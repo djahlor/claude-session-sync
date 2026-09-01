@@ -34,3 +34,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 claude_session_sync = ["SessionSyncWatcher.swift"]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
