@@ -29,6 +29,7 @@ class Config:
     claude_executable: Path
     approved_targets: Tuple[ApprovedTarget, ...] = ()
     target_policy: str = "approved-only"
+    sync_sidebar_layout: bool = False
     version: int = 1
 
     @classmethod
@@ -46,8 +47,9 @@ _CONFIG_KEYS = {
     "acknowledge_cross_account_copy",
     "claude_executable",
     "target_policy",
+    "sync_sidebar_layout",
 }
-_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {"target_policy"}
+_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {"target_policy", "sync_sidebar_layout"}
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
 _TARGET_KEYS = {"profile", "account", "workspace"}
 _TARGET_POLICIES = {"approved-only", "all-configured-profiles"}
@@ -150,6 +152,7 @@ def config_as_dict(config: Config, include_paths: bool = True) -> Dict[str, Any]
         "acknowledge_cross_profile_copy": config.acknowledge_cross_profile_copy,
         "acknowledge_cross_account_copy": config.acknowledge_cross_account_copy,
         "target_policy": config.target_policy,
+        "sync_sidebar_layout": config.sync_sidebar_layout,
         "claude_executable": (
             str(config.claude_executable) if include_paths else "<claude-executable>"
         ),
@@ -240,6 +243,10 @@ def load_config(path: Union[str, Path]) -> Config:
             "is all-configured-profiles"
         )
 
+    sync_sidebar_layout = document.get("sync_sidebar_layout", False)
+    if not isinstance(sync_sidebar_layout, bool):
+        raise ConfigError("sync_sidebar_layout must be a boolean")
+
     claude_executable = Path(
         _nonempty_string(document["claude_executable"], "claude_executable")
     ).expanduser()
@@ -253,5 +260,6 @@ def load_config(path: Union[str, Path]) -> Config:
         claude_executable=claude_executable,
         approved_targets=approved_targets,
         target_policy=target_policy,
+        sync_sidebar_layout=sync_sidebar_layout,
         version=version,
     )

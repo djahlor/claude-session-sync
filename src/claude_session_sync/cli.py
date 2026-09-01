@@ -15,7 +15,7 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence, TextIO
+from typing import Any, Callable, Mapping, Optional, Sequence, TextIO
 
 from .config import Config, load_config
 from .model import Plan, SyncRequest
@@ -25,6 +25,7 @@ ConfigLoader = Callable[[Path], Config]
 PlannerFactory = Callable[[Config], Any]
 EngineFactory = Callable[[Config], Any]
 InstallerFactory = Callable[[Path], Any]
+LayoutFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 2.0
 LAUNCH_CONFIRMATION_TIMEOUT_SECONDS = 5.0
@@ -65,6 +66,12 @@ def _default_installer_factory(config_path: Path) -> Any:
     return Installer(replace(layout, config_path=config_path))
 
 
+def _default_layout_factory(config: Config) -> Any:
+    from .layout import LayoutSynchronizer
+
+    return LayoutSynchronizer(config)
+
+
 @dataclass(frozen=True)
 class CliDependencies:
     """Injected system boundaries used by command tests and platform adapters."""
@@ -75,6 +82,7 @@ class CliDependencies:
     process_probe: Any = None
     launcher: Any = None
     installer_factory: InstallerFactory = _default_installer_factory
+    layout_factory: LayoutFactory = _default_layout_factory
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
@@ -144,10 +152,21 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="trust future account/workspace targets inside configured profiles",
     )
-    configure.add_argument(
+    profile_mode = configure.add_mutually_exclusive_group()
+    profile_mode.add_argument(
         "--enable-personal",
         action="store_true",
         help="enable the generated Personal profile",
+    )
+    profile_mode.add_argument(
+        "--disable-personal",
+        action="store_true",
+        help="disable the generated Personal profile",
+    )
+    configure.add_argument(
+        "--sync-layout",
+        action="store_true",
+        help="sync pins and custom groups after Claude quits",
     )
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
@@ -215,6 +234,47 @@ def _receipt_summary(receipt: Any, duration_ms: int) -> dict:
         "run_id": receipt.run_id,
         "state": receipt.status,
     }
+
+
+def _layout_summary(config: Config, dependencies: CliDependencies) -> dict:
+    if not config.sync_sidebar_layout:
+        return {"state": "disabled"}
+    from .layout import LayoutBusyError, LayoutError
+
+    try:
+        receipt = dependencies.layout_factory(config).sync()
+        payload = {
+            "state": receipt.state,
+            "profiles": receipt.profile_count,
+            "records": receipt.record_count,
+            "groups": receipt.group_count,
+            "assignments": receipt.assignment_count,
+            "pins": receipt.pin_count,
+            "ambiguous_assignments": receipt.ambiguous_assignments,
+        }
+    except LayoutBusyError:
+        payload = {"state": "skipped", "reason": "writer-busy"}
+    except LayoutError:
+        payload = {"state": "skipped", "reason": "unsafe-layout"}
+    except Exception:
+        payload = {"state": "skipped", "reason": "layout-error"}
+    _record_layout_status(config.state_dir, payload)
+    return payload
+
+
+def _record_layout_status(state_dir: Path, payload: Mapping[str, Any]) -> None:
+    from .filesystem import atomic_write_bytes, ensure_private_directory
+
+    try:
+        ensure_private_directory(state_dir)
+        path = state_dir / "sidebar-layout-status.json"
+        atomic_write_bytes(
+            path,
+            (json.dumps(dict(payload), sort_keys=True) + "\n").encode("utf-8"),
+        )
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _recovery_summary(receipt: Any, duration_ms: int) -> dict:
@@ -531,6 +591,9 @@ def _run_switch(
                     continue
                 raise
         duration_ms = round((dependencies.clock() - started) * 1000)
+        payload = _receipt_summary(receipt, duration_ms)
+        if config.sync_sidebar_layout:
+            payload["layout"] = _layout_summary(config, dependencies)
         if not arguments.no_launch:
             confirmation_enabled = dependencies.launch_confirmation_timeout > 0
             if confirmation_enabled:
@@ -560,7 +623,7 @@ def _run_switch(
                     return 1
                 _clear_launch_guard(config)
         _write(
-            _receipt_summary(receipt, duration_ms),
+            payload,
             as_json=False,
             stream=output,
         )
@@ -594,6 +657,24 @@ def _watcher_failure(state_dir: Path) -> int:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return 1
     return 0 if isinstance(document, dict) and document.get("state") == "ok" else 1
+
+
+def _layout_failure(config: Config) -> int:
+    if not config.sync_sidebar_layout:
+        return 0
+    path = config.state_dir / "sidebar-layout-status.json"
+    if not path.exists():
+        return 0
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 1
+    return (
+        0
+        if isinstance(document, dict)
+        and document.get("state") in ("synced", "noop")
+        else 1
+    )
 
 
 def _doctor_summary(config: Config) -> dict:
@@ -644,15 +725,18 @@ def _doctor_summary(config: Config) -> dict:
         errors += recovery_pending
     watcher_failure = _watcher_failure(config.state_dir)
     errors += watcher_failure
+    layout_failure = _layout_failure(config)
+    errors += layout_failure
     launch_guard_failure = _launch_guard_failure(config)
     errors += launch_guard_failure
     return {
         "bytes": 0,
         "counts": {
-            "checks": 6 + len(config.profiles),
+            "checks": 7 + len(config.profiles),
             "errors": errors,
             "invalid_replicas": len(discovery.invalid_replicas),
             "launch_guards": launch_guard_failure,
+            "layout_failures": layout_failure,
             "profiles": len(config.profiles),
             "recovery_pending": recovery_pending,
             "targets": len(discovery.targets),
@@ -737,6 +821,8 @@ def _configure(
     *,
     automatic_targets: bool,
     enable_personal: bool,
+    disable_personal: bool,
+    sync_layout: bool,
     apply: bool,
 ) -> dict:
     from .filesystem import atomic_write_bytes, ensure_private_directory
@@ -777,6 +863,26 @@ def _configure(
                 document[key] = True
                 changes += 1
 
+    if disable_personal:
+        personal = next(
+            (
+                profile
+                for profile in document.get("profiles", [])
+                if profile.get("name") == "Personal"
+            ),
+            None,
+        )
+        if personal is not None and personal.get("enabled", True) is not False:
+            personal["enabled"] = False
+            changes += 1
+        if document.get("acknowledge_cross_profile_copy") is not False:
+            document["acknowledge_cross_profile_copy"] = False
+            changes += 1
+
+    if sync_layout and document.get("sync_sidebar_layout") is not True:
+        document["sync_sidebar_layout"] = True
+        changes += 1
+
     _validate_config_document(document)
     if apply and changes:
         encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(
@@ -800,6 +906,7 @@ def _configure(
             "automatic_targets": int(
                 document.get("target_policy") == "all-configured-profiles"
             ),
+            "layout_sync": int(document.get("sync_sidebar_layout") is True),
         },
     }
 
@@ -848,6 +955,8 @@ def run(
                 arguments.config,
                 automatic_targets=arguments.automatic_targets,
                 enable_personal=arguments.enable_personal,
+                disable_personal=arguments.disable_personal,
+                sync_layout=arguments.sync_layout,
                 apply=arguments.apply,
             )
             _write(payload, as_json=False, stream=output)
@@ -876,8 +985,11 @@ def run(
                 return 1
             receipt = deps.engine_factory(config).apply(plan)
             duration_ms = round((deps.clock() - started) * 1000)
+            payload = _receipt_summary(receipt, duration_ms)
+            if config.sync_sidebar_layout:
+                payload["layout"] = _layout_summary(config, deps)
             _write(
-                _receipt_summary(receipt, duration_ms),
+                payload,
                 as_json=arguments.as_json,
                 stream=output,
             )
@@ -914,11 +1026,14 @@ def run(
                     stream=output,
                 )
                 return 0
+            payload = _receipt_summary(
+                receipt,
+                round((deps.clock() - started) * 1000),
+            )
+            if config.sync_sidebar_layout:
+                payload["layout"] = _layout_summary(config, deps)
             _write(
-                _receipt_summary(
-                    receipt,
-                    round((deps.clock() - started) * 1000),
-                ),
+                payload,
                 as_json=False,
                 stream=output,
             )
@@ -947,11 +1062,13 @@ def run(
             running = _running_processes(config, deps)
             watcher_failure = _watcher_failure(config.state_dir)
             launch_guard_failure = _launch_guard_failure(config)
+            layout_failure = _layout_failure(config)
             _write(
                 {
                     "bytes": 0,
                     "counts": {
                         "launch_guards": launch_guard_failure,
+                        "layout_failures": layout_failure,
                         "profiles": len(config.profiles),
                         "running_processes": len(running),
                         "watcher_failures": watcher_failure,
@@ -962,6 +1079,8 @@ def run(
                         if running
                         else "launch-unconfirmed"
                         if launch_guard_failure
+                        else "layout-failed"
+                        if layout_failure
                         else "watcher-failed"
                         if watcher_failure
                         else "idle"

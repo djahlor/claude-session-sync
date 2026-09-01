@@ -1,9 +1,13 @@
 # Claude Session Sync
 
-Claude Session Sync copies Claude Desktop Code-session registry replicas between
-explicitly configured local profiles on one Mac. It plans every change first,
-blocks ambiguous data, applies copies through a single-writer transaction, and
-keeps byte-for-byte recovery journals.
+Claude Session Sync keeps Claude Desktop Code chats, pins, and custom groups
+available when you change accounts on one Mac. The normal setup uses one Claude
+app and one local data root. A separate Personal app remains an optional,
+advanced mode.
+
+It plans chat changes first, uses a single writer, and keeps byte-for-byte
+recovery journals. Sidebar sync changes only three tested Local Storage records.
+It never copies Claude's whole login database.
 
 > [!WARNING]
 > This is experimental software built against Claude Desktop's undocumented,
@@ -19,9 +23,9 @@ and across account namespaces. That can expose work history to a personal
 profile, or personal history to a work profile. Review your employer's policy
 before enabling it.
 
-The generated config deliberately enables only Work, leaves the exact target
-allowlist empty, keeps automatic target discovery off, and sets both consent
-switches to `false`:
+The base config starts in safe mode. The recommended installer choice then
+enables automatic account discovery and sidebar sync inside the standard Claude
+data root:
 
 ```json
 {
@@ -29,47 +33,42 @@ switches to `false`:
   "approved_targets": [],
   "target_policy": "approved-only",
   "acknowledge_cross_profile_copy": false,
-  "acknowledge_cross_account_copy": false
+  "acknowledge_cross_account_copy": false,
+  "sync_sidebar_layout": false
 }
 ```
 
-Set each switch to `true` only after reviewing the configured data roots and
-accepting that boundary, then set the generated Personal profile's `enabled`
-field to `true`. Every discovered profile/account/workspace target must also
-match `approved_targets`; a future login blocks sync until separately approved.
-Automatic mode changes `target_policy` to `all-configured-profiles`, which
-accepts future account and workspace IDs only under roots already present in
-the private config. Malformed data, conflicts, unknown layouts, symlinks, and
-unexpected profile roots still block. Machine-readable output and logs contain aggregate counts, byte
-totals, durations, plan IDs, and run IDs—not raw account IDs, session IDs,
-paths, titles, or chat content.
+Automatic mode accepts future account and workspace IDs only under data roots
+already present in the private config. It does not trust new filesystem roots.
+Malformed chats and real revision conflicts still stop chat writes. A malformed
+sidebar record skips only the sidebar update, so a completed chat sync stays
+completed. Machine-readable output and logs contain aggregate counts, not raw
+account IDs, session IDs, paths, titles, or chat content.
 
 ## Requirements and compatibility
 
 - macOS with Claude Desktop installed at a configured executable path.
 - Python 3.9 or newer; runtime dependencies are Python standard library only.
-- Xcode Command Line Tools (`xcrun swiftc`) for the event-driven watcher.
+- Xcode Command Line Tools for the event-driven watcher and bundled sidebar
+  helper. The installer compiles both locally.
 - The currently observed Claude Code-session registry layout. This is an
   undocumented compatibility surface, not a stable API.
 
-The standard Work profile may launch Claude normally with no
-`--user-data-dir`. The Personal profile ultimately runs the same Claude
-executable with a distinct `--user-data-dir` argument. Process detection keeps
-that executable path separate from wrapper launch commands and matches exact,
-tokenized process arguments.
+The standard profile launches Claude normally with no `--user-data-dir`.
+Advanced two-profile mode adds a second data root and two generated launchers.
 
 ## Install
 
 For the easiest install, download the repository, double-click
-`Install Claude Session Sync.command`, and choose a mode. The two-profile mode
-keeps Work and Personal signed in separately and enables automatic target
-discovery inside those two configured profile roots. This path uses the macOS
-system Python and does not install Python packages globally.
+`Install Claude Session Sync.command`, and choose option 1. It uses the normal
+Claude app, trusts future accounts inside that app's existing data root, and
+syncs chats, pins, and groups after Claude quits. It uses the macOS system
+Python and does not install Python packages globally.
 
 The same setup can run from Terminal:
 
 ```sh
-./install.sh --automatic-targets --enable-personal
+./install.sh --automatic-targets --sync-layout --disable-personal
 ```
 
 From this directory:
@@ -83,23 +82,18 @@ claude-session-sync install --apply
 The per-user installer creates:
 
 - `~/.config/claude-session-sync/config.json` with mode `0600`;
-- `~/Applications/Claude Work.app`;
-- `~/Applications/Claude Personal Synced.app` after Personal is enabled;
+- no replacement Claude app in the normal one-profile setup;
+- Work and Personal launchers only in advanced two-profile mode;
 - a private system-Python-compatible runtime and compiled watcher under
   `~/Library/Application Support/ClaudeSessionSync`;
 - `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist`.
 
-Enabled-profile wrappers call `switch Work` or `switch Personal`. The
-installer never modifies `/Applications/Claude.app`. Generated plist files are
+The installer never modifies `/Applications/Claude.app`. Generated plist files are
 checked with `plutil -lint`; changed generated artifacts are backed up before
 replacement, unchanged installs are no-ops, and the LaunchAgent is bootstrapped
 or reloaded through `launchctl` after installation.
 
-Edit the private config, verify every profile root and launch command (the
-generated Personal root is `~/Library/Application Support/Claude-Personal`),
-set the explicit `is_default` process identity, change the consent switches,
-and enable Personal. Pin exactly the targets that exist now, then rerun install
-to expose the Personal wrapper:
+Safe mode pins only the targets that exist now:
 
 ```sh
 claude-session-sync approve-current-targets --dry-run
@@ -115,10 +109,10 @@ claude-session-sync configure --automatic-targets --dry-run
 claude-session-sync configure --automatic-targets --apply
 ```
 
-To enable both generated profile launchers in the same operation:
+To use the advanced separate Personal app:
 
 ```sh
-claude-session-sync configure --automatic-targets --enable-personal --apply
+claude-session-sync configure --automatic-targets --sync-layout --enable-personal --apply
 claude-session-sync install --apply
 ```
 
@@ -133,7 +127,17 @@ claude-session-sync plan --json
 
 ## Use
 
-Close every managed Claude window and process before synchronizing:
+The normal workflow has three steps:
+
+1. Sign out and sign in to another account in Claude when needed.
+2. Quit Claude once.
+3. Wait for `claude-session-sync status` to report `ready`, then open Claude
+   normally. The watcher syncs chats, pins, and groups while Claude is closed.
+
+If Claude reopens before the watcher can write, no data is changed. Quit it
+again and let the watcher finish the pending sync.
+
+Manual commands remain available:
 
 ```sh
 claude-session-sync sync
@@ -156,7 +160,7 @@ It launches the selected profile only after synchronization succeeds.
 success with an explicit `skipped` state so another termination event can retry
 safely.
 
-The recommended two-profile workflow requires one sign-in per profile:
+Advanced two-profile mode requires one sign-in per profile:
 
 1. Open `Claude Work` and sign in to the Work account once.
 2. Quit Claude.
@@ -201,23 +205,31 @@ watcher. If activation fails, it restores and restarts that legacy agent.
 
 ## Pins and custom groups
 
-Claude stores session history separately from sidebar layout. Pins, custom
-groups, collapsed sections, and grouping mode are held in Electron Local
-Storage rather than the Code-session registry synchronized by this release.
-Copying the whole Local Storage database would also copy unrelated account and
-application state, so this tool does not do that.
+Claude stores chat history and sidebar layout separately. The layout adapter
+reads and writes only the group-scope record, pin record, and matching dframe
+store record. It checks their shapes and requires the two group records to
+agree before writing.
 
-A future layout adapter can selectively synchronize a tested allowlist of
-sidebar keys with its own journal and compatibility check. Until that adapter
-exists, session history syncs but pins and custom groups remain profile-local.
+On first use, existing group names are combined and added to every discovered
+account/workspace scope. Unambiguous chat assignments are copied by group name.
+If the same chat has different group assignments in two scopes, each existing
+assignment stays in place and no assignment is guessed for a new scope. A
+private snapshot restores pins and groups if a new account starts with empty
+sidebar state.
 
 ## Failure handling
 
-`plan`, `auto`, and `switch` return `next_action=run-doctor` for malformed data
-or conflicts. Exact-target safe mode returns
+`plan`, `auto`, and `switch` return `next_action=run-doctor` for malformed chat
+data or conflicts. Exact-target safe mode returns
 `next_action=approve-targets-or-enable-automatic-targets` when a routine new
 target is the only blocker. Automatic mode removes that routine approval step,
 but never converts data corruption or an ambiguous revision into an overwrite.
+
+Sidebar errors are separate. A malformed or changed sidebar format returns
+`layout={'state': 'skipped', 'reason': 'unsafe-layout'}` after the chat result.
+No sidebar record is written. If verification fails after a write, the tool
+restores the three exact preimages. A failed restore creates
+`RECOVERY_REQUIRED` state and stops later sidebar writes.
 
 ## Recovery
 
@@ -257,13 +269,15 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src /usr/bin/python3 -m unittest discover -s tests
 ```
 
-Tests use temporary profile, config, and state roots plus fake process, launch,
-compiler, and plist-lint adapters. They do not run a live sync or write to
-Claude, Applications, Library, or LaunchAgents locations.
+Tests use temporary profile, config, state, and synthetic sidebar records plus
+fake process, launch, compiler, and plist-lint adapters. They do not write to
+live Claude, Applications, Library, or LaunchAgents locations.
 
 Release verification also builds the wheel, installs it into an isolated
 directory, and runs `install --dry-run` without the source checkout. The Swift
-watcher source ships as package data so wheel installs remain self-contained.
+watcher and third-party LevelDB/Snappy source ship as package data so wheel
+installs remain self-contained. LevelDB keeps its BSD license and Snappy keeps
+its COPYING notice under `src/claude_session_sync/vendor`.
 
 ## License
 

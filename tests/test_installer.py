@@ -19,6 +19,9 @@ class FakeCommandRunner:
         if "swiftc" in command:
             output = Path(command[command.index("-o") + 1])
             output.write_bytes(b"compiled-watcher")
+        if "clang++" in command:
+            output = Path(command[command.index("-o") + 1])
+            output.write_bytes(b"compiled-layout-helper")
         if len(command) > 1 and command[1] == "print":
             return subprocess.CompletedProcess(command, 113, stdout="", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
@@ -39,7 +42,7 @@ class InstallerTests(unittest.TestCase):
             self.assertGreater(report.change_count, 0)
             self.assertFalse(home.exists())
 
-    def test_apply_generates_private_config_wrappers_watcher_and_launch_agent(self):
+    def test_apply_generates_private_config_runtime_watcher_and_launch_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             layout = self.layout(home)
@@ -56,6 +59,7 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(template["acknowledge_cross_profile_copy"])
             self.assertFalse(template["acknowledge_cross_account_copy"])
             self.assertEqual(template["target_policy"], "approved-only")
+            self.assertFalse(template["sync_sidebar_layout"])
             self.assertFalse(template["profiles"][1]["enabled"])
             self.assertEqual(
                 template["profiles"][1]["data_root"],
@@ -69,13 +73,7 @@ class InstallerTests(unittest.TestCase):
                 stat.S_IMODE(layout.config_path.stat().st_mode),
                 stat.S_IRUSR | stat.S_IWUSR,
             )
-            work_launcher = layout.work_app / "Contents" / "MacOS" / "launcher"
-            personal_launcher = layout.personal_app / "Contents" / "MacOS" / "launcher"
-            self.assertIn("switch Work", work_launcher.read_text(encoding="utf-8"))
-            self.assertIn(
-                "--wait-for-exit 15",
-                work_launcher.read_text(encoding="utf-8"),
-            )
+            self.assertFalse(layout.work_app.exists())
             self.assertFalse(layout.personal_app.exists())
             template["profiles"][1]["enabled"] = True
             template["acknowledge_cross_profile_copy"] = True
@@ -87,6 +85,13 @@ class InstallerTests(unittest.TestCase):
             os.chmod(layout.config_path, 0o600)
             activated = installer.install(dry_run=False)
             self.assertEqual(activated.state, "installed")
+            work_launcher = layout.work_app / "Contents" / "MacOS" / "launcher"
+            personal_launcher = layout.personal_app / "Contents" / "MacOS" / "launcher"
+            self.assertIn("switch Work", work_launcher.read_text(encoding="utf-8"))
+            self.assertIn(
+                "--wait-for-exit 15",
+                work_launcher.read_text(encoding="utf-8"),
+            )
             self.assertIn(
                 "switch Personal", personal_launcher.read_text(encoding="utf-8")
             )
@@ -101,6 +106,17 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(layout.runtime_cli.is_file())
             self.assertTrue(os.access(layout.runtime_cli, os.X_OK))
             self.assertTrue((layout.runtime_package / "cli.py").is_file())
+            self.assertTrue((layout.runtime_package / "layoutdb.cc").is_file())
+            self.assertTrue(
+                (
+                    layout.runtime_package
+                    / "vendor"
+                    / "leveldb"
+                    / "include"
+                    / "leveldb"
+                    / "db.h"
+                ).is_file()
+            )
             self.assertTrue(
                 (layout.runtime_package / "SessionSyncWatcher.swift").is_file()
             )
@@ -129,6 +145,9 @@ class InstallerTests(unittest.TestCase):
                 standalone_dry_run.returncode, 0, standalone_dry_run.stderr
             )
             self.assertEqual(layout.watcher_binary.read_bytes(), b"compiled-watcher")
+            self.assertEqual(
+                layout.layout_helper.read_bytes(), b"compiled-layout-helper"
+            )
             agent = layout.launch_agent.read_text(encoding="utf-8")
             self.assertIn("<key>RunAtLoad</key>\n  <true/>", agent)
             self.assertIn(str(layout.watcher_binary), agent)
@@ -139,6 +158,7 @@ class InstallerTests(unittest.TestCase):
                 )
             )
             self.assertTrue(any("swiftc" in call[0] for call in runner.calls))
+            self.assertTrue(any("clang++" in call[0] for call in runner.calls))
             self.assertTrue(
                 any(
                     call[0][:2] == ("/bin/launchctl", "bootstrap")
@@ -160,6 +180,16 @@ class InstallerTests(unittest.TestCase):
             layout = self.layout(home)
             runner = FakeCommandRunner()
             installer = Installer(layout, runner=runner, backup_id=lambda: "backup-b")
+            installer.install(dry_run=False)
+            template = json.loads(layout.config_path.read_text(encoding="utf-8"))
+            template["profiles"][1]["enabled"] = True
+            template["acknowledge_cross_profile_copy"] = True
+            template["acknowledge_cross_account_copy"] = True
+            layout.config_path.write_text(
+                json.dumps(template, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(layout.config_path, 0o600)
             installer.install(dry_run=False)
             launcher = layout.work_app / "Contents" / "MacOS" / "launcher"
             launcher.write_text("user replacement", encoding="utf-8")

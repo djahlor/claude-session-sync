@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from claude_session_sync.cli import CliDependencies, run
@@ -63,6 +64,21 @@ class FakeEngine:
     def rollback(self, run_id):
         self.rolled_back = run_id
         return RecoveryReceipt(run_id, "rolled_back", 3, 1)
+
+
+class FakeLayoutReceipt:
+    state = "synced"
+    profile_count = 1
+    record_count = 2
+    group_count = 4
+    assignment_count = 12
+    pin_count = 3
+    ambiguous_assignments = 1
+
+
+class FakeLayout:
+    def sync(self):
+        return FakeLayoutReceipt()
 
 
 class FakeProcessProbe:
@@ -978,6 +994,7 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                     "bytes": 0,
                     "counts": {
                         "launch_guards": 0,
+                        "layout_failures": 0,
                         "profiles": 2,
                         "running_processes": 0,
                         "watcher_failures": 0,
@@ -1168,6 +1185,119 @@ class CliConfigureTests(unittest.TestCase):
             self.assertTrue(updated["acknowledge_cross_profile_copy"])
             self.assertTrue(updated["profiles"][1]["enabled"])
             self.assertIn("state=configured", output.getvalue())
+
+    def test_configure_disables_personal_and_enables_layout_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            document = {
+                "version": 1,
+                "approved_targets": [],
+                "profiles": [
+                    {
+                        "name": "Work",
+                        "data_root": str(root / "Claude"),
+                        "launch_command": ["/usr/bin/true"],
+                        "is_default": True,
+                    },
+                    {
+                        "name": "Personal",
+                        "data_root": str(root / "Claude-Personal"),
+                        "launch_command": ["/usr/bin/true"],
+                        "enabled": True,
+                        "is_default": False,
+                    },
+                ],
+                "state_dir": str(root / "state"),
+                "retention": 5,
+                "acknowledge_cross_profile_copy": True,
+                "acknowledge_cross_account_copy": True,
+                "target_policy": "all-configured-profiles",
+                "sync_sidebar_layout": False,
+                "claude_executable": "/usr/bin/true",
+            }
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+
+            exit_code = run(
+                [
+                    "--config",
+                    str(config_path),
+                    "configure",
+                    "--disable-personal",
+                    "--sync-layout",
+                    "--apply",
+                ],
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+
+            self.assertEqual(0, exit_code)
+            updated = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertFalse(updated["profiles"][1]["enabled"])
+            self.assertFalse(updated["acknowledge_cross_profile_copy"])
+            self.assertTrue(updated["sync_sidebar_layout"])
+
+
+class CliLayoutTests(unittest.TestCase):
+    def test_sync_reports_layout_without_changing_chat_receipt_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_sidebar_layout=True)
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: FakeLayout(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("committed", payload["state"])
+            self.assertEqual("synced", payload["layout"]["state"])
+            self.assertEqual(1, payload["layout"]["ambiguous_assignments"])
+
+    def test_layout_failure_does_not_change_a_committed_chat_result(self):
+        class BrokenLayout:
+            def sync(self):
+                raise RuntimeError("unexpected adapter failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_sidebar_layout=True)
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: BrokenLayout(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("committed", payload["state"])
+            self.assertEqual(
+                {"state": "skipped", "reason": "layout-error"},
+                payload["layout"],
+            )
 
 
 class CliInstallTests(unittest.TestCase):

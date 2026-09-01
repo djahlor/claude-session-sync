@@ -58,9 +58,28 @@ clears a known failed launch. It adds no synchronization policy.
    from a wrapper's launch command.
 10. Process waits use monotonic wall-clock deadlines and subprocess timeouts;
     probe runtime cannot silently extend a configured handoff limit.
-11. Session registry files are the only synchronized store. Sidebar pins,
-    custom groups, account tokens, and other Electron Local Storage values are
-    outside the current adapter and must never be copied as an opaque database.
+11. Chat sync changes only validated session registry files. Sidebar sync is a
+    separate, optional adapter that changes only the three allowlisted Local
+    Storage records needed for pins and custom groups. It never copies an opaque
+    Electron database, account tokens, cookies, or login state.
+12. Sidebar writes use one atomic LevelDB batch, checksum-verified reads,
+    exact preimage journals, post-write verification, and automatic rollback.
+    A sidebar failure cannot undo or relabel an already committed chat sync.
+
+## Sidebar layout adapter
+
+Claude stores chats and sidebar layout in separate stores. After chat sync
+commits, the optional layout adapter derives account and workspace scopes from
+the validated session registry. It then unions group names and pin order across
+those scopes. Group assignments copy by group name only when the source scopes
+agree. Ambiguous assignments remain unchanged in their existing scope and are
+not guessed for new scopes.
+
+The native helper is compiled locally from bundled LevelDB and Snappy sources.
+It exposes only exact-key reads and an atomic write batch. Unknown record shapes,
+missing records, internal record disagreement, checksum errors, and post-write
+verification failures stop the layout pass. Chat receipts remain committed and
+the aggregate status reports the layout failure separately.
 
 ## State machine
 

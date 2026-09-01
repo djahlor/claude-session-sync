@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.2.0"
-description = "Safely synchronize Claude Desktop Code session history across explicitly configured local profiles."
+version = "0.3.0"
+description = "Safely synchronize Claude Desktop Code sessions and sidebar layout across local accounts."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -33,7 +33,25 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-claude_session_sync = ["SessionSyncWatcher.swift"]
+claude_session_sync = [
+  "SessionSyncWatcher.swift",
+  "layoutdb.cc",
+  "vendor/README.md",
+  "vendor/leveldb/LICENSE",
+  "vendor/leveldb/db/*.cc",
+  "vendor/leveldb/db/*.h",
+  "vendor/leveldb/table/*.cc",
+  "vendor/leveldb/table/*.h",
+  "vendor/leveldb/util/*.cc",
+  "vendor/leveldb/util/*.h",
+  "vendor/leveldb/port/*.cc",
+  "vendor/leveldb/port/*.h",
+  "vendor/leveldb/include/leveldb/*.h",
+  "vendor/snappy/COPYING",
+  "vendor/snappy/snappy/*.cc",
+  "vendor/snappy/snappy/*.h",
+  "vendor/snappy/mac/*.h",
+]
 
 [tool.ruff]
 target-version = "py39"

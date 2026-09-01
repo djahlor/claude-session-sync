@@ -95,6 +95,10 @@ class InstallLayout:
         return self.support_dir / "bin" / "SessionSyncWatcher"
 
     @property
+    def layout_helper(self) -> Path:
+        return self.support_dir / "bin" / "layoutdb"
+
+    @property
     def runtime_cli(self) -> Path:
         return self.support_dir / "bin" / "claude-session-sync"
 
@@ -105,6 +109,10 @@ class InstallLayout:
     @property
     def watcher_stamp(self) -> Path:
         return self.support_dir / "bin" / ".SessionSyncWatcher.sha256"
+
+    @property
+    def layout_helper_stamp(self) -> Path:
+        return self.support_dir / "bin" / ".layoutdb.sha256"
 
     @property
     def launch_agent(self) -> Path:
@@ -170,6 +178,7 @@ class Installer:
             "acknowledge_cross_account_copy": False,
             "acknowledge_cross_profile_copy": False,
             "target_policy": "approved-only",
+            "sync_sidebar_layout": False,
             "claude_executable": str(executable),
             "profiles": [
                 {
@@ -253,12 +262,23 @@ class Installer:
     def _runtime_files(self) -> Dict[Path, Tuple[bytes, int]]:
         source_package = Path(__file__).resolve().parent
         files = {}
-        for source in sorted(source_package.rglob("*.py")):
-            if "__pycache__" not in source.parts:
-                files[source.relative_to(source_package)] = (source.read_bytes(), 0o644)
+        allowed_names = {"LICENSE", "COPYING"}
+        allowed_suffixes = {".py", ".cc", ".h", ".md", ".swift"}
+        for source in sorted(source_package.rglob("*")):
+            if (
+                source.is_file()
+                and "__pycache__" not in source.parts
+                and (
+                    source.name in allowed_names
+                    or source.suffix in allowed_suffixes
+                )
+            ):
+                files[source.relative_to(source_package)] = (
+                    source.read_bytes(),
+                    0o644,
+                )
         files[Path("SessionSyncWatcher.swift")] = (
-            self.layout.source_watcher.read_bytes(),
-            0o644,
+            self.layout.source_watcher.read_bytes(), 0o644
         )
         return files
 
@@ -306,6 +326,35 @@ class Installer:
         except OSError:
             return False
 
+    def _layout_sources(self) -> Tuple[Path, ...]:
+        package = Path(__file__).resolve().parent
+        sources = [package / "layoutdb.cc"]
+        sources.extend(sorted((package / "vendor" / "leveldb").rglob("*.cc")))
+        sources.extend(sorted((package / "vendor" / "snappy" / "snappy").glob("*.cc")))
+        return tuple(sources)
+
+    def _layout_helper_digest(self) -> str:
+        package = Path(__file__).resolve().parent
+        digest = hashlib.sha256()
+        source_files = list(self._layout_sources())
+        source_files.extend(sorted((package / "vendor").rglob("*.h")))
+        for source in source_files:
+            digest.update(str(source.relative_to(package)).encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(source.read_bytes())
+        return digest.hexdigest()
+
+    def _layout_helper_current(self) -> bool:
+        try:
+            return (
+                self.layout.layout_helper.is_file()
+                and os.access(self.layout.layout_helper, os.X_OK)
+                and self.layout.layout_helper_stamp.read_text(encoding="ascii").strip()
+                == self._layout_helper_digest()
+            )
+        except OSError:
+            return False
+
     def _planned_actions(self) -> List[InstallAction]:
         actions = []
         for legacy in self.layout.legacy_launch_agents:
@@ -343,6 +392,7 @@ class Installer:
                     self.layout.runtime_cli,
                 )
             )
+        wrapper_profiles = enabled_profiles if len(enabled_profiles) > 1 else set()
         bundle_specs = (
             (
                 "Work",
@@ -356,7 +406,7 @@ class Installer:
             ),
         )
         for profile_name, path, files in bundle_specs:
-            if profile_name not in enabled_profiles:
+            if profile_name not in wrapper_profiles:
                 if path.exists():
                     actions.append(InstallAction("remove-disabled", path))
             elif not self._same_bundle(path, files):
@@ -365,6 +415,8 @@ class Installer:
                 )
         if not self._watcher_current():
             actions.append(InstallAction("compile", self.layout.watcher_binary))
+        if not self._layout_helper_current():
+            actions.append(InstallAction("compile", self.layout.layout_helper))
         agent = self._launch_agent()
         if not self._same_file(self.layout.launch_agent, agent, 0o644):
             actions.append(
@@ -481,6 +533,65 @@ class Installer:
             if temporary.exists():
                 temporary.unlink()
 
+    def _compile_layout_helper(self) -> None:
+        target = self.layout.layout_helper
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".layoutdb-", dir=str(target.parent)
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        temporary.unlink()
+        package = Path(__file__).resolve().parent
+        leveldb = package / "vendor" / "leveldb"
+        snappy = package / "vendor" / "snappy"
+        command = [
+            "/usr/bin/xcrun",
+            "clang++",
+            "-std=c++11",
+            "-O2",
+            "-DNDEBUG",
+            "-DSNAPPY",
+            "-DOS_MACOSX",
+            "-DLEVELDB_PLATFORM_POSIX",
+            "-DLEVELDB_ATOMIC_PRESENT",
+            "-Wno-deprecated-declarations",
+            "-I{}".format(leveldb),
+            "-I{}".format(leveldb / "include"),
+            "-I{}".format(snappy / "snappy"),
+            "-I{}".format(snappy / "mac"),
+        ]
+        command.extend(str(source) for source in self._layout_sources())
+        command.extend(("-o", str(temporary)))
+        try:
+            try:
+                self._runner(
+                    command,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as error:
+                lines = (error.stderr or "").strip().splitlines()
+                detail = " | ".join(lines[-8:]) if lines else "compiler returned a failure"
+                raise RuntimeError(
+                    "could not compile the sidebar helper: {}".format(detail)
+                ) from error
+            if not temporary.is_file():
+                raise RuntimeError("clang++ did not create the sidebar helper")
+            os.chmod(temporary, 0o755)
+            if target.exists():
+                self._backup(target)
+            os.replace(temporary, target)
+            self._atomic_file(
+                self.layout.layout_helper_stamp,
+                (self._layout_helper_digest() + "\n").encode("ascii"),
+                0o644,
+            )
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
     def install(self, *, dry_run: bool) -> InstallReport:
         actions = self._planned_actions()
         if dry_run:
@@ -519,6 +630,8 @@ class Installer:
                     )
             elif action.path == self.layout.watcher_binary:
                 self._compile_watcher()
+            elif action.path == self.layout.layout_helper:
+                self._compile_layout_helper()
             elif action.path == self.layout.launch_agent:
                 self._atomic_file(action.path, self._launch_agent(), 0o644, lint=True)
         disabled_legacy = []
@@ -615,6 +728,7 @@ class Installer:
             self.layout.personal_app,
             self.layout.launch_agent,
             self.layout.watcher_binary,
+            self.layout.layout_helper,
             self.layout.runtime_cli,
             self.layout.runtime_package,
         )
@@ -630,5 +744,7 @@ class Installer:
             self._backup(action.path)
         if self.layout.watcher_stamp.exists():
             self.layout.watcher_stamp.unlink()
+        if self.layout.layout_helper_stamp.exists():
+            self.layout.layout_helper_stamp.unlink()
         state = "uninstalled" if actions else "noop"
         return InstallReport(state, tuple(actions), tuple(self._backups))

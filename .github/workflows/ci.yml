@@ -22,6 +22,29 @@ jobs:
       - run: python -m pip install --upgrade pip build ruff
       - run: ruff check .
       - run: PYTHONPATH=src python -m unittest discover -s tests
+      - name: Compile bundled sidebar helper
+        if: matrix.python-version == '3.13'
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          from claude_session_sync.installer import InstallLayout, Installer
+
+          with tempfile.TemporaryDirectory() as directory:
+              layout = InstallLayout.for_home(Path(directory))
+              Installer(layout)._compile_layout_helper()
+              result = subprocess.run(
+                  [str(layout.layout_helper)], text=True, capture_output=True
+              )
+              assert result.returncode == 2
+              assert "usage: layoutdb" in result.stderr
+          PY
       - run: python -m build
+      - name: Check wheel is self-contained
+        run: |
+          wheel_root="$RUNNER_TEMP/claude-session-sync-wheel"
+          python -m pip install --no-deps --target "$wheel_root" dist/*.whl
+          PYTHONPATH="$wheel_root" python -c 'from claude_session_sync.cli import main; raise SystemExit(main())' --config "$RUNNER_TEMP/test-config.json" install --dry-run
       - run: zsh -n install.sh
       - run: zsh -n "Install Claude Session Sync.command"
