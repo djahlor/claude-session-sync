@@ -207,8 +207,9 @@ watcher. If activation fails, it restores and restarts that legacy agent.
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
-store record. It checks their shapes and requires the two group records to
-agree before writing.
+store record. It checks their shapes and safely merges a group that appears in
+only one record during Claude shutdown. Conflicting group IDs, names, or
+assignments still stop the layout write.
 
 On first use, existing group names are combined and added to every discovered
 account/workspace scope. Unambiguous chat assignments are copied by group name.
@@ -226,9 +227,10 @@ target is the only blocker. Automatic mode removes that routine approval step,
 but never converts data corruption or an ambiguous revision into an overwrite.
 
 Sidebar errors are separate. A malformed or changed sidebar format returns
-`layout={'state': 'skipped', 'reason': 'unsafe-layout'}` after the chat result.
-No sidebar record is written. If verification fails after a write, the tool
-restores the three exact preimages. A failed restore creates
+`layout={'state': 'skipped', 'reason': 'unsafe-layout', 'detail': '...'}` after
+the chat result. The detail names the failed safety check without exposing chat
+or account IDs. No sidebar record is written. If verification fails after a
+write, the tool restores the three exact preimages. A failed restore creates
 `RECOVERY_REQUIRED` state and stops later sidebar writes.
 
 ## Recovery

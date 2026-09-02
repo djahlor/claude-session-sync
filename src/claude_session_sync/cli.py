@@ -254,8 +254,12 @@ def _layout_summary(config: Config, dependencies: CliDependencies) -> dict:
         }
     except LayoutBusyError:
         payload = {"state": "skipped", "reason": "writer-busy"}
-    except LayoutError:
-        payload = {"state": "skipped", "reason": "unsafe-layout"}
+    except LayoutError as error:
+        payload = {
+            "state": "skipped",
+            "reason": "unsafe-layout",
+            "detail": str(error),
+        }
     except Exception:
         payload = {"state": "skipped", "reason": "layout-error"}
     _record_layout_status(config.state_dir, payload)

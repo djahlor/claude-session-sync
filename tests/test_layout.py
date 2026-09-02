@@ -164,6 +164,37 @@ class LayoutTransformTests(unittest.TestCase):
             [group["name"] for group in store["customGroupsByScope"]["new/w"]["groups"]],
         )
 
+    def test_snapshot_groups_survive_an_active_scope_update(self):
+        snapshot = LayoutSnapshot(
+            groups=("Focus", "Backlog"),
+            assignments={},
+            pinned_order=(),
+            home_projects_pinned_order=(),
+        )
+        current = records(
+            {
+                "a/w": scope("Focus", "New"),
+                "b/w": scope("Focus", "Backlog"),
+            },
+            active="a/w",
+        )
+
+        result = transform_layout_records(
+            current,
+            {"a/w": set(), "b/w": set()},
+            snapshot=snapshot,
+            timestamp_ms=10,
+        )
+
+        self.assertEqual(("Focus", "New", "Backlog"), result.snapshot.groups)
+        repeated = transform_layout_records(
+            result.records,
+            {"a/w": set(), "b/w": set()},
+            snapshot=result.snapshot,
+            timestamp_ms=20,
+        )
+        self.assertEqual(result.records, repeated.records)
+
     def test_unrelated_store_fields_are_preserved(self):
         current = records(
             {"a/w": scope("Focus")}, active="a/w", extra={"keep": [1, 2, 3]}
@@ -177,13 +208,34 @@ class LayoutTransformTests(unittest.TestCase):
             decoded(result.records[DFRAME_STORE_KEY])["state"]["unrelated"],
         )
 
-    def test_disagreeing_group_records_stop_without_a_replacement(self):
-        current = records({"a/w": scope("Focus")}, active="a/w")
+    def test_one_sided_group_record_update_is_merged(self):
+        current = records({"a/w": scope("Focus", "New")}, active="a/w")
         group_record = decoded(current[GROUP_SCOPES_KEY])
-        group_record["value"] = {}
+        group_record["value"] = {"a/w": scope("Focus")}
         current[GROUP_SCOPES_KEY] = encoded(group_record)
 
-        with self.assertRaisesRegex(LayoutError, "disagree"):
+        result = transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
+
+        store = decoded(result.records[DFRAME_STORE_KEY])["state"][
+            "customGroupsByScope"
+        ]
+        persisted = decoded(result.records[GROUP_SCOPES_KEY])["value"]
+        self.assertEqual(store, persisted)
+        self.assertEqual(
+            ["Focus", "New"],
+            [group["name"] for group in store["a/w"]["groups"]],
+        )
+
+    def test_conflicting_group_ids_stop_without_a_replacement(self):
+        current = records({"a/w": scope("Focus")}, active="a/w")
+        group_record = decoded(current[GROUP_SCOPES_KEY])
+        conflicting = scope("Focus")
+        conflicting["groups"][0]["id"] = "different-id"
+        conflicting["order"] = {"different-id": []}
+        group_record["value"] = {"a/w": conflicting}
+        current[GROUP_SCOPES_KEY] = encoded(group_record)
+
+        with self.assertRaisesRegex(LayoutError, "conflicting ids"):
             transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
 
 

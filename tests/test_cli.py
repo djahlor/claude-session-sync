@@ -1299,6 +1299,42 @@ class CliLayoutTests(unittest.TestCase):
                 payload["layout"],
             )
 
+    def test_safe_layout_failure_reports_the_specific_check(self):
+        from claude_session_sync.layout import LayoutError
+
+        class UnsafeLayout:
+            def sync(self):
+                raise LayoutError("custom group records contain conflicting ids")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_sidebar_layout=True)
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: UnsafeLayout(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("committed", payload["state"])
+            self.assertEqual("unsafe-layout", payload["layout"]["reason"])
+            self.assertEqual(
+                "custom group records contain conflicting ids",
+                payload["layout"]["detail"],
+            )
+
 
 class CliInstallTests(unittest.TestCase):
     def test_install_modes_do_not_require_an_existing_config(self):

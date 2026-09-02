@@ -177,6 +177,85 @@ def _validated_scopes(value: Any) -> Dict[str, Dict[str, Any]]:
     return scopes
 
 
+def _merge_scope_pair(
+    preferred: Mapping[str, Any], fallback: Mapping[str, Any]
+) -> Dict[str, Any]:
+    preferred_pairs = _ordered_group_pairs(preferred)
+    fallback_pairs = _ordered_group_pairs(fallback)
+    ids_by_name = {}  # type: Dict[str, str]
+    names_by_id = {}  # type: Dict[str, str]
+    group_names = []
+    for group_id, name in preferred_pairs + fallback_pairs:
+        if name in ids_by_name and ids_by_name[name] != group_id:
+            raise LayoutError("custom group records contain conflicting ids")
+        if group_id in names_by_id and names_by_id[group_id] != name:
+            raise LayoutError("custom group records contain conflicting names")
+        ids_by_name[name] = group_id
+        names_by_id[group_id] = name
+        if name not in group_names:
+            group_names.append(name)
+
+    preferred_assignments = _scope_assignments_by_name(preferred)
+    fallback_assignments = _scope_assignments_by_name(fallback)
+    for session in set(preferred_assignments) & set(fallback_assignments):
+        if preferred_assignments[session] != fallback_assignments[session]:
+            raise LayoutError("custom group records contain conflicting assignments")
+    assignments_by_name = dict(preferred_assignments)
+    for session, name in fallback_assignments.items():
+        assignments_by_name.setdefault(session, name)
+
+    merged = copy.deepcopy(preferred)
+    for key, value in fallback.items():
+        if key in {"groups", "assignments", "order"}:
+            continue
+        if key in merged and merged[key] != value:
+            raise LayoutError("custom group scope metadata disagrees")
+        merged.setdefault(key, copy.deepcopy(value))
+
+    merged["groups"] = [
+        {"id": ids_by_name[name], "name": name} for name in group_names
+    ]
+    merged["assignments"] = {
+        session: ids_by_name[name] for session, name in assignments_by_name.items()
+    }
+    preferred_order = preferred.get("order", {})
+    fallback_order = fallback.get("order", {})
+    merged_order = {}
+    for name in group_names:
+        group_id = ids_by_name[name]
+        ordered = _stable_union(
+            (
+                preferred_order.get(group_id, []),
+                fallback_order.get(group_id, []),
+            )
+        )
+        merged_order[group_id] = [
+            session
+            for session in ordered
+            if assignments_by_name.get(session) == name
+        ]
+    merged["order"] = merged_order
+    _ordered_group_pairs(merged)
+    return merged
+
+
+def _merge_sidebar_scopes(
+    preferred: Mapping[str, Dict[str, Any]],
+    fallback: Mapping[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    merged = {}
+    for scope_key in sorted(set(preferred) | set(fallback)):
+        if scope_key in preferred and scope_key in fallback:
+            merged[scope_key] = _merge_scope_pair(
+                preferred[scope_key], fallback[scope_key]
+            )
+        elif scope_key in preferred:
+            merged[scope_key] = copy.deepcopy(preferred[scope_key])
+        else:
+            merged[scope_key] = copy.deepcopy(fallback[scope_key])
+    return merged
+
+
 def _stable_union(sequences: Iterable[Sequence[str]]) -> List[str]:
     output = []
     seen = set()
@@ -244,8 +323,7 @@ def transform_layout_records(
     store_state = store_record["state"]
     store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
     persisted_scopes = _validated_scopes(group_record["value"])
-    if store_scopes != persisted_scopes:
-        raise LayoutError("Claude sidebar group records disagree")
+    store_scopes = _merge_sidebar_scopes(store_scopes, persisted_scopes)
 
     store_pins = _string_list(store_state.get("pinnedOrder", []), "stored pins")
     local_pins = _string_list(
@@ -273,21 +351,30 @@ def transform_layout_records(
         active_scope in store_scopes
         and _ordered_group_pairs(store_scopes[active_scope])
     )
-    if snapshot is not None and active_has_groups:
-        groups = [
-            name for _group_id, name in _ordered_group_pairs(store_scopes[active_scope])
+    current_groups = _stable_union(
+        [
+            [name for _group_id, name in _ordered_group_pairs(store_scopes[key])]
+            for key in ordered_scope_keys
         ]
-        assignments = _scope_assignments_by_name(store_scopes[active_scope])
-    elif snapshot is not None:
-        groups = list(snapshot.groups)
-        assignments = dict(snapshot.assignments)
-    else:
-        groups = _stable_union(
-            [
-                [name for _group_id, name in _ordered_group_pairs(store_scopes[key])]
-                for key in ordered_scope_keys
+    )
+    if snapshot is not None:
+        active_groups = []
+        if active_has_groups:
+            active_groups = [
+                name
+                for _group_id, name in _ordered_group_pairs(
+                    store_scopes[active_scope]
+                )
             ]
-        )
+        groups = _stable_union((active_groups, snapshot.groups, current_groups))
+        assignments = dict(snapshot.assignments)
+        if active_has_groups:
+            assignments.update(
+                _scope_assignments_by_name(store_scopes[active_scope])
+            )
+    else:
+        groups = current_groups
+        assignments = {}
         candidate_assignments = {}  # type: Dict[str, Set[str]]
         for scope in store_scopes.values():
             for session, name in _scope_assignments_by_name(scope).items():
@@ -308,10 +395,11 @@ def transform_layout_records(
     for session, names in candidate_assignments.items():
         if session not in assignments and len(names) == 1:
             assignments[session] = next(iter(names))
+    group_names = set(groups)
     assignments = {
         session: name
         for session, name in assignments.items()
-        if name in set(groups) and session not in ambiguous_sessions
+        if name in group_names and session not in ambiguous_sessions
     }
 
     current_pins = _stable_union((store_pins, local_pins))
@@ -348,7 +436,7 @@ def transform_layout_records(
             name = assignments.get(session)
             if name is None and session in ambiguous_sessions:
                 name = existing_by_name.get(session)
-            if name in ids_by_name:
+            if name in group_names:
                 target_assignments[session] = ids_by_name[name]
         replacement["assignments"] = target_assignments
         existing_order = existing.get("order", {})
