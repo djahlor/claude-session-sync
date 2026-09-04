@@ -1,13 +1,14 @@
 # Claude Session Sync
 
-Claude Session Sync keeps Claude Desktop Code chats, pins, and custom groups
-available when you change accounts on one Mac. The normal setup uses one Claude
-app and one local data root. A separate Personal app remains an optional,
+Claude Session Sync keeps Claude Desktop Code chats, routines, pins, and custom
+groups available when you change accounts on one Mac. The normal setup uses one
+Claude app and one local data root. A separate Personal app remains an optional,
 advanced mode.
 
 It plans chat changes first, uses a single writer, and keeps byte-for-byte
 recovery journals. Sidebar sync changes only three tested Local Storage records.
-It never copies Claude's whole login database.
+Routine sync changes only Claude Code's scheduled-task manifests. It never
+copies Claude's whole login database.
 
 > [!WARNING]
 > This is experimental software built against Claude Desktop's undocumented,
@@ -21,7 +22,8 @@ It never copies Claude's whole login database.
 Synchronization can move conversation-session metadata across Claude profiles
 and across account namespaces. That can expose work history to a personal
 profile, or personal history to a work profile. Review your employer's policy
-before enabling it.
+before enabling it. Routine manifests can include local paths and approved
+permission settings, so the same boundary applies to routine sync.
 
 The base config starts in safe mode. The recommended installer choice then
 enables automatic account discovery and sidebar sync inside the standard Claude
@@ -34,6 +36,7 @@ data root:
   "target_policy": "approved-only",
   "acknowledge_cross_profile_copy": false,
   "acknowledge_cross_account_copy": false,
+  "sync_code_routines": false,
   "sync_sidebar_layout": false
 }
 ```
@@ -41,9 +44,9 @@ data root:
 Automatic mode accepts future account and workspace IDs only under data roots
 already present in the private config. It does not trust new filesystem roots.
 Malformed chats and real revision conflicts still stop chat writes. A malformed
-sidebar record skips only the sidebar update, so a completed chat sync stays
-completed. Machine-readable output and logs contain aggregate counts, not raw
-account IDs, session IDs, paths, titles, or chat content.
+routine or sidebar record skips only that separate update, so a completed chat
+sync stays completed. Machine-readable output and logs contain aggregate counts,
+not raw account IDs, session IDs, paths, titles, or chat content.
 
 ## Requirements and compatibility
 
@@ -51,8 +54,8 @@ account IDs, session IDs, paths, titles, or chat content.
 - Python 3.9 or newer; runtime dependencies are Python standard library only.
 - Xcode Command Line Tools for the event-driven watcher and bundled sidebar
   helper. The installer compiles both locally.
-- The currently observed Claude Code-session registry layout. This is an
-  undocumented compatibility surface, not a stable API.
+- The currently observed Claude Code-session and routine-manifest layouts.
+  These are undocumented compatibility surfaces, not stable APIs.
 
 The standard profile launches Claude normally with no `--user-data-dir`.
 Advanced two-profile mode adds a second data root and two generated launchers.
@@ -62,13 +65,13 @@ Advanced two-profile mode adds a second data root and two generated launchers.
 For the easiest install, download the repository, double-click
 `Install Claude Session Sync.command`, and choose option 1. It uses the normal
 Claude app, trusts future accounts inside that app's existing data root, and
-syncs chats, pins, and groups after Claude quits. It uses the macOS system
-Python and does not install Python packages globally.
+syncs chats, Code routines, pins, and groups after Claude quits. It uses the
+macOS system Python and does not install Python packages globally.
 
 The same setup can run from Terminal:
 
 ```sh
-./install.sh --automatic-targets --sync-layout --disable-personal
+./install.sh --automatic-targets --sync-layout --sync-routines --disable-personal
 ```
 
 From this directory:
@@ -112,7 +115,7 @@ claude-session-sync configure --automatic-targets --apply
 To use the advanced separate Personal app:
 
 ```sh
-claude-session-sync configure --automatic-targets --sync-layout --enable-personal --apply
+claude-session-sync configure --automatic-targets --sync-layout --sync-routines --enable-personal --apply
 claude-session-sync install --apply
 ```
 
@@ -131,8 +134,9 @@ The normal workflow has three steps:
 
 1. Sign out and sign in to another account in Claude when needed.
 2. Quit Claude once.
-3. Wait for `claude-session-sync status` to report `ready`, then open Claude
-   normally. The watcher syncs chats, pins, and groups while Claude is closed.
+3. Wait for `claude-session-sync status` to report `idle`, then open Claude
+   normally. The watcher syncs chats, Code routines, pins, and groups while
+   Claude is closed.
 
 If Claude reopens before the watcher can write, no data is changed. Quit it
 again and let the watcher finish the pending sync.
@@ -218,20 +222,39 @@ assignment stays in place and no assignment is guessed for a new scope. A
 private snapshot restores pins and groups if a new account starts with empty
 sidebar state.
 
+## Claude Code routines
+
+Claude Code stores routines in `scheduled-tasks.json`, separate from chat files.
+The task instructions remain in Claude's shared `~/.claude/scheduled-tasks`
+directory, so account switching needs only the small manifest copied.
+
+The adapter merges routines by task ID across approved account and organization
+targets. On first sync it combines unique tasks and keeps the newest manifest
+when the same task differs. A private snapshot then tracks additions, edits, and
+deletions so a deleted routine does not return from a stale account. New empty
+accounts receive the current snapshot instead of deleting it.
+
+Each multi-file update has exact preimages, post-write verification, automatic
+rollback, and crash recovery. Routine errors are reported separately and never
+change a completed chat result. This release syncs Claude Code routines only;
+Cowork routines use different space-specific context and are left untouched.
+
 ## Failure handling
 
 `plan`, `auto`, and `switch` return `next_action=run-doctor` for malformed chat
 data or conflicts. Exact-target safe mode returns
-`next_action=approve-targets-or-enable-automatic-targets` when a routine new
-target is the only blocker. Automatic mode removes that routine approval step,
+`next_action=approve-targets-or-enable-automatic-targets` when a new target is
+the only blocker. Automatic mode removes that approval step,
 but never converts data corruption or an ambiguous revision into an overwrite.
 
-Sidebar errors are separate. A malformed or changed sidebar format returns
+Routine and sidebar errors are separate. A malformed routine manifest returns
+`routines={'state': 'skipped', 'reason': 'unsafe-routines', 'detail': '...'}`.
+A malformed or changed sidebar format returns
 `layout={'state': 'skipped', 'reason': 'unsafe-layout', 'detail': '...'}` after
-the chat result. The detail names the failed safety check without exposing chat
-or account IDs. No sidebar record is written. If verification fails after a
-write, the tool restores the three exact preimages. A failed restore creates
-`RECOVERY_REQUIRED` state and stops later sidebar writes.
+the chat result. Details name the failed safety check without exposing chat or
+account IDs. No affected record is written. If verification fails after a
+write, the tool restores exact preimages. A failed restore creates
+`RECOVERY_REQUIRED` state and stops later writes for that adapter.
 
 ## Recovery
 

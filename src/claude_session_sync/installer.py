@@ -179,6 +179,7 @@ class Installer:
             "acknowledge_cross_profile_copy": False,
             "target_policy": "approved-only",
             "sync_sidebar_layout": False,
+            "sync_code_routines": False,
             "claude_executable": str(executable),
             "profiles": [
                 {

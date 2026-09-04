@@ -60,6 +60,7 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(template["acknowledge_cross_account_copy"])
             self.assertEqual(template["target_policy"], "approved-only")
             self.assertFalse(template["sync_sidebar_layout"])
+            self.assertFalse(template["sync_code_routines"])
             self.assertFalse(template["profiles"][1]["enabled"])
             self.assertEqual(
                 template["profiles"][1]["data_root"],

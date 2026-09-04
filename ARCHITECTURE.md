@@ -65,6 +65,10 @@ clears a known failed launch. It adds no synchronization policy.
 12. Sidebar writes use one atomic LevelDB batch, checksum-verified reads,
     exact preimage journals, post-write verification, and automatic rollback.
     A sidebar failure cannot undo or relabel an already committed chat sync.
+13. Code routine sync is a separate, optional adapter. It writes only approved
+    `scheduled-tasks.json` targets and cannot undo or relabel a chat sync.
+14. Routine additions, edits, and deletions use a private three-way snapshot.
+    Equal-time divergent edits stop only the routine adapter.
 
 ## Sidebar layout adapter
 
@@ -80,6 +84,21 @@ It exposes only exact-key reads and an atomic write batch. Unknown record shapes
 missing records, internal record disagreement, checksum errors, and post-write
 verification failures stop the layout pass. Chat receipts remain committed and
 the aggregate status reports the layout failure separately.
+
+## Code routine adapter
+
+Claude Code initializes one scheduled-task manifest for the active account and
+organization. The routine adapter discovers the same approved targets as chat
+sync and merges task records by ID after Claude terminates. A first run unions
+unique tasks and uses manifest modification time for differing copies. Later
+runs compare every target with a private snapshot, which makes deletions and new
+empty accounts unambiguous.
+
+The task instruction files stay in Claude's shared scheduled-task directory.
+Before any manifest write, the adapter confirms every selected instruction file
+is a regular `SKILL.md` under its task ID. Multi-file writes have private exact
+preimages, verification, rollback, and crash recovery. Cowork routine manifests
+are excluded because their space context has different semantics.
 
 ## State machine
 
@@ -98,4 +117,5 @@ and injected process/launch adapters. Required behaviors include deterministic
 planning, explicit privacy scope, two-profile discovery, malformed and tied
 revision blocking, one-writer concurrency, interruption recovery, app-reopen
 abort, idempotent apply, byte-perfect rollback, and a 5,000-replica performance
-budget.
+budget. Routine tests cover union, newest-edit selection, deletion propagation,
+new empty targets, malformed manifests, and missing task instructions.

@@ -81,6 +81,20 @@ class FakeLayout:
         return FakeLayoutReceipt()
 
 
+class FakeRoutineReceipt:
+    state = "synced"
+    profile_count = 1
+    target_count = 3
+    manifest_count = 2
+    task_count = 4
+    write_count = 1
+
+
+class FakeRoutine:
+    def sync(self):
+        return FakeRoutineReceipt()
+
+
 class FakeProcessProbe:
     def __init__(self, processes=()):
         self.processes = tuple(processes)
@@ -996,6 +1010,7 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                         "launch_guards": 0,
                         "layout_failures": 0,
                         "profiles": 2,
+                        "routine_failures": 0,
                         "running_processes": 0,
                         "watcher_failures": 0,
                     },
@@ -1225,6 +1240,7 @@ class CliConfigureTests(unittest.TestCase):
                     "configure",
                     "--disable-personal",
                     "--sync-layout",
+                    "--sync-routines",
                     "--apply",
                 ],
                 stdout=io.StringIO(),
@@ -1236,6 +1252,69 @@ class CliConfigureTests(unittest.TestCase):
             self.assertFalse(updated["profiles"][1]["enabled"])
             self.assertFalse(updated["acknowledge_cross_profile_copy"])
             self.assertTrue(updated["sync_sidebar_layout"])
+            self.assertTrue(updated["sync_code_routines"])
+
+
+class CliRoutineTests(unittest.TestCase):
+    def test_sync_reports_routines_without_changing_chat_receipt_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_code_routines=True)
+            planned = Plan(1, "digest", (), (), (), "plan-routines", 0)
+            receipt = RunReceipt("run-routines", "committed", "plan-routines", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                routine_factory=lambda _config: FakeRoutine(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("committed", payload["state"])
+            self.assertEqual("synced", payload["routines"]["state"])
+            self.assertEqual(4, payload["routines"]["tasks"])
+
+    def test_routine_failure_does_not_change_committed_chat_result(self):
+        class BrokenRoutine:
+            def sync(self):
+                raise RuntimeError("unexpected routine adapter failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_code_routines=True)
+            planned = Plan(1, "digest", (), (), (), "plan-routines", 0)
+            receipt = RunReceipt("run-routines", "committed", "plan-routines", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                routine_factory=lambda _config: BrokenRoutine(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("committed", payload["state"])
+            self.assertEqual(
+                {"state": "skipped", "reason": "routine-error"},
+                payload["routines"],
+            )
 
 
 class CliLayoutTests(unittest.TestCase):

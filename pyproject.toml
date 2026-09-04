@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.3.1"
-description = "Safely synchronize Claude Desktop Code sessions and sidebar layout across local accounts."
+version = "0.4.0"
+description = "Safely synchronize Claude Desktop Code chats, routines, and sidebar layout across local accounts."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

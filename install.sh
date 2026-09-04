@@ -6,6 +6,7 @@ automatic_targets=false
 enable_personal=false
 disable_personal=false
 sync_layout=false
+sync_routines=false
 
 for argument in "$@"; do
   case "$argument" in
@@ -21,9 +22,12 @@ for argument in "$@"; do
     --sync-layout)
       sync_layout=true
       ;;
+    --sync-routines)
+      sync_routines=true
+      ;;
     *)
       echo "Unknown option: $argument" >&2
-      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--enable-personal|--disable-personal]" >&2
+      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--enable-personal|--disable-personal]" >&2
       exit 2
       ;;
   esac
@@ -83,6 +87,9 @@ fi
 if [[ "$sync_layout" == true ]]; then
   configure_args+=(--sync-layout)
 fi
+if [[ "$sync_routines" == true ]]; then
+  configure_args+=(--sync-routines)
+fi
 if (( ${#configure_args[@]} > 0 )); then
   run_source_cli configure "${configure_args[@]}" --apply
   run_source_cli install --apply
@@ -103,4 +110,7 @@ else
 fi
 if [[ "$sync_layout" == true ]]; then
   echo "Pins and custom groups will sync after Claude quits."
+fi
+if [[ "$sync_routines" == true ]]; then
+  echo "Claude Code routines will sync after Claude quits."
 fi

@@ -26,6 +26,7 @@ PlannerFactory = Callable[[Config], Any]
 EngineFactory = Callable[[Config], Any]
 InstallerFactory = Callable[[Path], Any]
 LayoutFactory = Callable[[Config], Any]
+RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 2.0
 LAUNCH_CONFIRMATION_TIMEOUT_SECONDS = 5.0
@@ -72,6 +73,12 @@ def _default_layout_factory(config: Config) -> Any:
     return LayoutSynchronizer(config)
 
 
+def _default_routine_factory(config: Config) -> Any:
+    from .routines import RoutineSynchronizer
+
+    return RoutineSynchronizer(config)
+
+
 @dataclass(frozen=True)
 class CliDependencies:
     """Injected system boundaries used by command tests and platform adapters."""
@@ -83,6 +90,7 @@ class CliDependencies:
     launcher: Any = None
     installer_factory: InstallerFactory = _default_installer_factory
     layout_factory: LayoutFactory = _default_layout_factory
+    routine_factory: RoutineFactory = _default_routine_factory
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
@@ -167,6 +175,11 @@ def _parser() -> argparse.ArgumentParser:
         "--sync-layout",
         action="store_true",
         help="sync pins and custom groups after Claude quits",
+    )
+    configure.add_argument(
+        "--sync-routines",
+        action="store_true",
+        help="sync Claude Code routines after Claude quits",
     )
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
@@ -272,6 +285,50 @@ def _record_layout_status(state_dir: Path, payload: Mapping[str, Any]) -> None:
     try:
         ensure_private_directory(state_dir)
         path = state_dir / "sidebar-layout-status.json"
+        atomic_write_bytes(
+            path,
+            (json.dumps(dict(payload), sort_keys=True) + "\n").encode("utf-8"),
+        )
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _routine_summary(config: Config, dependencies: CliDependencies) -> dict:
+    if not config.sync_code_routines:
+        return {"state": "disabled"}
+    from .routines import RoutineBusyError, RoutineError
+
+    try:
+        receipt = dependencies.routine_factory(config).sync()
+        payload = {
+            "state": receipt.state,
+            "profiles": receipt.profile_count,
+            "targets": receipt.target_count,
+            "manifests": receipt.manifest_count,
+            "tasks": receipt.task_count,
+            "writes": receipt.write_count,
+        }
+    except RoutineBusyError:
+        payload = {"state": "skipped", "reason": "writer-busy"}
+    except RoutineError as error:
+        payload = {
+            "state": "skipped",
+            "reason": "unsafe-routines",
+            "detail": str(error),
+        }
+    except Exception:
+        payload = {"state": "skipped", "reason": "routine-error"}
+    _record_routine_status(config.state_dir, payload)
+    return payload
+
+
+def _record_routine_status(state_dir: Path, payload: Mapping[str, Any]) -> None:
+    from .filesystem import atomic_write_bytes, ensure_private_directory
+
+    try:
+        ensure_private_directory(state_dir)
+        path = state_dir / "code-routines-status.json"
         atomic_write_bytes(
             path,
             (json.dumps(dict(payload), sort_keys=True) + "\n").encode("utf-8"),
@@ -596,6 +653,8 @@ def _run_switch(
                 raise
         duration_ms = round((dependencies.clock() - started) * 1000)
         payload = _receipt_summary(receipt, duration_ms)
+        if config.sync_code_routines:
+            payload["routines"] = _routine_summary(config, dependencies)
         if config.sync_sidebar_layout:
             payload["layout"] = _layout_summary(config, dependencies)
         if not arguments.no_launch:
@@ -681,6 +740,24 @@ def _layout_failure(config: Config) -> int:
     )
 
 
+def _routine_failure(config: Config) -> int:
+    if not config.sync_code_routines:
+        return 0
+    path = config.state_dir / "code-routines-status.json"
+    if not path.exists():
+        return 0
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 1
+    return (
+        0
+        if isinstance(document, dict)
+        and document.get("state") in ("synced", "noop")
+        else 1
+    )
+
+
 def _doctor_summary(config: Config) -> dict:
     from .journal import JournalError, pending_recovery_runs
     from .store import SessionStore
@@ -731,18 +808,21 @@ def _doctor_summary(config: Config) -> dict:
     errors += watcher_failure
     layout_failure = _layout_failure(config)
     errors += layout_failure
+    routine_failure = _routine_failure(config)
+    errors += routine_failure
     launch_guard_failure = _launch_guard_failure(config)
     errors += launch_guard_failure
     return {
         "bytes": 0,
         "counts": {
-            "checks": 7 + len(config.profiles),
+            "checks": 8 + len(config.profiles),
             "errors": errors,
             "invalid_replicas": len(discovery.invalid_replicas),
             "launch_guards": launch_guard_failure,
             "layout_failures": layout_failure,
             "profiles": len(config.profiles),
             "recovery_pending": recovery_pending,
+            "routine_failures": routine_failure,
             "targets": len(discovery.targets),
             "unapproved_targets": unapproved,
             "watcher_failures": watcher_failure,
@@ -827,6 +907,7 @@ def _configure(
     enable_personal: bool,
     disable_personal: bool,
     sync_layout: bool,
+    sync_routines: bool,
     apply: bool,
 ) -> dict:
     from .filesystem import atomic_write_bytes, ensure_private_directory
@@ -887,6 +968,10 @@ def _configure(
         document["sync_sidebar_layout"] = True
         changes += 1
 
+    if sync_routines and document.get("sync_code_routines") is not True:
+        document["sync_code_routines"] = True
+        changes += 1
+
     _validate_config_document(document)
     if apply and changes:
         encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(
@@ -911,6 +996,7 @@ def _configure(
                 document.get("target_policy") == "all-configured-profiles"
             ),
             "layout_sync": int(document.get("sync_sidebar_layout") is True),
+            "routine_sync": int(document.get("sync_code_routines") is True),
         },
     }
 
@@ -961,6 +1047,7 @@ def run(
                 enable_personal=arguments.enable_personal,
                 disable_personal=arguments.disable_personal,
                 sync_layout=arguments.sync_layout,
+                sync_routines=arguments.sync_routines,
                 apply=arguments.apply,
             )
             _write(payload, as_json=False, stream=output)
@@ -990,6 +1077,8 @@ def run(
             receipt = deps.engine_factory(config).apply(plan)
             duration_ms = round((deps.clock() - started) * 1000)
             payload = _receipt_summary(receipt, duration_ms)
+            if config.sync_code_routines:
+                payload["routines"] = _routine_summary(config, deps)
             if config.sync_sidebar_layout:
                 payload["layout"] = _layout_summary(config, deps)
             _write(
@@ -1034,6 +1123,8 @@ def run(
                 receipt,
                 round((deps.clock() - started) * 1000),
             )
+            if config.sync_code_routines:
+                payload["routines"] = _routine_summary(config, deps)
             if config.sync_sidebar_layout:
                 payload["layout"] = _layout_summary(config, deps)
             _write(
@@ -1067,6 +1158,7 @@ def run(
             watcher_failure = _watcher_failure(config.state_dir)
             launch_guard_failure = _launch_guard_failure(config)
             layout_failure = _layout_failure(config)
+            routine_failure = _routine_failure(config)
             _write(
                 {
                     "bytes": 0,
@@ -1074,6 +1166,7 @@ def run(
                         "launch_guards": launch_guard_failure,
                         "layout_failures": layout_failure,
                         "profiles": len(config.profiles),
+                        "routine_failures": routine_failure,
                         "running_processes": len(running),
                         "watcher_failures": watcher_failure,
                     },
@@ -1085,6 +1178,8 @@ def run(
                         if launch_guard_failure
                         else "layout-failed"
                         if layout_failure
+                        else "routines-failed"
+                        if routine_failure
                         else "watcher-failed"
                         if watcher_failure
                         else "idle"

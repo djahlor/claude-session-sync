@@ -30,6 +30,7 @@ class Config:
     approved_targets: Tuple[ApprovedTarget, ...] = ()
     target_policy: str = "approved-only"
     sync_sidebar_layout: bool = False
+    sync_code_routines: bool = False
     version: int = 1
 
     @classmethod
@@ -48,8 +49,13 @@ _CONFIG_KEYS = {
     "claude_executable",
     "target_policy",
     "sync_sidebar_layout",
+    "sync_code_routines",
 }
-_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {"target_policy", "sync_sidebar_layout"}
+_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
+    "target_policy",
+    "sync_sidebar_layout",
+    "sync_code_routines",
+}
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
 _TARGET_KEYS = {"profile", "account", "workspace"}
 _TARGET_POLICIES = {"approved-only", "all-configured-profiles"}
@@ -153,6 +159,7 @@ def config_as_dict(config: Config, include_paths: bool = True) -> Dict[str, Any]
         "acknowledge_cross_account_copy": config.acknowledge_cross_account_copy,
         "target_policy": config.target_policy,
         "sync_sidebar_layout": config.sync_sidebar_layout,
+        "sync_code_routines": config.sync_code_routines,
         "claude_executable": (
             str(config.claude_executable) if include_paths else "<claude-executable>"
         ),
@@ -246,6 +253,9 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_sidebar_layout = document.get("sync_sidebar_layout", False)
     if not isinstance(sync_sidebar_layout, bool):
         raise ConfigError("sync_sidebar_layout must be a boolean")
+    sync_code_routines = document.get("sync_code_routines", False)
+    if not isinstance(sync_code_routines, bool):
+        raise ConfigError("sync_code_routines must be a boolean")
 
     claude_executable = Path(
         _nonempty_string(document["claude_executable"], "claude_executable")
@@ -261,5 +271,6 @@ def load_config(path: Union[str, Path]) -> Config:
         approved_targets=approved_targets,
         target_policy=target_policy,
         sync_sidebar_layout=sync_sidebar_layout,
+        sync_code_routines=sync_code_routines,
         version=version,
     )
