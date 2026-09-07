@@ -265,11 +265,43 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(layout.runtime_package.exists())
             self.assertFalse(layout.work_app.exists())
 
+    def test_compile_failure_restores_exact_preinstall_state(self):
+        class FailingLayoutCompiler(FakeCommandRunner):
+            def __call__(self, command, **kwargs):
+                if "clang++" in command:
+                    raise subprocess.CalledProcessError(
+                        1, command, stderr="synthetic compiler failure"
+                    )
+                return super().__call__(command, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            layout = self.layout(home)
+            unrelated = layout.support_dir / "keep.txt"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_bytes(b"keep-exactly")
+            installer = Installer(layout, runner=FailingLayoutCompiler())
+
+            with self.assertRaisesRegex(RuntimeError, "synthetic compiler failure"):
+                installer.install(dry_run=False)
+
+            self.assertEqual(unrelated.read_bytes(), b"keep-exactly")
+            self.assertFalse(layout.config_path.exists())
+            self.assertFalse(layout.runtime_package.exists())
+            self.assertFalse(layout.runtime_cli.exists())
+            self.assertFalse(layout.watcher_binary.exists())
+            self.assertFalse(layout.layout_helper.exists())
+            self.assertFalse(layout.launch_agent.exists())
+
     def test_legacy_service_must_be_confirmed_stopped_before_activation(self):
         class StubbornLegacyRunner(FakeCommandRunner):
             def __call__(self, command, **kwargs):
                 result = super().__call__(command, **kwargs)
-                if len(command) > 1 and command[1] == "print":
+                if (
+                    len(command) > 1
+                    and command[1] == "print"
+                    and command[-1].endswith("/com.djahlor.claude-session-sync")
+                ):
                     return subprocess.CompletedProcess(
                         command, 0, stdout="still loaded", stderr=""
                     )
@@ -314,6 +346,75 @@ class InstallerTests(unittest.TestCase):
 
             launch_agent = layout.launch_agent.read_text(encoding="utf-8")
             self.assertIn(str(custom_state / "watcher-status.json"), launch_agent)
+
+    def test_setup_applies_supplied_config_in_the_same_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            layout = self.layout(home)
+            installer = Installer(layout, runner=FakeCommandRunner())
+            document = json.loads(installer.default_config_data())
+            document["profiles"][1]["enabled"] = True
+            document["acknowledge_cross_profile_copy"] = True
+            document["acknowledge_cross_account_copy"] = True
+            config_data = (
+                json.dumps(document, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+
+            report = installer.setup(dry_run=False, config_data=config_data)
+
+            self.assertEqual(report.state, "installed")
+            self.assertEqual(layout.config_path.read_bytes(), config_data)
+            self.assertTrue(layout.work_app.exists())
+            self.assertTrue(layout.personal_app.exists())
+
+    def test_activation_failure_restores_existing_config_and_artifacts(self):
+        class FailNextWatcherBootstrap(FakeCommandRunner):
+            def __init__(self):
+                super().__init__()
+                self.fail_next = False
+
+            def __call__(self, command, **kwargs):
+                if (
+                    self.fail_next
+                    and len(command) > 1
+                    and command[1] == "bootstrap"
+                    and "com.claude-session-sync.watcher.plist" in command[-1]
+                ):
+                    self.fail_next = False
+                    raise subprocess.CalledProcessError(1, command)
+                return super().__call__(command, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            layout = self.layout(home)
+            runner = FailNextWatcherBootstrap()
+            installer = Installer(layout, runner=runner, backup_id=lambda: "rollback")
+            installer.setup(dry_run=False)
+            before_config = layout.config_path.read_bytes()
+            before_agent = layout.launch_agent.read_bytes()
+            before_runtime = {
+                path.relative_to(layout.runtime_package): path.read_bytes()
+                for path in layout.runtime_package.rglob("*")
+                if path.is_file()
+            }
+            document = json.loads(before_config)
+            document["sync_sidebar_layout"] = True
+            changed = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+            runner.fail_next = True
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                installer.setup(dry_run=False, config_data=changed)
+
+            self.assertEqual(layout.config_path.read_bytes(), before_config)
+            self.assertEqual(layout.launch_agent.read_bytes(), before_agent)
+            self.assertEqual(
+                {
+                    path.relative_to(layout.runtime_package): path.read_bytes()
+                    for path in layout.runtime_package.rglob("*")
+                    if path.is_file()
+                },
+                before_runtime,
+            )
 
 
 if __name__ == "__main__":

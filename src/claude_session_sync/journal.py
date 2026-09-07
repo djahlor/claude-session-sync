@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
+from . import strict_json as json
 import os
 import re
 import shutil
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from .filesystem import (
+    _open_regular_read,
     atomic_copy,
     atomic_write_bytes,
     digest_file,
@@ -70,19 +71,23 @@ class RunJournal:
         state = ensure_private_directory(state_root)
         authentication_key = cls._load_or_create_key(state)
         runs = ensure_private_directory(state / "runs")
+        preparations = ensure_private_directory(state / "preparations")
         fsync_directory(state)
         identifier = run_id or uuid.uuid4().hex
         cls._validate_run_id(identifier)
-        run_root = runs / identifier
+        # A run becomes recoverable only after every backup and its signed
+        # manifest are durable. Failed preparations never changed live data.
+        if os.path.lexists(str(runs / identifier)):
+            raise JournalError("run already exists: {}".format(identifier))
+        run_root = preparations / identifier
         try:
             run_root.mkdir(mode=0o700)
         except FileExistsError as error:
             raise JournalError("run already exists: {}".format(identifier)) from error
-        fsync_directory(runs)
-        ensure_private_directory(run_root / "preimages")
-
         materialized = []  # type: List[Dict[str, Any]]
         try:
+            fsync_directory(preparations)
+            ensure_private_directory(run_root / "preimages")
             for index, raw_record in enumerate(records):
                 record = dict(raw_record)
                 record["index"] = index
@@ -101,22 +106,29 @@ class RunJournal:
                 else:
                     record["preimage"] = None
                 materialized.append(record)
-        except BaseException:
-            # An incomplete private run directory is intentionally retained as
-            # evidence. No live destination has been changed at this point.
-            raise
-
-        manifest = {
-            "version": cls.VERSION,
-            "run_id": identifier,
-            "plan_id": plan_id,
-            "phase": "JOURNALING",
-            "records": materialized,
-            "receipt": None,
-        }
-        journal = cls(state, identifier, manifest, authentication_key)
-        journal._persist()
-        return journal
+            manifest = {
+                "version": cls.VERSION,
+                "run_id": identifier,
+                "plan_id": plan_id,
+                "phase": "JOURNALING",
+                "records": materialized,
+                "receipt": None,
+            }
+            journal = cls(state, identifier, manifest, authentication_key)
+            journal._persist(destination=run_root / "manifest.json")
+            fsync_directory(run_root)
+            if os.path.lexists(str(journal.run_root)):
+                raise JournalError("run already exists: {}".format(identifier))
+            os.rename(str(run_root), str(journal.run_root))
+            fsync_directory(runs)
+            fsync_directory(preparations)
+            return journal
+        finally:
+            # These are copies, never originals: live mutation starts only
+            # after publication and return. Never remove the published journal.
+            if os.path.lexists(str(run_root)):
+                shutil.rmtree(str(run_root))
+                fsync_directory(preparations)
 
     @classmethod
     def load(cls, state_root: PathLike, run_id: str) -> "RunJournal":
@@ -125,7 +137,8 @@ class RunJournal:
         authentication_key = cls._load_or_create_key(state)
         manifest_path = state / "runs" / run_id / "manifest.json"
         try:
-            raw = manifest_path.read_bytes()
+            with _open_regular_read(manifest_path) as stream:
+                raw = stream.read()
         except FileNotFoundError as error:
             raise JournalError("unknown run: {}".format(run_id)) from error
         try:
@@ -183,7 +196,7 @@ class RunJournal:
         self.manifest["receipt"] = dict(receipt)
         self._persist()
 
-    def _persist(self) -> None:
+    def _persist(self, *, destination: Optional[Path] = None) -> None:
         self.manifest["generation"] = int(self.manifest.get("generation", 0)) + 1
         self.manifest["checksum"] = self._checksum(
             self.manifest, self.authentication_key
@@ -194,7 +207,7 @@ class RunJournal:
             )
             + b"\n"
         )
-        atomic_write_bytes(self.manifest_path, encoded)
+        atomic_write_bytes(destination or self.manifest_path, encoded)
 
     @classmethod
     def _validate_manifest(
@@ -286,7 +299,7 @@ class RunJournal:
         key_path = state_root / "journal.key"
         if not os.path.lexists(str(key_path)):
             atomic_write_bytes(key_path, os.urandom(32))
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
@@ -338,6 +351,23 @@ def prune_terminal_runs(state_root: PathLike, retention: int) -> List[str]:
             continue
         deleted.append(run_id)
     return deleted
+
+
+def abandoned_preparations(state_root: PathLike) -> List[str]:
+    """Expose crash residue without mistaking it for a published transaction."""
+
+    root = Path(state_root) / "preparations"
+    if not os.path.lexists(str(root)):
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise JournalError("preparations path is not a real directory")
+    identifiers = []
+    for path in root.iterdir():
+        if path.is_symlink() or not path.is_dir():
+            raise JournalError("unexpected entry in preparations directory")
+        RunJournal._validate_run_id(path.name)
+        identifiers.append(path.name)
+    return sorted(identifiers)
 
 
 def pending_recovery_runs(state_root: PathLike) -> List[str]:

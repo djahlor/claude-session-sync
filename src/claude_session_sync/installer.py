@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from . import strict_json as json
 import os
 import shlex
 import shutil
@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import load_config
+from .filesystem import fsync_directory
+from .install_transaction import InstallTransaction
 
 
 def _xml(value: object) -> str:
@@ -204,6 +206,13 @@ class Installer:
         }
         return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
+    def default_config_data(self) -> bytes:
+        """Return the validated default configuration used for a fresh setup."""
+
+        data = self._config_template()
+        self._load_config_bytes(data)
+        return data
+
     def _bundle(self, profile: str, identifier: str) -> Dict[Path, Tuple[bytes, int]]:
         command = self.layout.cli_command + (
             "--config",
@@ -230,8 +239,12 @@ class Installer:
             Path("Contents/MacOS/launcher"): (launcher, 0o755),
         }
 
-    def _launch_agent(self) -> bytes:
-        if self.layout.config_path.exists():
+    def _launch_agent(self, config_data: Optional[bytes] = None) -> bytes:
+        if config_data is not None:
+            configured = self._load_config_bytes(config_data)
+            claude_executable = configured.claude_executable
+            watcher_status = configured.state_dir / "watcher-status.json"
+        elif self.layout.config_path.exists():
             configured = load_config(self.layout.config_path)
             claude_executable = configured.claude_executable
             watcher_status = configured.state_dir / "watcher-status.json"
@@ -356,16 +369,36 @@ class Installer:
         except OSError:
             return False
 
-    def _planned_actions(self) -> List[InstallAction]:
+    def _load_config_bytes(self, data: bytes):
+        descriptor, name = tempfile.mkstemp(prefix=".session-sync-config-")
+        path = Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+            os.chmod(path, 0o600)
+            return load_config(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def _planned_actions(self, config_data: Optional[bytes] = None) -> List[InstallAction]:
         actions = []
         for legacy in self.layout.legacy_launch_agents:
             if legacy.exists():
                 actions.append(InstallAction("disable-legacy", legacy))
-        if not self.layout.config_path.exists():
+        if config_data is not None:
+            configured = self._load_config_bytes(config_data)
+            if not self._same_file(self.layout.config_path, config_data, 0o600):
+                actions.append(InstallAction(
+                    "replace" if self.layout.config_path.exists() else "create",
+                    self.layout.config_path,
+                ))
+        elif not self.layout.config_path.exists():
             actions.append(InstallAction("create", self.layout.config_path))
         elif stat.S_IMODE(self.layout.config_path.stat().st_mode) != 0o600:
             actions.append(InstallAction("permission", self.layout.config_path))
-        if self.layout.config_path.exists():
+        if config_data is not None:
+            enabled_profiles = {profile.name for profile in configured.profiles}
+        elif self.layout.config_path.exists():
             enabled_profiles = {
                 profile.name
                 for profile in load_config(self.layout.config_path).profiles
@@ -418,7 +451,7 @@ class Installer:
             actions.append(InstallAction("compile", self.layout.watcher_binary))
         if not self._layout_helper_current():
             actions.append(InstallAction("compile", self.layout.layout_helper))
-        agent = self._launch_agent()
+        agent = self._launch_agent(config_data)
         if not self._same_file(self.layout.launch_agent, agent, 0o644):
             actions.append(
                 InstallAction(
@@ -437,6 +470,8 @@ class Installer:
             index += 1
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(target, destination)
+        fsync_directory(target.parent)
+        fsync_directory(destination.parent)
         self._backups.append(destination)
         return destination
 
@@ -464,6 +499,7 @@ class Installer:
             if target.exists():
                 self._backup(target)
             os.replace(temporary, target)
+            fsync_directory(target.parent)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -488,124 +524,158 @@ class Installer:
                         text=True,
                         capture_output=True,
                     )
+                descriptor = os.open(str(destination), os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            for directory in sorted(
+                (path for path in staging.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts), reverse=True,
+            ):
+                fsync_directory(directory)
+            fsync_directory(staging)
             if target.exists():
                 self._backup(target)
             os.replace(staging, target)
+            fsync_directory(target.parent)
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
 
-    def _compile_watcher(self) -> None:
-        target = self.layout.watcher_binary
-        target.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".watcher-", dir=str(target.parent)
+    def _stage_watcher(self, target: Path) -> None:
+        self._runner(
+            [
+                "/usr/bin/xcrun", "swiftc", str(self.layout.source_watcher),
+                "-o", str(target), "-framework", "AppKit",
+            ],
+            check=True, text=True, capture_output=True,
         )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        temporary.unlink()
-        try:
-            self._runner(
-                [
-                    "/usr/bin/xcrun",
-                    "swiftc",
-                    str(self.layout.source_watcher),
-                    "-o",
-                    str(temporary),
-                    "-framework",
-                    "AppKit",
-                ],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            if not temporary.is_file():
-                raise RuntimeError("swiftc did not create the watcher binary")
-            os.chmod(temporary, 0o755)
-            if target.exists():
-                self._backup(target)
-            os.replace(temporary, target)
-            self._atomic_file(
-                self.layout.watcher_stamp,
-                (self._watcher_digest() + "\n").encode("ascii"),
-                0o644,
-            )
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        if not target.is_file():
+            raise RuntimeError("swiftc did not create the watcher binary")
+        os.chmod(target, 0o755)
 
-    def _compile_layout_helper(self) -> None:
-        target = self.layout.layout_helper
-        target.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".layoutdb-", dir=str(target.parent)
-        )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        temporary.unlink()
+    def _stage_layout_helper(self, target: Path) -> None:
         package = Path(__file__).resolve().parent
         leveldb = package / "vendor" / "leveldb"
         snappy = package / "vendor" / "snappy"
         command = [
-            "/usr/bin/xcrun",
-            "clang++",
-            "-std=c++11",
-            "-O2",
-            "-DNDEBUG",
-            "-DSNAPPY",
-            "-DOS_MACOSX",
-            "-DLEVELDB_PLATFORM_POSIX",
-            "-DLEVELDB_ATOMIC_PRESENT",
-            "-Wno-deprecated-declarations",
-            "-I{}".format(leveldb),
-            "-I{}".format(leveldb / "include"),
-            "-I{}".format(snappy / "snappy"),
-            "-I{}".format(snappy / "mac"),
+            "/usr/bin/xcrun", "clang++", "-std=c++11", "-O2", "-DNDEBUG",
+            "-DSNAPPY", "-DOS_MACOSX", "-DLEVELDB_PLATFORM_POSIX",
+            "-DLEVELDB_ATOMIC_PRESENT", "-Wno-deprecated-declarations",
+            "-I{}".format(leveldb), "-I{}".format(leveldb / "include"),
+            "-I{}".format(snappy / "snappy"), "-I{}".format(snappy / "mac"),
         ]
         command.extend(str(source) for source in self._layout_sources())
-        command.extend(("-o", str(temporary)))
+        command.extend(("-o", str(target)))
         try:
-            try:
-                self._runner(
-                    command,
-                    check=True,
-                    text=True,
-                    capture_output=True,
-                )
-            except subprocess.CalledProcessError as error:
-                lines = (error.stderr or "").strip().splitlines()
-                detail = " | ".join(lines[-8:]) if lines else "compiler returned a failure"
-                raise RuntimeError(
-                    "could not compile the sidebar helper: {}".format(detail)
-                ) from error
-            if not temporary.is_file():
-                raise RuntimeError("clang++ did not create the sidebar helper")
-            os.chmod(temporary, 0o755)
-            if target.exists():
-                self._backup(target)
-            os.replace(temporary, target)
-            self._atomic_file(
-                self.layout.layout_helper_stamp,
-                (self._layout_helper_digest() + "\n").encode("ascii"),
-                0o644,
-            )
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+            self._runner(command, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+            lines = (error.stderr or "").strip().splitlines()
+            detail = " | ".join(lines[-8:]) if lines else "compiler returned a failure"
+            raise RuntimeError(
+                "could not compile the sidebar helper: {}".format(detail)
+            ) from error
+        if not target.is_file():
+            raise RuntimeError("clang++ did not create the sidebar helper")
+        os.chmod(target, 0o755)
 
-    def install(self, *, dry_run: bool) -> InstallReport:
-        actions = self._planned_actions()
+    def _transaction_targets(self) -> Tuple[Path, ...]:
+        return (
+            self.layout.config_path,
+            self.layout.work_app,
+            self.layout.personal_app,
+            self.layout.runtime_package,
+            self.layout.runtime_cli,
+            self.layout.watcher_binary,
+            self.layout.watcher_stamp,
+            self.layout.layout_helper,
+            self.layout.layout_helper_stamp,
+            self.layout.launch_agent,
+            self.layout.backups_dir,
+        ) + self.layout.legacy_launch_agents
+
+    def _install_transaction(
+        self, config_data: Optional[bytes] = None
+    ) -> InstallTransaction:
+        state_roots = {self.layout.support_dir / "state"}
+        if self.layout.config_path.exists():
+            try:
+                state_roots.add(load_config(self.layout.config_path).state_dir)
+            except (OSError, ValueError):
+                if not (self.layout.support_dir / "install-state").exists():
+                    raise
+        if config_data is not None:
+            state_roots.add(self._load_config_bytes(config_data).state_dir)
+        return InstallTransaction(
+            targets=self._transaction_targets(), state_roots=state_roots,
+            launch_agent=self.layout.launch_agent,
+            recovery_root=self.layout.support_dir / "install-state",
+            runner=self._runner, legacy_agents=self.layout.legacy_launch_agents,
+        )
+
+    def setup(
+        self, *, dry_run: bool, config_data: Optional[bytes] = None
+    ) -> InstallReport:
+        """Validate and stage a complete setup, then apply it transactionally."""
+
         if dry_run:
-            return InstallReport("planned", tuple(actions))
-        self._backups = []
-        legacy_actions = [
-            action for action in actions if action.kind == "disable-legacy"
+            if (self.layout.support_dir / "install-state").exists():
+                with self._install_transaction(config_data):
+                    pass
+            return InstallReport("planned", tuple(self._planned_actions(config_data)))
+        staging = Path(tempfile.mkdtemp(prefix="claude-session-sync-setup-"))
+        try:
+            # The install lock encloses recovery, planning, staging, and apply.
+            transaction = self._install_transaction(config_data)
+            with transaction:
+                actions = self._planned_actions(config_data)
+                watcher = staging / "SessionSyncWatcher"
+                helper = staging / "layoutdb"
+                if any(a.path == self.layout.watcher_binary for a in actions):
+                    self._stage_watcher(watcher)
+                if any(a.path == self.layout.layout_helper for a in actions):
+                    self._stage_layout_helper(helper)
+                self._validate_staged_plists(staging, config_data)
+                transaction.stop_watcher()
+                report = self._apply_setup(actions, config_data, watcher, helper)
+                remaining = self._planned_actions(config_data)
+                if remaining:
+                    raise RuntimeError(
+                        "installed artifacts failed verification: {}".format(
+                            ", ".join(str(action.path) for action in remaining)
+                        )
+                    )
+                transaction.sync_targets()
+                return report
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _validate_staged_plists(
+        self, staging: Path, config_data: Optional[bytes]
+    ) -> None:
+        data = [self._launch_agent(config_data)] + [
+            self._bundle(profile, identifier)[Path("Contents/Info.plist")][0]
+            for profile, identifier in (
+                ("Work", "com.claude-session-sync.work"),
+                ("Personal", "com.claude-session-sync.personal"),
+            )
         ]
+        for index, content in enumerate(data):
+            candidate = staging / "validate-{}.plist".format(index)
+            candidate.write_bytes(content)
+            self._runner(["/usr/bin/plutil", "-lint", str(candidate)], check=True,
+                         text=True, capture_output=True)
+
+    def _apply_setup(self, actions, config_data, watcher, helper) -> InstallReport:
+        self._backups = []
         for action in actions:
             if action.kind == "disable-legacy":
                 continue
             if action.path == self.layout.config_path:
-                if action.kind == "create":
+                if config_data is not None:
+                    self._atomic_file(action.path, config_data, 0o600)
+                elif action.kind == "create":
                     self._atomic_file(action.path, self._config_template(), 0o600)
                 else:
                     os.chmod(action.path, 0o600)
@@ -613,83 +683,47 @@ class Installer:
                 self._install_bundle(action.path, self._runtime_files())
             elif action.path == self.layout.runtime_cli:
                 self._atomic_file(action.path, self._runtime_shim(), 0o755)
-            elif action.path == self.layout.work_app:
+            elif action.path in (self.layout.work_app, self.layout.personal_app):
+                profile = "Work" if action.path == self.layout.work_app else "Personal"
                 if action.kind == "remove-disabled":
                     self._backup(action.path)
                 else:
                     self._install_bundle(
-                        action.path,
-                        self._bundle("Work", "com.claude-session-sync.work"),
-                    )
-            elif action.path == self.layout.personal_app:
-                if action.kind == "remove-disabled":
-                    self._backup(action.path)
-                else:
-                    self._install_bundle(
-                        action.path,
-                        self._bundle("Personal", "com.claude-session-sync.personal"),
+                        action.path, self._bundle(
+                            profile, "com.claude-session-sync." + profile.lower()
+                        )
                     )
             elif action.path == self.layout.watcher_binary:
-                self._compile_watcher()
+                self._atomic_file(action.path, watcher.read_bytes(), 0o755)
+                self._atomic_file(self.layout.watcher_stamp,
+                    (self._watcher_digest() + "\n").encode("ascii"), 0o644)
             elif action.path == self.layout.layout_helper:
-                self._compile_layout_helper()
+                self._atomic_file(action.path, helper.read_bytes(), 0o755)
+                self._atomic_file(self.layout.layout_helper_stamp,
+                    (self._layout_helper_digest() + "\n").encode("ascii"), 0o644)
             elif action.path == self.layout.launch_agent:
-                self._atomic_file(action.path, self._launch_agent(), 0o644, lint=True)
-        disabled_legacy = []
-        for action in legacy_actions:
-            self._runner(
-                [
-                    "/bin/launchctl",
-                    "bootout",
-                    "gui/{}".format(os.getuid()),
-                    str(action.path),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-            label = action.path.stem
+                self._atomic_file(action.path, self._launch_agent(config_data),
+                                  0o644, lint=True)
+        for action in (a for a in actions if a.kind == "disable-legacy"):
+            self._runner(["/bin/launchctl", "bootout",
+                          "gui/{}".format(os.getuid()), str(action.path)],
+                         check=False, text=True, capture_output=True)
             verification = self._runner(
-                [
-                    "/bin/launchctl",
-                    "print",
-                    "gui/{}/{}".format(os.getuid(), label),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
+                ["/bin/launchctl", "print",
+                 "gui/{}/{}".format(os.getuid(), action.path.stem)],
+                check=False, text=True, capture_output=True)
             if verification.returncode == 0:
-                raise RuntimeError(
-                    "legacy session sync service is still loaded: {}".format(label)
-                )
-            disabled_legacy.append((action.path, self._backup(action.path)))
-        try:
-            self.load_launch_agent()
-        except Exception:
-            for original, backup in reversed(disabled_legacy):
-                if backup.exists() and not original.exists():
-                    original.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(backup, original)
-                    self._runner(
-                        [
-                            "/bin/launchctl",
-                            "bootstrap",
-                            "gui/{}".format(os.getuid()),
-                            str(original),
-                        ],
-                        check=False,
-                        text=True,
-                        capture_output=True,
-                    )
-                    if backup in self._backups:
-                        self._backups.remove(backup)
-            raise
-        return InstallReport(
-            "installed" if actions else "noop",
-            tuple(actions),
-            tuple(self._backups),
-        )
+                raise RuntimeError("legacy session sync service is still loaded: {}"
+                                   .format(action.path.stem))
+            self._backup(action.path)
+        self.load_launch_agent()
+        return InstallReport("installed" if actions else "noop", tuple(actions),
+                             tuple(self._backups))
+
+    def install(self, *, dry_run: bool) -> InstallReport:
+        """Compatibility wrapper for callers that do not update configuration."""
+
+        return self.setup(dry_run=dry_run)
 
     def load_launch_agent(self) -> None:
         """Bootstrap or replace the per-user watcher in the current GUI domain."""
@@ -733,19 +767,31 @@ class Installer:
             self.layout.runtime_cli,
             self.layout.runtime_package,
         )
-        actions = [
-            InstallAction("remove", target) for target in targets if target.exists()
-        ]
         if dry_run:
+            if (self.layout.support_dir / "install-state").exists():
+                with self._install_transaction():
+                    pass
+            actions = [
+                InstallAction("remove", target) for target in targets if target.exists()
+            ]
             return InstallReport("planned", tuple(actions))
-        self._backups = []
-        if self.layout.launch_agent.exists():
-            self.unload_launch_agent()
-        for action in actions:
-            self._backup(action.path)
-        if self.layout.watcher_stamp.exists():
-            self.layout.watcher_stamp.unlink()
-        if self.layout.layout_helper_stamp.exists():
-            self.layout.layout_helper_stamp.unlink()
-        state = "uninstalled" if actions else "noop"
-        return InstallReport(state, tuple(actions), tuple(self._backups))
+        transaction = self._install_transaction()
+        with transaction:
+            actions = [
+                InstallAction("remove", target) for target in targets if target.exists()
+            ]
+            transaction.stop_watcher()
+            self._backups = []
+            for action in actions:
+                self._backup(action.path)
+            for stamp in (self.layout.watcher_stamp, self.layout.layout_helper_stamp):
+                if stamp.exists():
+                    stamp.unlink()
+            remaining = [target for target in targets if target.exists()]
+            if remaining:
+                raise RuntimeError(
+                    "uninstall target still exists: {}".format(remaining[0])
+                )
+            transaction.sync_targets()
+            state = "uninstalled" if actions else "noop"
+            return InstallReport(state, tuple(actions), tuple(self._backups))

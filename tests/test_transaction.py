@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
+
+from claude_session_sync.journal import abandoned_preparations, pending_recovery_runs
 
 from claude_session_sync.transaction import (
     AppRunningError,
@@ -45,6 +51,62 @@ def make_plan(source: Path, destination: Path, destination_before: Optional[byte
 
 
 class TransactionEngineTests(unittest.TestCase):
+    def test_fifo_backup_input_is_rejected_without_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "fifo"
+            os.mkfifo(fifo)
+            result = subprocess.run(
+                [sys.executable, "-c", (
+                    "import sys\n"
+                    "from claude_session_sync.filesystem import digest_file, UnsafePathError\n"
+                    "try: digest_file(sys.argv[1])\n"
+                    "except UnsafePathError: pass\n"
+                    "else: raise AssertionError('FIFO was accepted')\n"
+                ), str(fifo)],
+                capture_output=True, text=True, timeout=3,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_manifest_write_discards_only_unpublished_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new")
+            destination.write_bytes(b"old")
+            plan = make_plan(source, destination, b"old")
+            engine = TransactionEngine(root / "state", process_probe=lambda: False)
+            with patch("claude_session_sync.journal.RunJournal._persist", side_effect=OSError("disk unavailable")):
+                with self.assertRaises(OSError):
+                    engine.apply(plan)
+            self.assertEqual(pending_recovery_runs(root / "state"), [])
+            self.assertEqual(abandoned_preparations(root / "state"), [])
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(engine.apply(plan).status, "committed")
+
+    def test_crash_preparations_remain_visible_without_blocking_safe_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            identifier = "a" * 32
+            (state / "preparations" / identifier).mkdir(parents=True)
+            self.assertEqual(abandoned_preparations(state), [identifier])
+            self.assertEqual(pending_recovery_runs(state), [])
+
+    def test_interrupted_backup_does_not_publish_an_invalid_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new")
+            destination.write_bytes(b"old")
+            plan = make_plan(source, destination, b"old")
+            engine = TransactionEngine(root / "state", process_probe=lambda: False)
+            with patch("claude_session_sync.journal.atomic_copy", side_effect=OSError("disk unavailable")):
+                with self.assertRaises(OSError):
+                    engine.apply(plan)
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(pending_recovery_runs(root / "state"), [])
+            self.assertEqual(engine.apply(plan).status, "committed")
+            self.assertEqual(destination.read_bytes(), b"new")
+
     def test_noop_aborts_if_an_app_reopens_after_planning(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

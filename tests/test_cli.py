@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -249,6 +250,7 @@ class CliSyncTests(unittest.TestCase):
                 planner_factory=lambda _config: planner,
                 engine_factory=lambda _config: engine,
                 clock=lambda: next(ticks),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -270,8 +272,92 @@ class CliSyncTests(unittest.TestCase):
                     "plan_id": "plan-7",
                     "run_id": "run-9",
                     "state": "committed",
+                    "progress": "finished",
                 },
             )
+
+    def test_sync_reports_recovery_pending_without_exception_details(self):
+        from claude_session_sync.transaction import RecoveryPendingError
+
+        class RecoveryPlanner:
+            def plan(self, request):
+                raise RecoveryPendingError("private journal path and run id")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out = io.StringIO()
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=CliDependencies(
+                    config_loader=lambda path: config(root),
+                    planner_factory=lambda loaded: RecoveryPlanner(),
+                    process_probe=FakeProcessProbe(),
+                ),
+                stdout=out,
+                stderr=io.StringIO(),
+            )
+            payload = json.loads(out.getvalue())
+            self.assertEqual(1, exit_code)
+            self.assertEqual("recovery-pending", payload["reason"])
+            self.assertEqual("recovery-pending-error", payload["error_type"])
+            self.assertEqual("run-doctor", payload["next_action"])
+            self.assertNotIn("private", out.getvalue())
+
+    def test_sync_reports_process_inspection_permission_failure(self):
+        class DeniedProbe(FakeProcessProbe):
+            def running(self, **kwargs):
+                raise PermissionError("private process details")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out = io.StringIO()
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=CliDependencies(
+                    config_loader=lambda path: config(root),
+                    process_probe=DeniedProbe(),
+                ),
+                stdout=out,
+                stderr=io.StringIO(),
+            )
+            payload = json.loads(out.getvalue())
+            self.assertEqual(1, exit_code)
+            self.assertEqual("process-inspection-unavailable", payload["reason"])
+            self.assertEqual("process-permission-error", payload["error_type"])
+            self.assertNotIn("private", out.getvalue())
+
+    def test_sync_masks_journal_and_process_timeout_details(self):
+        from claude_session_sync.journal import JournalError
+
+        cases = (
+            (JournalError("private manifest path"), "invalid-journal", "journal-error", "run-doctor"),
+            (subprocess.TimeoutExpired(["ps", "private"], 2), "process-inspection-timeout", "process-timeout", "retry-sync"),
+        )
+        for error, reason, error_type, next_action in cases:
+            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                out = io.StringIO()
+
+                class BrokenPlanner:
+                    def plan(self, request):
+                        raise error
+
+                exit_code = run(
+                    ["--config", str(root / "config.json"), "sync", "--json"],
+                    dependencies=CliDependencies(
+                        config_loader=lambda path: config(root),
+                        planner_factory=lambda loaded: BrokenPlanner(),
+                        process_probe=FakeProcessProbe(),
+                    ),
+                    stdout=out,
+                    stderr=io.StringIO(),
+                )
+                payload = json.loads(out.getvalue())
+                self.assertEqual(1, exit_code)
+                self.assertEqual(reason, payload["reason"])
+                self.assertEqual(error_type, payload["error_type"])
+                self.assertEqual(next_action, payload["next_action"])
+                self.assertNotIn("private", out.getvalue())
 
 
 class CliAutomaticTests(unittest.TestCase):
@@ -302,7 +388,7 @@ class CliAutomaticTests(unittest.TestCase):
             self.assertEqual(
                 out.getvalue(),
                 "bytes=450 counts={'operations': 2} duration_ms=12 "
-                "plan_id=plan-auto run_id=run-auto state=committed\n",
+                "plan_id=plan-auto run_id=run-auto state=committed progress=finished\n",
             )
 
     def test_auto_succeeds_with_explicit_skip_while_app_is_running(self):
@@ -323,7 +409,7 @@ class CliAutomaticTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(out.getvalue(), "state=skipped reason=app-running\n")
+            self.assertEqual(out.getvalue(), "state=skipped reason=app-running progress=waiting-for-Claude\n")
 
     def test_auto_succeeds_with_explicit_skip_when_transaction_is_busy(self):
         class TransactionBusyError(Exception):
@@ -355,7 +441,7 @@ class CliAutomaticTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(out.getvalue(), "state=skipped reason=busy\n")
+            self.assertEqual(out.getvalue(), "state=skipped reason=busy progress=waiting-for-sync\n")
 
 
 class CliSwitchTests(unittest.TestCase):
@@ -1007,6 +1093,7 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                 {
                     "bytes": 0,
                     "counts": {
+                        "abandoned_preparations": 0,
                         "launch_guards": 0,
                         "layout_failures": 0,
                         "profiles": 2,
@@ -1016,6 +1103,9 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                     },
                     "duration_ms": 0,
                     "state": "idle",
+                    "progress": "not-synced-yet",
+                    "last_success_at": None,
+                    "next_action": "run-sync",
                 },
             )
             self.assertEqual(
@@ -1028,6 +1118,29 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                 0,
             )
             self.assertEqual(json.loads(doctor_out.getvalue())["state"], "healthy")
+
+    def test_status_reports_abandoned_preparations_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            (loaded.state_dir / "preparations" / "crash-copy").mkdir(parents=True)
+            output = io.StringIO()
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "status", "--json"],
+                dependencies=CliDependencies(
+                    config_loader=lambda path: loaded,
+                    process_probe=FakeProcessProbe(),
+                ),
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual(1, payload["counts"]["abandoned_preparations"])
+            self.assertEqual("needs-attention", payload["progress"])
+            self.assertEqual("inspect-preparations", payload["next_action"])
 
     def test_unknown_command_is_nonzero(self):
         error = io.StringIO()
@@ -1126,6 +1239,74 @@ class CliApprovalTests(unittest.TestCase):
 
 
 class CliConfigureTests(unittest.TestCase):
+    def test_setup_prepares_config_then_calls_atomic_installer_once(self):
+        class FakeInstaller:
+            def __init__(self, default_data):
+                self.default_data = default_data
+                self.calls = []
+
+            def default_config_data(self):
+                return self.default_data
+
+            def setup(self, *, dry_run, config_data=None):
+                self.calls.append((dry_run, config_data))
+                return InstallReport(
+                    "planned" if dry_run else "installed",
+                    (InstallAction("create", Path("/private/not-output")),),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = {
+                "version": 1,
+                "approved_targets": [],
+                "profiles": [
+                    {
+                        "name": "Work",
+                        "data_root": str(root / "Claude"),
+                        "launch_command": ["/usr/bin/true"],
+                        "is_default": True,
+                    },
+                    {
+                        "name": "Personal",
+                        "data_root": str(root / "Claude-Personal"),
+                        "launch_command": ["/usr/bin/true"],
+                        "enabled": False,
+                        "is_default": False,
+                    },
+                ],
+                "state_dir": str(root / "state"),
+                "retention": 5,
+                "acknowledge_cross_profile_copy": False,
+                "acknowledge_cross_account_copy": False,
+                "target_policy": "approved-only",
+                "claude_executable": "/usr/bin/true",
+            }
+            fake = FakeInstaller((json.dumps(document) + "\n").encode())
+            config_path = root / "missing" / "config.json"
+            output = io.StringIO()
+
+            exit_code = run(
+                [
+                    "--config", str(config_path), "setup",
+                    "--automatic-targets", "--enable-personal",
+                    "--sync-layout", "--sync-routines", "--dry-run",
+                ],
+                dependencies=CliDependencies(installer_factory=lambda path: fake),
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual(1, len(fake.calls))
+            self.assertTrue(fake.calls[0][0])
+            desired = json.loads(fake.calls[0][1])
+            self.assertEqual("all-configured-profiles", desired["target_policy"])
+            self.assertTrue(desired["profiles"][1]["enabled"])
+            self.assertTrue(desired["sync_sidebar_layout"])
+            self.assertTrue(desired["sync_code_routines"])
+            self.assertFalse(config_path.exists())
+
     def test_configure_enables_automatic_targets_and_personal_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1268,6 +1449,7 @@ class CliRoutineTests(unittest.TestCase):
                 planner_factory=lambda _config: FakePlanner(planned),
                 engine_factory=lambda _config: FakeEngine(receipt),
                 routine_factory=lambda _config: FakeRoutine(),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -1299,6 +1481,7 @@ class CliRoutineTests(unittest.TestCase):
                 planner_factory=lambda _config: FakePlanner(planned),
                 engine_factory=lambda _config: FakeEngine(receipt),
                 routine_factory=lambda _config: BrokenRoutine(),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -1309,7 +1492,8 @@ class CliRoutineTests(unittest.TestCase):
             )
 
             payload = json.loads(output.getvalue())
-            self.assertEqual(0, exit_code)
+            self.assertEqual(1, exit_code)
+            self.assertEqual("needs-attention", payload["progress"])
             self.assertEqual("committed", payload["state"])
             self.assertEqual(
                 {"state": "skipped", "reason": "routine-error"},
@@ -1330,6 +1514,7 @@ class CliLayoutTests(unittest.TestCase):
                 planner_factory=lambda _config: FakePlanner(planned),
                 engine_factory=lambda _config: FakeEngine(receipt),
                 layout_factory=lambda _config: FakeLayout(),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -1361,6 +1546,7 @@ class CliLayoutTests(unittest.TestCase):
                 planner_factory=lambda _config: FakePlanner(planned),
                 engine_factory=lambda _config: FakeEngine(receipt),
                 layout_factory=lambda _config: BrokenLayout(),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -1371,7 +1557,8 @@ class CliLayoutTests(unittest.TestCase):
             )
 
             payload = json.loads(output.getvalue())
-            self.assertEqual(0, exit_code)
+            self.assertEqual(1, exit_code)
+            self.assertEqual("needs-attention", payload["progress"])
             self.assertEqual("committed", payload["state"])
             self.assertEqual(
                 {"state": "skipped", "reason": "layout-error"},
@@ -1396,6 +1583,7 @@ class CliLayoutTests(unittest.TestCase):
                 planner_factory=lambda _config: FakePlanner(planned),
                 engine_factory=lambda _config: FakeEngine(receipt),
                 layout_factory=lambda _config: UnsafeLayout(),
+                process_probe=FakeProcessProbe(),
             )
 
             exit_code = run(
@@ -1406,7 +1594,8 @@ class CliLayoutTests(unittest.TestCase):
             )
 
             payload = json.loads(output.getvalue())
-            self.assertEqual(0, exit_code)
+            self.assertEqual(1, exit_code)
+            self.assertEqual("needs-attention", payload["progress"])
             self.assertEqual("committed", payload["state"])
             self.assertEqual("unsafe-layout", payload["layout"]["reason"])
             self.assertEqual(

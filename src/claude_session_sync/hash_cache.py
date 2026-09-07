@@ -59,6 +59,11 @@ class HashCache:
             self._connection.execute(
                 "ALTER TABLE file_hashes ADD COLUMN session_id TEXT"
             )
+        # Validation rules changed to reject duplicate keys and non-finite numbers.
+        # Keep digest caching, but never reuse validation from the older reader.
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+            self._connection.execute("UPDATE file_hashes SET session_id = NULL")
+            self._connection.execute("PRAGMA user_version = 1")
         self._connection.commit()
 
     def digest(

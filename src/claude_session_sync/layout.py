@@ -3,20 +3,40 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
+from . import strict_json as json
 from .config import Config
-from .filesystem import atomic_write_bytes, ensure_private_directory
+from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_directory
 from .locking import ExclusiveFileLock, LockUnavailableError
+from .processes import managed_processes
+from .record_journal import (
+    Record,
+    RecordJournal,
+    RecordJournalError,
+    RecordRecoveryError,
+)
+from .store import SessionStore
 
 
 ORIGIN_PREFIX = b"_https://claude.ai\x00\x01"
@@ -53,9 +73,7 @@ class LayoutSnapshot:
             "groups": list(self.groups),
             "assignments": dict(sorted(self.assignments.items())),
             "pinned_order": list(self.pinned_order),
-            "home_projects_pinned_order": list(
-                self.home_projects_pinned_order
-            ),
+            "home_projects_pinned_order": list(self.home_projects_pinned_order),
         }
 
 
@@ -138,9 +156,7 @@ def _ordered_group_pairs(scope: Any) -> List[Tuple[str, str]]:
     names = [name for _group_id, name in pairs]
     if len(ids) != len(set(ids)) or len(names) != len(set(names)):
         raise LayoutError("custom groups contain duplicate ids or names")
-    assignments = _string_map(
-        scope.get("assignments", {}), "custom group assignments"
-    )
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
     if set(assignments.values()) - set(ids):
         raise LayoutError("custom group assignment references an unknown group")
     order = scope.get("order", {})
@@ -159,9 +175,7 @@ def _ordered_group_pairs(scope: Any) -> List[Tuple[str, str]]:
 
 def _scope_assignments_by_name(scope: Mapping[str, Any]) -> Dict[str, str]:
     names = dict(_ordered_group_pairs(scope))
-    assignments = _string_map(
-        scope.get("assignments", {}), "custom group assignments"
-    )
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
     return {session: names[group_id] for session, group_id in assignments.items()}
 
 
@@ -212,9 +226,7 @@ def _merge_scope_pair(
             raise LayoutError("custom group scope metadata disagrees")
         merged.setdefault(key, copy.deepcopy(value))
 
-    merged["groups"] = [
-        {"id": ids_by_name[name], "name": name} for name in group_names
-    ]
+    merged["groups"] = [{"id": ids_by_name[name], "name": name} for name in group_names]
     merged["assignments"] = {
         session: ids_by_name[name] for session, name in assignments_by_name.items()
     }
@@ -230,9 +242,7 @@ def _merge_scope_pair(
             )
         )
         merged_order[group_id] = [
-            session
-            for session in ordered
-            if assignments_by_name.get(session) == name
+            session for session in ordered if assignments_by_name.get(session) == name
         ]
     merged["order"] = merged_order
     _ordered_group_pairs(merged)
@@ -272,12 +282,8 @@ def _load_snapshot_document(document: Any) -> LayoutSnapshot:
         raise LayoutError("sidebar snapshot has an unknown version")
     return LayoutSnapshot(
         groups=tuple(_string_list(document.get("groups"), "snapshot groups")),
-        assignments=_string_map(
-            document.get("assignments"), "snapshot assignments"
-        ),
-        pinned_order=tuple(
-            _string_list(document.get("pinned_order"), "snapshot pins")
-        ),
+        assignments=_string_map(document.get("assignments"), "snapshot assignments"),
+        pinned_order=tuple(_string_list(document.get("pinned_order"), "snapshot pins")),
         home_projects_pinned_order=tuple(
             _string_list(
                 document.get("home_projects_pinned_order"),
@@ -287,16 +293,44 @@ def _load_snapshot_document(document: Any) -> LayoutSnapshot:
     )
 
 
-def load_snapshot(path: Path) -> Optional[LayoutSnapshot]:
-    if not path.exists():
+def _snapshot_bytes(path: Path) -> Optional[bytes]:
+    if not os.path.lexists(str(path)):
         return None
-    if path.is_symlink() or not path.is_file():
-        raise LayoutError("sidebar snapshot is not a regular file")
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > MAX_RECORD_BYTES
+            ):
+                raise LayoutError("sidebar snapshot is not a regular bounded file")
+            content = stream.read(MAX_RECORD_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or len(content) > MAX_RECORD_BYTES:
+            raise LayoutError("sidebar snapshot changed while being read")
+        return content
+    except OSError as error:
+        raise LayoutError("sidebar snapshot is not a readable regular file") from error
+
+
+def _decode_snapshot(content: Optional[bytes]) -> Optional[LayoutSnapshot]:
+    if content is None:
+        return None
+    try:
+        document = json.loads(content.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise LayoutError("sidebar snapshot is malformed") from error
     return _load_snapshot_document(document)
+
+
+def load_snapshot(path: Path) -> Optional[LayoutSnapshot]:
+    return _decode_snapshot(_snapshot_bytes(path))
 
 
 def transform_layout_records(
@@ -362,16 +396,12 @@ def transform_layout_records(
         if active_has_groups:
             active_groups = [
                 name
-                for _group_id, name in _ordered_group_pairs(
-                    store_scopes[active_scope]
-                )
+                for _group_id, name in _ordered_group_pairs(store_scopes[active_scope])
             ]
         groups = _stable_union((active_groups, snapshot.groups, current_groups))
         assignments = dict(snapshot.assignments)
         if active_has_groups:
-            assignments.update(
-                _scope_assignments_by_name(store_scopes[active_scope])
-            )
+            assignments.update(_scope_assignments_by_name(store_scopes[active_scope]))
     else:
         groups = current_groups
         assignments = {}
@@ -453,7 +483,9 @@ def transform_layout_records(
                 if assigned_group == group_id
             ]
             ordered = [session for session in previous if session in set(assigned)]
-            ordered.extend(session for session in assigned if session not in set(ordered))
+            ordered.extend(
+                session for session in assigned if session not in set(ordered)
+            )
             replacement_order[group_id] = ordered
         replacement["order"] = replacement_order
         updated_scopes[scope_key] = replacement
@@ -547,13 +579,91 @@ class LevelDatabase:
 class LayoutSynchronizer:
     """Synchronize allowlisted sidebar records after Claude has terminated."""
 
-    def __init__(self, config: Config, *, helper: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        helper: Optional[Path] = None,
+        process_probe: Optional[Callable[[], Any]] = None,
+    ) -> None:
         self.config = config
         self.helper = Path(helper or config.state_dir.parent / "bin" / "layoutdb")
+        self.process_probe = process_probe or (
+            lambda: managed_processes(
+                config.profiles, executable=config.claude_executable, timeout=5
+            )
+        )
+
+    def _assert_stopped(self) -> None:
+        if self.process_probe():
+            raise LayoutBusyError(
+                "waiting for Claude to quit before syncing sidebar layout"
+            )
+
+    def _check_database_path(self, path: Path) -> None:
+        allowed = {
+            profile.data_root / "Local Storage" / "leveldb"
+            for profile in self.config.profiles
+        }
+        if path not in allowed or path.is_symlink() or not path.is_dir():
+            raise LayoutError("Claude Local Storage has an unknown layout")
+        if any(parent.is_symlink() for parent in (path.parent, path.parent.parent)):
+            raise LayoutError("Claude Local Storage includes an unsafe symlink")
+
+    def probe(self) -> Dict[str, Any]:
+        """Validate current records in disposable copies without opening live DBs."""
+        if not self.config.sync_sidebar_layout:
+            return {"state": "disabled"}
+        self._assert_stopped()
+        if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
+            raise LayoutError("sidebar helper is not installed")
+        profiles = groups = pins = assignments = 0
+        for index, profile in enumerate(self.config.profiles):
+            source = profile.data_root / "Local Storage" / "leveldb"
+            self._check_database_path(source)
+            targets = self._target_sessions(profile.name, profile.data_root)
+            with tempfile.TemporaryDirectory(
+                prefix="claude-layout-probe-"
+            ) as temporary:
+                copied = Path(temporary) / "leveldb"
+                self._assert_stopped()
+                # Preserve symlinks in the copy, then reject them before opening.
+                shutil.copytree(source, copied, symlinks=True)
+                for entry in copied.rglob("*"):
+                    mode = entry.lstat().st_mode
+                    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                        raise LayoutError(
+                            "Claude Local Storage contains an unsafe entry"
+                        )
+                    os.chmod(str(entry), 0o700 if stat.S_ISDIR(mode) else 0o600)
+                os.chmod(str(copied), 0o700)
+                self._assert_stopped()
+                database = LevelDatabase(self.helper, copied)
+                current = {key: database.get(key) for key in LAYOUT_KEYS}
+                transformed = transform_layout_records(
+                    current,
+                    targets,
+                    snapshot=load_snapshot(
+                        self.config.state_dir / "sidebar-layout-{}.json".format(index)
+                    ),
+                )
+                profiles += 1
+                groups += transformed.group_count
+                pins += transformed.pin_count
+                assignments += transformed.assignment_count
+        self._assert_stopped()
+        return {
+            "state": "compatible",
+            "profile_count": profiles,
+            "group_count": groups,
+            "pin_count": pins,
+            "assignment_count": assignments,
+        }
 
     def sync(self) -> LayoutReceipt:
         if not self.config.sync_sidebar_layout:
             return LayoutReceipt("disabled", 0, 0, 0, 0, 0, 0)
+        self._assert_stopped()
         if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
             raise LayoutError("sidebar helper is not installed")
         ensure_private_directory(self.config.state_dir)
@@ -562,44 +672,51 @@ class LayoutSynchronizer:
                 self.config.state_dir / "transaction.lock", mode="auto"
             ).acquire()
         except LockUnavailableError as error:
-            raise LayoutBusyError("another synchronization is still finishing") from error
+            raise LayoutBusyError(
+                "another synchronization is still finishing"
+            ) from error
         try:
             self._recover_pending()
             totals = [0, 0, 0, 0, 0]
             changed_profiles = 0
             for index, profile in enumerate(self.config.profiles):
                 database_path = profile.data_root / "Local Storage" / "leveldb"
-                if database_path.is_symlink() or not database_path.is_dir():
-                    raise LayoutError("Claude Local Storage has an unknown layout")
+                self._check_database_path(database_path)
                 target_sessions = self._target_sessions(profile.name, profile.data_root)
                 database = LevelDatabase(self.helper, database_path)
-                current = {key: database.get(key) for key in LAYOUT_KEYS}
+                current = {}
+                for key in LAYOUT_KEYS:
+                    self._assert_stopped()
+                    current[key] = database.get(key)
                 snapshot_path = self.config.state_dir / "sidebar-layout-{}.json".format(
                     index
                 )
+                snapshot_before = _snapshot_bytes(snapshot_path)
                 transformed = transform_layout_records(
                     current,
                     target_sessions,
-                    snapshot=load_snapshot(snapshot_path),
+                    snapshot=_decode_snapshot(snapshot_before),
                 )
                 replacements = {
                     key: value
                     for key, value in transformed.records.items()
                     if current[key] != value
                 }
+                snapshot_after = (
+                    json.dumps(transformed.snapshot.as_dict(), indent=2, sort_keys=True)
+                    + "\n"
+                ).encode("utf-8")
+                if replacements or snapshot_before != snapshot_after:
+                    self._commit(
+                        database,
+                        current,
+                        transformed.records,
+                        snapshot_path=snapshot_path,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=snapshot_after,
+                    )
                 if replacements:
-                    self._commit(database, current, replacements)
                     changed_profiles += 1
-                atomic_write_bytes(
-                    snapshot_path,
-                    (
-                        json.dumps(
-                            transformed.snapshot.as_dict(), indent=2, sort_keys=True
-                        )
-                        + "\n"
-                    ).encode("utf-8"),
-                )
-                os.chmod(snapshot_path, 0o600)
                 totals[0] += len(replacements)
                 totals[1] = max(totals[1], transformed.group_count)
                 totals[2] = max(totals[2], transformed.assignment_count)
@@ -617,176 +734,162 @@ class LayoutSynchronizer:
         finally:
             lock.release()
 
-    def _target_sessions(self, profile_name: str, data_root: Path) -> Dict[str, Set[str]]:
+    def _target_sessions(
+        self, profile_name: str, data_root: Path
+    ) -> Dict[str, Set[str]]:
+        discovery = SessionStore().discover_targets(self.config)
+        if discovery.invalid_replicas:
+            raise LayoutError("Claude session storage has an unknown layout")
         approved = {
             (target.account_id, target.workspace_id)
             for target in self.config.approved_targets
             if target.profile_name == profile_name
         }
-        sessions_root = data_root / "claude-code-sessions"
-        if sessions_root.is_symlink() or not sessions_root.is_dir():
-            raise LayoutError("Claude session storage has an unknown layout")
         targets = {}
-        for account in sorted(sessions_root.iterdir()):
-            if account.is_symlink() or not account.is_dir():
+        for target in discovery.targets:
+            if target.profile_name != profile_name:
                 continue
-            for workspace in sorted(account.iterdir()):
-                if workspace.is_symlink() or not workspace.is_dir():
+            if (
+                self.config.target_policy == "approved-only"
+                and (target.account_id, target.workspace_id) not in approved
+            ):
+                continue
+            sessions = set()
+            for replica in target.path.iterdir():
+                if replica.is_symlink() or not replica.is_file():
                     continue
-                if (
-                    self.config.target_policy == "approved-only"
-                    and (account.name, workspace.name) not in approved
-                ):
-                    continue
-                sessions = set()
-                for replica in workspace.iterdir():
-                    if replica.is_symlink() or not replica.is_file():
-                        continue
-                    if replica.name.startswith("local_") and replica.name.endswith(
-                        ".json"
-                    ):
-                        sessions.add("code:{}".format(replica.stem))
-                targets["{}/{}".format(account.name, workspace.name)] = sessions
+                if replica.name.startswith("local_") and replica.name.endswith(".json"):
+                    sessions.add("code:{}".format(replica.stem))
+            targets["{}/{}".format(target.account_id, target.workspace_id)] = sessions
         if not targets:
             raise LayoutError("no approved Claude sidebar scopes were found")
+        if (
+            len({key.split("/")[0] for key in targets}) > 1
+            and not self.config.acknowledge_cross_account_copy
+        ):
+            raise LayoutError("cross-account sidebar copying is not acknowledged")
         return targets
 
     def _journal_root(self) -> Path:
         return self.config.state_dir / "layout-runs"
 
-    def _recover_pending(self) -> None:
-        root = self._journal_root()
-        if not root.exists():
-            return
-        if root.is_symlink() or not root.is_dir():
-            raise LayoutRecoveryError("sidebar recovery state is unsafe")
-        allowed_databases = {
-            str(profile.data_root / "Local Storage" / "leveldb")
-            for profile in self.config.profiles
-        }
-        for path in root.glob("*.json"):
-            if path.is_symlink() or not path.is_file():
-                raise LayoutRecoveryError("sidebar recovery record is unsafe")
-            try:
-                document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                raise LayoutRecoveryError("sidebar recovery state is malformed") from error
-            state = document.get("state")
-            if state in ("COMMITTED", "ROLLED_BACK"):
-                continue
-            database_path = document.get("database")
-            raw_records = document.get("records")
-            if (
-                document.get("version") != 1
-                or database_path not in allowed_databases
-                or not isinstance(raw_records, list)
-                or not raw_records
-            ):
-                raise LayoutRecoveryError("sidebar recovery state is malformed")
-            before = {}
-            after_digests = {}
-            for record in raw_records:
-                if not isinstance(record, dict):
-                    raise LayoutRecoveryError("sidebar recovery state is malformed")
-                try:
-                    key = bytes.fromhex(record["key"])
-                    value = bytes.fromhex(record["before"])
-                    after_digest = record["after_sha256"]
-                except (KeyError, TypeError, ValueError) as error:
-                    raise LayoutRecoveryError(
-                        "sidebar recovery state is malformed"
-                    ) from error
-                if (
-                    key not in LAYOUT_KEYS
-                    or key in before
-                    or not isinstance(after_digest, str)
-                    or len(after_digest) != 64
-                ):
-                    raise LayoutRecoveryError("sidebar recovery state is malformed")
-                before[key] = value
-                after_digests[key] = after_digest
-            database = LevelDatabase(self.helper, Path(database_path))
-            current = {key: database.get(key) for key in before}
-            if all(current[key] == before[key] for key in before):
-                document["state"] = "ROLLED_BACK"
-                self._write_journal(path, document)
-                continue
-            if all(
-                hashlib.sha256(current[key]).hexdigest() == after_digests[key]
-                for key in before
-            ):
-                document["state"] = "COMMITTED"
-                self._write_journal(path, document)
-                continue
-            try:
-                database.write(before, self.config.state_dir)
-                if any(database.get(key) != value for key, value in before.items()):
-                    raise LayoutRecoveryError("sidebar rollback failed verification")
-            except BaseException as error:
-                document["state"] = "RECOVERY_REQUIRED"
-                self._write_journal(path, document)
-                raise LayoutRecoveryError("sidebar recovery is required") from error
-            document["state"] = "ROLLED_BACK"
-            self._write_journal(path, document)
+    def _record_target(self, database: Path, key: bytes) -> str:
+        return json.dumps([str(database), key.hex()], separators=(",", ":"))
 
-    def _write_journal(self, path: Path, document: Mapping[str, Any]) -> None:
-        atomic_write_bytes(
-            path,
-            (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    def _snapshot_target(self, path: Path) -> str:
+        return json.dumps(["snapshot", str(path)], separators=(",", ":"))
+
+    def _parse_target(self, target: str) -> Tuple[Path, Optional[bytes]]:
+        try:
+            value = json.loads(target)
+            if not isinstance(value, list) or len(value) != 2:
+                raise ValueError("invalid sidebar target")
+            database, encoded_key = value
+            if database == "snapshot":
+                path = Path(encoded_key)
+                allowed = {
+                    self.config.state_dir / "sidebar-layout-{}.json".format(index)
+                    for index in range(len(self.config.profiles))
+                }
+                if path not in allowed or path.is_symlink() or path.parent.is_symlink():
+                    raise ValueError("invalid sidebar snapshot target")
+                if not path.parent.is_dir():
+                    raise ValueError("sidebar snapshot directory is missing")
+                return path, None
+            key = bytes.fromhex(encoded_key)
+            path = Path(database)
+        except (TypeError, ValueError) as error:
+            raise LayoutRecoveryError("sidebar recovery target is malformed") from error
+        if key not in LAYOUT_KEYS:
+            raise LayoutRecoveryError("sidebar recovery key is not allowed")
+        self._check_database_path(path)
+        return path, key
+
+    def _legacy_records(self, document: Mapping[str, Any]) -> Sequence[Record]:
+        raw = document["records"]
+        if not isinstance(raw, list):
+            raise ValueError("invalid sidebar records")
+        return [
+            Record(
+                self._record_target(
+                    Path(document["database"]), bytes.fromhex(item["key"])
+                ),
+                bytes.fromhex(item["before"]),
+                None,
+                item["after_sha256"],
+                legacy=True,
+            )
+            for item in raw
+        ]
+
+    def _journal(self) -> RecordJournal:
+        def read(target: str) -> Optional[bytes]:
+            path, key = self._parse_target(target)
+            if key is None:
+                return _snapshot_bytes(path)
+            self._assert_stopped()  # Opening LevelDB can itself mutate its files.
+            return LevelDatabase(self.helper, path).get(key)
+
+        def write(target: str, value: bytes) -> None:
+            path, key = self._parse_target(target)
+            self._assert_stopped()
+            if key is None:
+                atomic_write_bytes(path, value)
+            else:
+                LevelDatabase(self.helper, path).write(
+                    {key: value}, self.config.state_dir
+                )
+
+        def delete(target: str) -> None:
+            path, key = self._parse_target(target)
+            if key is not None:
+                raise LayoutRecoveryError("sidebar records cannot be deleted")
+            self._assert_stopped()
+            durable_unlink(path)
+
+        return RecordJournal(
+            self._journal_root(),
+            read=read,
+            write=write,
+            delete=delete,
+            validate=self._parse_target,
+            before_mutation=self._assert_stopped,
+            retention=self.config.retention,
+            legacy_loader=self._legacy_records,
         )
-        os.chmod(path, 0o600)
+
+    def _recover_pending(self) -> None:
+        self._assert_stopped()
+        try:
+            self._journal().recover()
+        except RecordJournalError as error:
+            raise LayoutRecoveryError(str(error)) from error
 
     def _commit(
         self,
         database: LevelDatabase,
         current: Mapping[bytes, bytes],
         replacements: Mapping[bytes, bytes],
+        *,
+        snapshot_path: Optional[Path] = None,
+        snapshot_before: Optional[bytes] = None,
+        snapshot_after: Optional[bytes] = None,
     ) -> None:
-        root = ensure_private_directory(self._journal_root())
-        run_id = uuid.uuid4().hex
-        journal_path = root / "{}.json".format(run_id)
-        journal = {
-            "version": 1,
-            "run_id": run_id,
-            "state": "PREPARED",
-            "database": str(database.database),
-            "records": [
-                {
-                    "key": key.hex(),
-                    "before": current[key].hex(),
-                    "after_sha256": hashlib.sha256(value).hexdigest(),
-                }
-                for key, value in sorted(replacements.items())
-            ],
+        before = {
+            self._record_target(database.database, key): current[key]
+            for key in replacements
         }
-        self._write_journal(journal_path, journal)
+        after = {
+            self._record_target(database.database, key): value
+            for key, value in replacements.items()
+        }
+        if snapshot_path is not None:
+            target = self._snapshot_target(snapshot_path)
+            before[target] = snapshot_before
+            after[target] = snapshot_after
         try:
-            database.write(replacements, self.config.state_dir)
-            if any(database.get(key) != value for key, value in replacements.items()):
-                raise LayoutError("Claude sidebar write failed verification")
-        except BaseException as write_error:
-            try:
-                database.write(
-                    {key: current[key] for key in replacements}, self.config.state_dir
-                )
-                if any(
-                    database.get(key) != current[key] for key in replacements
-                ):
-                    raise LayoutRecoveryError("sidebar rollback failed verification")
-                journal["state"] = "ROLLED_BACK"
-                self._write_journal(journal_path, journal)
-            except BaseException as recovery_error:
-                journal["state"] = "RECOVERY_REQUIRED"
-                self._write_journal(journal_path, journal)
-                raise LayoutRecoveryError(
-                    "sidebar recovery is required before another layout write"
-                ) from recovery_error
-            raise LayoutError("sidebar update was rolled back safely") from write_error
-        journal["state"] = "COMMITTED"
-        self._write_journal(journal_path, journal)
-        self._prune_journals(root)
-
-    def _prune_journals(self, root: Path) -> None:
-        paths = sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        for path in paths[: -self.config.retention]:
-            path.unlink()
+            self._journal().commit(before, after)
+        except RecordRecoveryError as error:
+            raise LayoutRecoveryError(str(error)) from error
+        except RecordJournalError as error:
+            raise LayoutError(str(error)) from error

@@ -4,20 +4,23 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import math
 import os
-import shutil
 import subprocess
 import stat
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence, TextIO
+from typing import Any, Callable, Optional, Sequence, TextIO
 
 from .config import Config, load_config
+from . import __version__
+from . import strict_json as json
+from .adapters import adapter_failure, run_adapters
+from .config_commands import _approve_current_targets, _configure, _prepare_config_data
+from .health import abandoned_preparation_count, doctor_summary, watcher_failure
+from .progress import current_progress, finish_progress, record_progress
 from .model import Plan, SyncRequest
 
 
@@ -111,6 +114,7 @@ def _nonnegative_seconds(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-session-sync")
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "--config",
         type=Path,
@@ -126,7 +130,8 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", dest="as_json")
     sync = commands.add_parser("sync", help="apply the next synchronization")
     sync.add_argument("--json", action="store_true", dest="as_json")
-    commands.add_parser("auto", help="sync after Claude terminates")
+    auto = commands.add_parser("auto", help="sync after Claude terminates")
+    auto.add_argument("--json", action="store_true", dest="as_json")
     switch = commands.add_parser("switch", help="sync and launch a profile")
     switch.add_argument("profile")
     switch.add_argument("--no-launch", action="store_true")
@@ -184,6 +189,18 @@ def _parser() -> argparse.ArgumentParser:
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
     configure_mode.add_argument("--apply", action="store_true")
+    setup = commands.add_parser(
+        "setup", help="configure and install macOS adapters atomically"
+    )
+    setup.add_argument("--automatic-targets", action="store_true")
+    setup_profile = setup.add_mutually_exclusive_group()
+    setup_profile.add_argument("--enable-personal", action="store_true")
+    setup_profile.add_argument("--disable-personal", action="store_true")
+    setup.add_argument("--sync-layout", action="store_true")
+    setup.add_argument("--sync-routines", action="store_true")
+    setup_mode = setup.add_mutually_exclusive_group(required=True)
+    setup_mode.add_argument("--dry-run", action="store_true")
+    setup_mode.add_argument("--apply", action="store_true")
     clear_guard = commands.add_parser(
         "clear-launch-guard",
         help="clear a failed launch guard after confirming Claude is stopped",
@@ -247,95 +264,6 @@ def _receipt_summary(receipt: Any, duration_ms: int) -> dict:
         "run_id": receipt.run_id,
         "state": receipt.status,
     }
-
-
-def _layout_summary(config: Config, dependencies: CliDependencies) -> dict:
-    if not config.sync_sidebar_layout:
-        return {"state": "disabled"}
-    from .layout import LayoutBusyError, LayoutError
-
-    try:
-        receipt = dependencies.layout_factory(config).sync()
-        payload = {
-            "state": receipt.state,
-            "profiles": receipt.profile_count,
-            "records": receipt.record_count,
-            "groups": receipt.group_count,
-            "assignments": receipt.assignment_count,
-            "pins": receipt.pin_count,
-            "ambiguous_assignments": receipt.ambiguous_assignments,
-        }
-    except LayoutBusyError:
-        payload = {"state": "skipped", "reason": "writer-busy"}
-    except LayoutError as error:
-        payload = {
-            "state": "skipped",
-            "reason": "unsafe-layout",
-            "detail": str(error),
-        }
-    except Exception:
-        payload = {"state": "skipped", "reason": "layout-error"}
-    _record_layout_status(config.state_dir, payload)
-    return payload
-
-
-def _record_layout_status(state_dir: Path, payload: Mapping[str, Any]) -> None:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-
-    try:
-        ensure_private_directory(state_dir)
-        path = state_dir / "sidebar-layout-status.json"
-        atomic_write_bytes(
-            path,
-            (json.dumps(dict(payload), sort_keys=True) + "\n").encode("utf-8"),
-        )
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-
-
-def _routine_summary(config: Config, dependencies: CliDependencies) -> dict:
-    if not config.sync_code_routines:
-        return {"state": "disabled"}
-    from .routines import RoutineBusyError, RoutineError
-
-    try:
-        receipt = dependencies.routine_factory(config).sync()
-        payload = {
-            "state": receipt.state,
-            "profiles": receipt.profile_count,
-            "targets": receipt.target_count,
-            "manifests": receipt.manifest_count,
-            "tasks": receipt.task_count,
-            "writes": receipt.write_count,
-        }
-    except RoutineBusyError:
-        payload = {"state": "skipped", "reason": "writer-busy"}
-    except RoutineError as error:
-        payload = {
-            "state": "skipped",
-            "reason": "unsafe-routines",
-            "detail": str(error),
-        }
-    except Exception:
-        payload = {"state": "skipped", "reason": "routine-error"}
-    _record_routine_status(config.state_dir, payload)
-    return payload
-
-
-def _record_routine_status(state_dir: Path, payload: Mapping[str, Any]) -> None:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-
-    try:
-        ensure_private_directory(state_dir)
-        path = state_dir / "code-routines-status.json"
-        atomic_write_bytes(
-            path,
-            (json.dumps(dict(payload), sort_keys=True) + "\n").encode("utf-8"),
-        )
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def _recovery_summary(receipt: Any, duration_ms: int) -> dict:
@@ -574,6 +502,43 @@ def _clear_launch_guard_command(
         handoff.release()
 
 
+def _switch_chat_result(
+    config: Config, dependencies: CliDependencies, started: float
+) -> dict:
+    try:
+        planner = dependencies.planner_factory(config)
+        engine = dependencies.engine_factory(config)
+        plan = planner.plan(SyncRequest(config))
+        dependencies.clock()
+        writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
+        revalidation_retries = SWITCH_REVALIDATION_RETRIES
+        while True:
+            if _plan_state(plan).startswith("blocked_"):
+                return _plan_summary(
+                    plan, round((dependencies.clock() - started) * 1000)
+                )
+            try:
+                receipt = engine.apply(plan)
+                break
+            except Exception as error:
+                remaining = writer_deadline - dependencies.monotonic()
+                if _busy_reason(error) == "busy" and remaining > 0:
+                    dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
+                    continue
+                if (
+                    type(error).__name__ == "RevalidationError"
+                    and revalidation_retries > 0
+                ):
+                    revalidation_retries -= 1
+                    plan = planner.plan(SyncRequest(config))
+                    continue
+                raise
+        duration_ms = round((dependencies.clock() - started) * 1000)
+        return _receipt_summary(receipt, duration_ms)
+    except Exception as error:
+        return _chat_failure(error)
+
+
 def _run_switch(
     arguments: Any,
     config: Config,
@@ -617,46 +582,20 @@ def _run_switch(
                 stream=output,
             )
             return 1
+        record_progress(config, "syncing")
         started = dependencies.clock()
-        planner = dependencies.planner_factory(config)
-        engine = dependencies.engine_factory(config)
-        plan = planner.plan(SyncRequest(config))
-        dependencies.clock()
-        writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
-        revalidation_retries = SWITCH_REVALIDATION_RETRIES
-        while True:
-            if _plan_state(plan).startswith("blocked_"):
-                _write(
-                    _plan_summary(
-                        plan,
-                        round((dependencies.clock() - started) * 1000),
-                    ),
-                    as_json=False,
-                    stream=output,
-                )
-                return 1
-            try:
-                receipt = engine.apply(plan)
-                break
-            except Exception as error:
-                remaining = writer_deadline - dependencies.monotonic()
-                if _busy_reason(error) == "busy" and remaining > 0:
-                    dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-                    continue
-                if (
-                    type(error).__name__ == "RevalidationError"
-                    and revalidation_retries > 0
-                ):
-                    revalidation_retries -= 1
-                    plan = planner.plan(SyncRequest(config))
-                    continue
-                raise
-        duration_ms = round((dependencies.clock() - started) * 1000)
-        payload = _receipt_summary(receipt, duration_ms)
-        if config.sync_code_routines:
-            payload["routines"] = _routine_summary(config, dependencies)
-        if config.sync_sidebar_layout:
-            payload["layout"] = _layout_summary(config, dependencies)
+        payload = _switch_chat_result(config, dependencies, started)
+        payload.update(
+            run_adapters(
+                config,
+                dependencies,
+                lambda: bool(_running_processes(config, dependencies)),
+            )
+        )
+        payload["progress"] = finish_progress(config, payload)
+        if payload["progress"] == "needs-attention":
+            _write(payload, as_json=False, stream=output)
+            return 1
         if not arguments.no_launch:
             confirmation_enabled = dependencies.launch_confirmation_timeout > 0
             if confirmation_enabled:
@@ -711,294 +650,128 @@ def _busy_reason(error: Exception) -> Optional[str]:
     return None
 
 
-def _watcher_failure(state_dir: Path) -> int:
-    path = state_dir / "watcher-status.json"
-    if not path.exists():
-        return 0
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return 1
-    return 0 if isinstance(document, dict) and document.get("state") == "ok" else 1
+def _chat_failure(error: Exception) -> dict:
+    """Map chat failures to an allowlisted, content-free operator action."""
 
+    from .journal import JournalError
+    from .transaction import RecoveryPendingError
 
-def _layout_failure(config: Config) -> int:
-    if not config.sync_sidebar_layout:
-        return 0
-    path = config.state_dir / "sidebar-layout-status.json"
-    if not path.exists():
-        return 0
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return 1
-    return (
-        0
-        if isinstance(document, dict)
-        and document.get("state") in ("synced", "noop")
-        else 1
-    )
-
-
-def _routine_failure(config: Config) -> int:
-    if not config.sync_code_routines:
-        return 0
-    path = config.state_dir / "code-routines-status.json"
-    if not path.exists():
-        return 0
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return 1
-    return (
-        0
-        if isinstance(document, dict)
-        and document.get("state") in ("synced", "noop")
-        else 1
-    )
-
-
-def _doctor_summary(config: Config) -> dict:
-    from .journal import JournalError, pending_recovery_runs
-    from .store import SessionStore
-
-    discovery = SessionStore().discover(config)
-    approved = {
-        (target.profile_name, target.account_id, target.workspace_id)
-        for target in config.approved_targets
-    }
-    unapproved = 0
-    if config.target_policy == "approved-only":
-        unapproved = sum(
-            1
-            for target in discovery.targets
-            if (target.profile_name, target.account_id, target.workspace_id)
-            not in approved
-        )
-    errors = len(discovery.invalid_replicas) + unapproved
-    executable = config.claude_executable
-    if not executable.is_file() or not os.access(str(executable), os.X_OK):
-        errors += 1
-    for profile in config.profiles:
-        root = profile.data_root
-        if root.is_symlink() or not root.is_dir():
-            errors += 1
-        program = profile.launch_command[0]
-        if os.path.isabs(program):
-            launchable = Path(program).is_file() and os.access(program, os.X_OK)
-        else:
-            launchable = shutil.which(program) is not None
-        if not launchable:
-            errors += 1
-    if not discovery.targets:
-        errors += 1
-    account_namespaces = {
-        (target.profile_name, target.account_id) for target in discovery.targets
-    }
-    if len(account_namespaces) > 1 and not config.acknowledge_cross_account_copy:
-        errors += 1
-    recovery_pending = 0
-    if os.path.lexists(str(config.state_dir)):
-        try:
-            recovery_pending = len(pending_recovery_runs(config.state_dir))
-        except (JournalError, OSError):
-            recovery_pending = 1
-        errors += recovery_pending
-    watcher_failure = _watcher_failure(config.state_dir)
-    errors += watcher_failure
-    layout_failure = _layout_failure(config)
-    errors += layout_failure
-    routine_failure = _routine_failure(config)
-    errors += routine_failure
-    launch_guard_failure = _launch_guard_failure(config)
-    errors += launch_guard_failure
-    return {
-        "bytes": 0,
-        "counts": {
-            "checks": 8 + len(config.profiles),
-            "errors": errors,
-            "invalid_replicas": len(discovery.invalid_replicas),
-            "launch_guards": launch_guard_failure,
-            "layout_failures": layout_failure,
-            "profiles": len(config.profiles),
-            "recovery_pending": recovery_pending,
-            "routine_failures": routine_failure,
-            "targets": len(discovery.targets),
-            "unapproved_targets": unapproved,
-            "watcher_failures": watcher_failure,
-        },
-        "duration_ms": 0,
-        "state": "healthy" if errors == 0 else "unhealthy",
-    }
-
-
-def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) -> dict:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-    from .store import SessionStore
-
-    discovery = SessionStore().discover(config)
-    if discovery.invalid_replicas or not discovery.targets:
+    if isinstance(error, RecoveryPendingError):
         return {
-            "state": "blocked",
-            "counts": {
-                "approved": len(config.approved_targets),
-                "invalid_replicas": len(discovery.invalid_replicas),
-                "targets": len(discovery.targets),
-            },
+            "state": "failed",
+            "reason": "recovery-pending",
+            "next_action": "run-doctor",
+            "error_type": "recovery-pending-error",
         }
-    approved = [
-        {
-            "profile": target.profile_name,
-            "account": target.account_id,
-            "workspace": target.workspace_id,
+    if isinstance(error, JournalError):
+        return {
+            "state": "failed",
+            "reason": "invalid-journal",
+            "next_action": "run-doctor",
+            "error_type": "journal-error",
         }
-        for target in discovery.targets
-    ]
-    current = {
-        (target.profile_name, target.account_id, target.workspace_id)
-        for target in config.approved_targets
-    }
-    discovered = {
-        (target.profile_name, target.account_id, target.workspace_id)
-        for target in discovery.targets
-    }
-    if apply:
-        document = json.loads(config_path.read_text(encoding="utf-8"))
-        document["approved_targets"] = approved
-        encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(
-            "utf-8"
-        )
-        ensure_private_directory(config_path.parent)
-        atomic_write_bytes(config_path, encoded)
-        os.chmod(str(config_path), 0o600)
-        # Validate the exact durable document before reporting success.
-        load_config(config_path)
+    if isinstance(error, subprocess.TimeoutExpired):
+        return {
+            "state": "failed",
+            "reason": "process-inspection-timeout",
+            "next_action": "retry-sync",
+            "error_type": "process-timeout",
+        }
     return {
-        "state": "approved" if apply else "planned",
-        "counts": {
-            "approved": len(discovered),
-            "new": len(discovered - current),
-            "removed": len(current - discovered),
-            "targets": len(discovered),
-        },
+        "state": "failed",
+        "reason": _busy_reason(error) or "chat-sync-error",
+        "next_action": "run-doctor",
+        "error_type": "chat-sync-error",
     }
 
 
-def _validate_config_document(document: dict) -> None:
-    encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor, raw_path = tempfile.mkstemp(prefix="claude-session-sync-config-")
-    path = Path(raw_path)
+def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) -> int:
+    from .locking import ExclusiveFileLock, LockUnavailableError
+
+    handoff = ExclusiveFileLock(
+        config.state_dir / "switch-handoff.lock", mode="auto", timeout=0
+    )
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-        os.chmod(str(path), 0o600)
-        load_config(path)
-    finally:
+        handoff.acquire()
+    except LockUnavailableError:
+        _write(
+            {"state": "skipped", "reason": "busy"},
+            as_json=arguments.as_json,
+            stream=output,
+        )
+        return 0 if arguments.command == "auto" else 1
+    try:
         try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _configure(
-    config_path: Path,
-    *,
-    automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
-    sync_layout: bool,
-    sync_routines: bool,
-    apply: bool,
-) -> dict:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-
-    load_config(config_path)
-    document = json.loads(config_path.read_text(encoding="utf-8"))
-    changes = 0
-
-    if automatic_targets:
-        desired = {
-            "target_policy": "all-configured-profiles",
-            "acknowledge_cross_account_copy": True,
-        }
-        for key, value in desired.items():
-            if document.get(key) != value:
-                document[key] = value
-                changes += 1
-
-    if enable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is None:
-            raise ValueError("generated Personal profile is missing")
-        if personal.get("enabled") is not True:
-            personal["enabled"] = True
-            changes += 1
-        for key in (
-            "acknowledge_cross_profile_copy",
-            "acknowledge_cross_account_copy",
-        ):
-            if document.get(key) is not True:
-                document[key] = True
-                changes += 1
-
-    if disable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is not None and personal.get("enabled", True) is not False:
-            personal["enabled"] = False
-            changes += 1
-        if document.get("acknowledge_cross_profile_copy") is not False:
-            document["acknowledge_cross_profile_copy"] = False
-            changes += 1
-
-    if sync_layout and document.get("sync_sidebar_layout") is not True:
-        document["sync_sidebar_layout"] = True
-        changes += 1
-
-    if sync_routines and document.get("sync_code_routines") is not True:
-        document["sync_code_routines"] = True
-        changes += 1
-
-    _validate_config_document(document)
-    if apply and changes:
-        encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(
-            "utf-8"
-        )
-        ensure_private_directory(config_path.parent)
-        atomic_write_bytes(config_path, encoded)
-        os.chmod(str(config_path), 0o600)
-        load_config(config_path)
-    return {
-        "state": "configured" if apply and changes else "planned" if changes else "noop",
-        "counts": {
-            "changes": changes,
-            "personal_enabled": int(
-                any(
-                    profile.get("name") == "Personal"
-                    and profile.get("enabled") is True
-                    for profile in document.get("profiles", [])
+            running = _running_processes(config, deps)
+        except PermissionError:
+            _write(
+                {
+                    "state": "failed",
+                    "reason": "process-inspection-unavailable",
+                    "next_action": "allow-process-inspection-and-retry",
+                    "error_type": "process-permission-error",
+                },
+                as_json=arguments.as_json,
+                stream=output,
+            )
+            return 1
+        except subprocess.TimeoutExpired as error:
+            _write(_chat_failure(error), as_json=arguments.as_json, stream=output)
+            return 1
+        if running:
+            record_progress(config, "waiting-for-Claude")
+            _write(
+                {
+                    "state": "skipped",
+                    "reason": "app-running",
+                    "progress": "waiting-for-Claude",
+                },
+                as_json=arguments.as_json,
+                stream=output,
+            )
+            return 0 if arguments.command == "auto" else 1
+        record_progress(config, "syncing")
+        started = deps.clock()
+        try:
+            plan = deps.planner_factory(config).plan(SyncRequest(config))
+            if arguments.command == "sync":
+                deps.clock()
+            if _plan_state(plan).startswith("blocked_"):
+                payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
+            else:
+                receipt = deps.engine_factory(config).apply(plan)
+                payload = _receipt_summary(
+                    receipt, round((deps.clock() - started) * 1000)
                 )
-            ),
-            "automatic_targets": int(
-                document.get("target_policy") == "all-configured-profiles"
-            ),
-            "layout_sync": int(document.get("sync_sidebar_layout") is True),
-            "routine_sync": int(document.get("sync_code_routines") is True),
-        },
-    }
+        except Exception as error:
+            reason = _busy_reason(error)
+            if reason is not None:
+                state = (
+                    "waiting-for-Claude"
+                    if reason == "app-running"
+                    else "waiting-for-sync"
+                )
+                record_progress(config, state)
+                _write(
+                    {"state": "skipped", "reason": reason, "progress": state},
+                    as_json=arguments.as_json,
+                    stream=output,
+                )
+                return 0 if arguments.command == "auto" else 1
+            payload = _chat_failure(error)
+        payload.update(
+            run_adapters(config, deps, lambda: bool(_running_processes(config, deps)))
+        )
+        payload["progress"] = finish_progress(config, payload)
+        _write(payload, as_json=arguments.as_json, stream=output)
+        return 0 if payload["progress"] == "finished" else 1
+    except Exception:
+        record_progress(
+            config, "needs-attention", reason="sync-error", next_action="run-doctor"
+        )
+        raise
+    finally:
+        handoff.release()
 
 
 def run(
@@ -1040,6 +813,39 @@ def run(
                 stream=output,
             )
             return 0
+        if arguments.command == "setup":
+            installer = deps.installer_factory(arguments.config)
+            if arguments.config.exists():
+                source = arguments.config.read_bytes()
+            else:
+                source = installer.default_config_data()
+            desired, config_payload = _prepare_config_data(
+                source,
+                automatic_targets=arguments.automatic_targets,
+                enable_personal=arguments.enable_personal,
+                disable_personal=arguments.disable_personal,
+                sync_layout=arguments.sync_layout,
+                sync_routines=arguments.sync_routines,
+            )
+            report = installer.setup(
+                dry_run=arguments.dry_run,
+                config_data=desired,
+            )
+            _write(
+                {
+                    "state": report.state,
+                    "counts": {
+                        "actions": report.change_count,
+                        "backups": len(report.backups),
+                        **config_payload["counts"],
+                    },
+                    "bytes": 0,
+                    "duration_ms": 0,
+                },
+                as_json=False,
+                stream=output,
+            )
+            return 0
         if arguments.command == "configure":
             payload = _configure(
                 arguments.config,
@@ -1063,76 +869,8 @@ def run(
                 stream=output,
             )
             return 0 if _plan_state(plan) in ("planned", "noop") else 1
-        if arguments.command == "sync":
-            started = deps.clock()
-            plan = deps.planner_factory(config).plan(SyncRequest(config))
-            deps.clock()  # Preserve a phase boundary for injected timing adapters.
-            if _plan_state(plan).startswith("blocked_"):
-                _write(
-                    _plan_summary(plan, round((deps.clock() - started) * 1000)),
-                    as_json=arguments.as_json,
-                    stream=output,
-                )
-                return 1
-            receipt = deps.engine_factory(config).apply(plan)
-            duration_ms = round((deps.clock() - started) * 1000)
-            payload = _receipt_summary(receipt, duration_ms)
-            if config.sync_code_routines:
-                payload["routines"] = _routine_summary(config, deps)
-            if config.sync_sidebar_layout:
-                payload["layout"] = _layout_summary(config, deps)
-            _write(
-                payload,
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "auto":
-            if _running_processes(config, deps):
-                _write(
-                    {"state": "skipped", "reason": "app-running"},
-                    as_json=False,
-                    stream=output,
-                )
-                return 0
-            started = deps.clock()
-            try:
-                plan = deps.planner_factory(config).plan(SyncRequest(config))
-                if _plan_state(plan).startswith("blocked_"):
-                    _write(
-                        _plan_summary(
-                            plan,
-                            round((deps.clock() - started) * 1000),
-                        ),
-                        as_json=False,
-                        stream=output,
-                    )
-                    return 1
-                receipt = deps.engine_factory(config).apply(plan)
-            except Exception as error:
-                reason = _busy_reason(error)
-                if reason is None:
-                    raise
-                _write(
-                    {"state": "skipped", "reason": reason},
-                    as_json=False,
-                    stream=output,
-                )
-                return 0
-            payload = _receipt_summary(
-                receipt,
-                round((deps.clock() - started) * 1000),
-            )
-            if config.sync_code_routines:
-                payload["routines"] = _routine_summary(config, deps)
-            if config.sync_sidebar_layout:
-                payload["layout"] = _layout_summary(config, deps)
-            _write(
-                payload,
-                as_json=False,
-                stream=output,
-            )
-            return 0
+        if arguments.command in ("sync", "auto"):
+            return _run_sync(arguments, config, deps, output)
         if arguments.command == "switch":
             return _run_switch(arguments, config, deps, output)
         if arguments.command == "clear-launch-guard":
@@ -1155,22 +893,36 @@ def run(
             return 0
         if arguments.command == "status":
             running = _running_processes(config, deps)
-            watcher_failure = _watcher_failure(config.state_dir)
+            watcher_error = watcher_failure(config.state_dir)
             launch_guard_failure = _launch_guard_failure(config)
-            layout_failure = _layout_failure(config)
-            routine_failure = _routine_failure(config)
+            layout_failure = adapter_failure(config, "layout")
+            routine_failure = adapter_failure(config, "routines")
+            abandoned = abandoned_preparation_count(config.state_dir)
+            progress = current_progress(
+                config,
+                app_running=bool(running),
+                failures=watcher_error
+                + launch_guard_failure
+                + layout_failure
+                + routine_failure
+                + abandoned,
+            )
+            if abandoned:
+                progress["next_action"] = "inspect-preparations"
             _write(
                 {
                     "bytes": 0,
                     "counts": {
+                        "abandoned_preparations": abandoned,
                         "launch_guards": launch_guard_failure,
                         "layout_failures": layout_failure,
                         "profiles": len(config.profiles),
                         "routine_failures": routine_failure,
                         "running_processes": len(running),
-                        "watcher_failures": watcher_failure,
+                        "watcher_failures": watcher_error,
                     },
                     "duration_ms": 0,
+                    **progress,
                     "state": (
                         "app-running"
                         if running
@@ -1181,7 +933,7 @@ def run(
                         else "routines-failed"
                         if routine_failure
                         else "watcher-failed"
-                        if watcher_failure
+                        if watcher_error
                         else "idle"
                     ),
                 },
@@ -1190,7 +942,12 @@ def run(
             )
             return 0
         if arguments.command == "doctor":
-            payload = _doctor_summary(config)
+            payload = doctor_summary(
+                config,
+                deps,
+                lambda: bool(_running_processes(config, deps)),
+                _launch_guard_failure(config),
+            )
             _write(
                 payload,
                 as_json=arguments.as_json,

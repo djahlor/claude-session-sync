@@ -22,8 +22,8 @@ copies Claude's whole login database.
 Synchronization can move conversation-session metadata across Claude profiles
 and across account namespaces. That can expose work history to a personal
 profile, or personal history to a work profile. Review your employer's policy
-before enabling it. Routine manifests can include local paths and approved
-permission settings, so the same boundary applies to routine sync.
+before enabling it. Routine definitions include local paths. Existing permission
+grants, execution history, and unknown fields stay local to each destination.
 
 The base config starts in safe mode. The recommended installer choice then
 enables automatic account discovery and sidebar sync inside the standard Claude
@@ -45,8 +45,8 @@ Automatic mode accepts future account and workspace IDs only under data roots
 already present in the private config. It does not trust new filesystem roots.
 Malformed chats and real revision conflicts still stop chat writes. A malformed
 routine or sidebar record skips only that separate update, so a completed chat
-sync stays completed. Machine-readable output and logs contain aggregate counts,
-not raw account IDs, session IDs, paths, titles, or chat content.
+sync stays completed. Invalid chats do not stop valid routine or sidebar updates.
+Receipts use aggregate counts; diagnostic error details can include local paths.
 
 ## Requirements and compatibility
 
@@ -78,8 +78,8 @@ From this directory:
 
 ```sh
 python3 -m pip install .
-claude-session-sync install --dry-run
-claude-session-sync install --apply
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --dry-run
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --apply
 ```
 
 The per-user installer creates:
@@ -95,6 +95,14 @@ The installer never modifies `/Applications/Claude.app`. Generated plist files a
 checked with `plutil -lint`; changed generated artifacts are backed up before
 replacement, unchanged installs are no-ops, and the LaunchAgent is bootstrapped
 or reloaded through `launchctl` after installation.
+
+`setup` validates the requested config and stages the helpers before changing
+installed artifacts. It holds the installation and sync locks, stops the old
+watcher, and activates the new one last. A durable recovery snapshot restores
+the previous files and service after failure. An interrupted setup is recovered
+before the next applying setup or uninstall. If recovery cannot be verified,
+the snapshot stays in the private support directory and the command reports its
+location. Dry-run never applies a pending recovery.
 
 Safe mode pins only the targets that exist now:
 
@@ -115,8 +123,7 @@ claude-session-sync configure --automatic-targets --apply
 To use the advanced separate Personal app:
 
 ```sh
-claude-session-sync configure --automatic-targets --sync-layout --sync-routines --enable-personal --apply
-claude-session-sync install --apply
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --enable-personal --apply
 ```
 
 Validate before the first write:
@@ -134,9 +141,13 @@ The normal workflow has three steps:
 
 1. Sign out and sign in to another account in Claude when needed.
 2. Quit Claude once.
-3. Wait for `claude-session-sync status` to report `idle`, then open Claude
-   normally. The watcher syncs chats, Code routines, pins, and groups while
-   Claude is closed.
+3. Wait for the “Sync finished” notification, then open Claude normally.
+   `claude-session-sync status` also reports `progress=finished`.
+
+Status reports waiting for Claude, syncing, finished, or needs attention. It also
+shows the last successful sync time. A missing or interrupted run is never
+reported as finished. macOS notification settings can suppress banners, so use
+the status command if no banner appears.
 
 If Claude reopens before the watcher can write, no data is changed. Quit it
 again and let the watcher finish the pending sync.
@@ -161,8 +172,8 @@ launch two profiles. The wait uses a wall-clock deadline and a bounded process
 probe, so slow process inspection cannot silently extend the advertised limit.
 It launches the selected profile only after synchronization succeeds.
 `auto` is intended for the watcher; app-running or writer-busy conditions return
-success with an explicit `skipped` state so another termination event can retry
-safely.
+success with an explicit `skipped` state. The watcher retries temporary shutdown
+and writer-busy conditions for up to 30 seconds, without changing open app data.
 
 Advanced two-profile mode requires one sign-in per profile:
 
@@ -187,21 +198,23 @@ claude-session-sync clear-launch-guard --apply
 ```
 
 The Swift watcher subscribes to macOS workspace application-termination
-notifications and runs one `auto` check at load. It does not poll every second,
-coalesces termination bursts, and persists a private aggregate status receipt.
-`status` and `doctor` surface watcher failure.
+notifications and runs one `auto` check at load. It coalesces termination bursts,
+uses bounded retries during shutdown, and persists a private aggregate status
+receipt. Completion and attention notifications contain no chat data.
+`status` surfaces watcher failure; `doctor` probes current routine data and a
+private copy of the sidebar database while Claude is closed. Successful adapter
+checks record the installed Desktop build without imposing a version allowlist.
 Planning uses cached content hashes, unchanged syncs are no-ops, and copies are
-staged and atomically replaced. On the development Mac, a durable synthetic
-700-copy transaction (4.2 MB) takes about 0.3–0.5 seconds, while the 5,000-file
-planner test remains well under its three-second warm-cache budget. Actual
-performance still depends on filesystem and profile size.
+staged and atomically replaced. In a copy-only check on the development Mac,
+catching up 676 chat records took about 68 seconds; a following unchanged sync
+took about 14 seconds. These measurements are not a live completion guarantee.
+Actual time depends on the number and size of records and the filesystem.
 
 The watcher receives an event only after Claude has really terminated. A quit
-request can return while Electron is still shutting down; observed shutdowns on
-the development Mac ranged from about 1.2 to 6.0 seconds. The hot no-op sync
-itself normally takes about 0.2–0.4 seconds. The wrapper removes the need to
-guess or retry during that shutdown gap, but it cannot make Claude terminate
-faster. Heavy system load can increase both numbers.
+request can return while Electron is still shutting down. The watcher waits for
+the remaining processes during its retry window. The finished notification and
+the status receipt show when sync has completed; they do not make Claude shut
+down faster.
 
 The installer detects the legacy `com.djahlor.claude-session-sync` LaunchAgent,
 stops it, and moves its plist into the backup area before activating the new
@@ -235,8 +248,11 @@ deletions so a deleted routine does not return from a stale account. New empty
 accounts receive the current snapshot instead of deleting it.
 
 Each multi-file update has exact preimages, post-write verification, automatic
-rollback, and crash recovery. Routine errors are reported separately and never
-change a completed chat result. This release syncs Claude Code routines only;
+rollback, and crash recovery. Manifests and their comparison snapshot share one
+transaction. Definitions sync; permission grants, execution history, and unknown
+metadata remain local to each destination. Routine errors are reported separately
+and never change a completed chat result, but the overall command returns a
+nonzero exit code with `progress=needs-attention`. This tool syncs Claude Code routines only;
 Cowork routines use different space-specific context and are left untouched.
 
 ## Failure handling
@@ -273,6 +289,18 @@ Rollback revalidates live data before restoring journaled preimages. If it
 reports `RECOVERY_REQUIRED`, stop launching Claude and preserve the state
 directory for manual inspection. Never delete a journal to silence an error.
 
+Chat backups are now prepared outside the published `runs` directory. An
+ordinary backup failure removes only its unfinished copies, before any live
+write. A complete signed journal becomes visible in `runs` through one rename.
+After a hard process crash, `doctor` and `status` report any leftover preparations
+with `next_action=inspect-preparations`. These are separate from published runs.
+Older manifestless runs still need individual inspection; the tool does not
+guess whether a missing manifest was never written or was later deleted.
+
+If process inspection is denied, sync stops with
+`reason=process-inspection-unavailable`. Run it in a normal local Terminal with
+access to the Mac process table. Do not disable the stopped-app check.
+
 Preview or apply removal with:
 
 ```sh
@@ -299,10 +327,20 @@ fake process, launch, compiler, and plist-lint adapters. They do not write to
 live Claude, Applications, Library, or LaunchAgents locations.
 
 Release verification also builds the wheel, installs it into an isolated
-directory, and runs `install --dry-run` without the source checkout. The Swift
+directory, and runs `setup --dry-run` without the source checkout. The Swift
 watcher and third-party LevelDB/Snappy source ship as package data so wheel
 installs remain self-contained. LevelDB keeps its BSD license and Snappy keeps
 its COPYING notice under `src/claude_session_sync/vendor`.
+
+Opt-in macOS integration tests compile the real helpers and exercise an isolated
+install, config upgrade, and uninstall with a simulated service controller:
+
+```sh
+RUN_MACOS_INSTALLER_INTEGRATION=1 PYTHONPATH=src python3 -m unittest discover -s tests -p test_installer_integration.py -v
+```
+
+`RUN_LAUNCHCTL_INTEGRATION=1` additionally registers and removes a uniquely named
+test service in the current GUI session. It never targets the production watcher.
 
 ## License
 

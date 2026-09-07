@@ -45,7 +45,8 @@ def ensure_private_file(path: PathLike) -> None:
 
 def _open_regular_read(path: PathLike) -> BinaryIO:
     file_path = Path(path)
-    flags = os.O_RDONLY
+    # Reject FIFOs after opening without waiting for a writer indefinitely.
+    flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(str(file_path), flags)

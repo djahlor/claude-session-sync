@@ -4,34 +4,55 @@ from __future__ import annotations
 
 import base64
 import copy
-import hashlib
-import json
 import os
 import re
 import stat
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from .config import Config
+from . import strict_json as json
 from .filesystem import (
     atomic_write_bytes,
     durable_unlink,
     ensure_private_directory,
-    fsync_directory,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
+from .record_journal import (
+    Record,
+    RecordJournal,
+    RecordJournalError,
+    RecordRecoveryError,
+)
+from .processes import managed_processes
 from .store import SessionStore
 
 
 SNAPSHOT_VERSION = 1
-JOURNAL_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TASKS = 10_000
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 MISSING = object()
 TargetKey = Tuple[str, str, str]
+# Observed in Claude Desktop's CCDScheduledTasks schema. All other fields,
+# including future ones, belong to the destination account and never travel.
+DEFINITION_FIELDS = frozenset(
+    (
+        "id",
+        "displayName",
+        "cronExpression",
+        "fireAt",
+        "enabled",
+        "filePath",
+        "model",
+        "createdAt",
+        "cwd",
+        "useWorktree",
+        "sourceBranch",
+        "disableJitter",
+    )
+)
 
 
 class RoutineError(RuntimeError):
@@ -52,6 +73,7 @@ class RoutineSample:
     path: Path
     mtime_ns: int
     document: Optional[Mapping[str, Any]]
+    content: Optional[bytes] = None
 
     @property
     def exists(self) -> bool:
@@ -76,6 +98,7 @@ class RoutineTransform:
     manifest: Mapping[str, Any]
     snapshot: RoutineSnapshot
     task_count: int
+    documents: Mapping[TargetKey, Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -109,6 +132,37 @@ def _task_map(document: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     return {task["id"]: task for task in document["scheduledTasks"]}
 
 
+def _definitions(document: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "scheduledTasks": [
+            {
+                key: copy.deepcopy(value)
+                for key, value in task.items()
+                if key in DEFINITION_FIELDS
+            }
+            for task in document["scheduledTasks"]
+        ]
+    }
+
+
+def _destination_manifest(
+    definitions: Mapping[str, Any], original: Optional[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    document = copy.deepcopy(dict(original or {"scheduledTasks": []}))
+    originals = _task_map(document)
+    tasks = []
+    for definition in definitions["scheduledTasks"]:
+        local = {
+            key: copy.deepcopy(value)
+            for key, value in originals.get(definition["id"], {}).items()
+            if key not in DEFINITION_FIELDS
+        }
+        local.update(copy.deepcopy(definition))
+        tasks.append(local)
+    document["scheduledTasks"] = tasks
+    return document
+
+
 def _validate_manifest(value: Any, label: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise RoutineError("{} is not a JSON object".format(label))
@@ -137,6 +191,12 @@ def _validate_manifest(value: Any, label: str) -> Dict[str, Any]:
         created_at = task.get("createdAt")
         if isinstance(created_at, bool) or not isinstance(created_at, int):
             raise RoutineError("{} contains an invalid creation time".format(label))
+        for key in ("displayName", "model", "cwd", "sourceBranch"):
+            if key in task and not isinstance(task[key], str):
+                raise RoutineError("{} contains an invalid {}".format(label, key))
+        for key in ("useWorktree", "disableJitter"):
+            if key in task and not isinstance(task[key], bool):
+                raise RoutineError("{} contains an invalid {}".format(label, key))
         cron = task.get("cronExpression")
         fire_at = task.get("fireAt")
         if not (
@@ -168,20 +228,19 @@ def _select_change(label: str, candidates: Sequence[Tuple[int, TargetKey, Any]])
     return _clone(selected[2])
 
 
-def _merge_value(
-    label: str,
+def _merge_task(
     key: str,
     baseline: Any,
     samples: Sequence[RoutineSample],
     known_targets: Set[TargetKey],
-    getter: Any,
+    task_maps: Mapping[TargetKey, Mapping[str, Mapping[str, Any]]],
 ) -> Any:
     candidates = []
     baseline_key = _value_key(baseline)
     for sample in samples:
         if not sample.exists:
             continue
-        current = getter(sample.document, key)
+        current = task_maps[sample.target].get(key, MISSING)
         if current is MISSING and sample.target not in known_targets:
             continue
         if _value_key(current) == baseline_key:
@@ -189,7 +248,7 @@ def _merge_value(
         candidates.append((sample.mtime_ns, sample.target, current))
     if not candidates:
         return _clone(baseline)
-    return _select_change(label, candidates)
+    return _select_change("routine task", candidates)
 
 
 def transform_routine_manifests(
@@ -207,64 +266,58 @@ def transform_routine_manifests(
             (
                 None
                 if sample.document is None
-                else _validate_manifest(sample.document, "routine manifest")
+                else _definitions(
+                    _validate_manifest(sample.document, "routine manifest")
+                )
             ),
+            sample.content,
         )
         for sample in samples
     )
     baseline = (
         {"scheduledTasks": []}
         if snapshot is None
-        else _validate_manifest(snapshot.manifest, "routine snapshot")
+        else _definitions(_validate_manifest(snapshot.manifest, "routine snapshot"))
     )
     known_targets = set(() if snapshot is None else snapshot.targets)
     baseline_tasks = _task_map(baseline)
+    task_maps = {
+        sample.target: _task_map(sample.document)
+        for sample in validated
+        if sample.document is not None
+    }
     task_ids = set(baseline_tasks)
-    for sample in validated:
-        if sample.document is not None:
-            task_ids.update(_task_map(sample.document))
+    for tasks in task_maps.values():
+        task_ids.update(tasks)
 
     merged_tasks = []
     for task_id in sorted(task_ids):
-        selected = _merge_value(
-            "routine task",
+        selected = _merge_task(
             task_id,
             baseline_tasks.get(task_id, MISSING),
             validated,
             known_targets,
-            lambda document, key: _task_map(document).get(key, MISSING),
+            task_maps,
         )
         if selected is not MISSING:
             merged_tasks.append(selected)
 
-    metadata_keys = set(baseline) - {"scheduledTasks"}
-    for sample in validated:
-        if sample.document is not None:
-            metadata_keys.update(set(sample.document) - {"scheduledTasks"})
     merged: Dict[str, Any] = {"scheduledTasks": merged_tasks}
-    for key in sorted(metadata_keys):
-        selected = _merge_value(
-            "routine metadata {}".format(key),
-            key,
-            baseline.get(key, MISSING),
-            validated,
-            known_targets,
-            lambda document, name: document.get(name, MISSING),
-        )
-        if selected is not MISSING:
-            merged[key] = selected
-
     merged = _validate_manifest(merged, "merged routine manifest")
     targets = tuple(sorted(sample.target for sample in validated))
     return RoutineTransform(
         merged,
         RoutineSnapshot(targets, merged),
         len(merged_tasks),
+        {
+            sample.target: _destination_manifest(merged, sample.document)
+            for sample in samples
+        },
     )
 
 
 def _read_regular(path: Path) -> Tuple[bytes, int]:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -280,6 +333,13 @@ def _read_regular(path: Path) -> Tuple[bytes, int]:
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
             content = stream.read(MAX_MANIFEST_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RoutineError("routine manifest changed while being read")
         if len(content) > MAX_MANIFEST_BYTES:
             raise RoutineError("routine manifest is too large")
         return content, metadata.st_mtime_ns
@@ -307,9 +367,12 @@ def _encode_manifest(document: Mapping[str, Any]) -> bytes:
 
 
 def load_routine_snapshot(path: Path) -> Optional[RoutineSnapshot]:
-    if not os.path.lexists(str(path)):
+    return _decode_snapshot(_read_optional(path))
+
+
+def _decode_snapshot(content: Optional[bytes]) -> Optional[RoutineSnapshot]:
+    if content is None:
         return None
-    content, _mtime = _read_regular(path)
     try:
         value = json.loads(content.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
@@ -337,12 +400,51 @@ def load_routine_snapshot(path: Path) -> Optional[RoutineSnapshot]:
 class RoutineSynchronizer:
     """Synchronize Code routines after Claude has fully terminated."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        task_root: Optional[Path] = None,
+        process_probe: Callable[..., Any] = managed_processes,
+    ) -> None:
         self.config = config
+        self.task_root = task_root or Path.home() / ".claude" / "scheduled-tasks"
+        self.process_probe = process_probe
+
+    def probe(self) -> Dict[str, Any]:
+        """Validate current source data without creating state or restoring files."""
+
+        if not self.config.sync_code_routines:
+            return {
+                "state": "disabled",
+                "target_count": 0,
+                "manifest_count": 0,
+                "task_count": 0,
+            }
+        self._assert_stopped()
+        targets = self._targets()
+        samples = tuple(self._sample(target) for target in targets)
+        transform = transform_routine_manifests(
+            samples, snapshot=load_routine_snapshot(self._snapshot_path())
+        )
+        self._validate_task_files(transform.manifest)
+        return {
+            "state": "compatible",
+            "target_count": len(targets),
+            "manifest_count": sum(sample.exists for sample in samples),
+            "task_count": transform.task_count,
+        }
+
+    def _assert_stopped(self) -> None:
+        if self.process_probe(
+            self.config.profiles, executable=self.config.claude_executable, timeout=5
+        ):
+            raise RoutineBusyError("Claude must be fully quit before syncing routines")
 
     def sync(self) -> RoutineReceipt:
         if not self.config.sync_code_routines:
             return RoutineReceipt("disabled", 0, 0, 0, 0, 0)
+        self._assert_stopped()
         ensure_private_directory(self.config.state_dir)
         try:
             lock = ExclusiveFileLock(
@@ -356,35 +458,40 @@ class RoutineSynchronizer:
             targets = self._targets()
             self._recover_pending(targets)
             samples = tuple(self._sample(target) for target in targets)
-            snapshot_path = self.config.state_dir / "code-routines-snapshot.json"
+            snapshot_path = self._snapshot_path()
+            snapshot_before = _read_optional(snapshot_path)
             transform = transform_routine_manifests(
                 samples,
-                snapshot=load_routine_snapshot(snapshot_path),
+                snapshot=_decode_snapshot(snapshot_before),
             )
             self._validate_task_files(transform.manifest)
-            encoded = _encode_manifest(transform.manifest)
-            current = {sample.path: _read_optional(sample.path) for sample in samples}
+            current = {sample.path: sample.content for sample in samples}
             replacements = {
-                sample.path: encoded
+                sample.path: _encode_manifest(transform.documents[sample.target])
                 for sample in samples
-                if sample.document is None or sample.document != transform.manifest
+                if sample.document != transform.documents[sample.target]
             }
+            manifest_writes = len(replacements)
+            current[snapshot_path] = snapshot_before
+            snapshot_after = _canonical(transform.snapshot.as_dict()) + b"\n"
+            if snapshot_after != snapshot_before:
+                replacements[snapshot_path] = snapshot_after
+            if any(_read_optional(path) != before for path, before in current.items()):
+                raise RoutineError("a routine manifest changed during synchronization")
             if replacements:
                 self._commit(current, replacements, targets)
-            if snapshot_path.is_symlink():
-                raise RoutineError("routine snapshot path is unsafe")
-            atomic_write_bytes(
-                snapshot_path,
-                (_canonical(transform.snapshot.as_dict()) + b"\n"),
-            )
-            os.chmod(str(snapshot_path), 0o600)
+            self._assert_stopped()
+            expected = dict(current)
+            expected.update(replacements)
+            if any(_read_optional(path) != after for path, after in expected.items()):
+                raise RoutineError("routine data changed after synchronization")
             return RoutineReceipt(
-                "synced" if replacements else "noop",
+                "synced" if manifest_writes else "noop",
                 len(self.config.profiles),
                 len(targets),
                 sum(sample.exists for sample in samples),
                 transform.task_count,
-                len(replacements),
+                manifest_writes,
             )
         finally:
             lock.release()
@@ -395,7 +502,7 @@ class RoutineSynchronizer:
             and not self.config.acknowledge_cross_profile_copy
         ):
             raise RoutineError("cross-profile routine copying is not acknowledged")
-        discovery = SessionStore().discover(self.config)
+        discovery = SessionStore().discover_targets(self.config)
         if discovery.invalid_replicas:
             raise RoutineError("Claude Code session storage is unsafe")
         approved = {
@@ -426,19 +533,20 @@ class RoutineSynchronizer:
         if not os.path.lexists(str(path)):
             return RoutineSample(key, path, 0, None)
         content, mtime_ns = _read_regular(path)
-        return RoutineSample(key, path, mtime_ns, _decode_manifest(content))
+        return RoutineSample(key, path, mtime_ns, _decode_manifest(content), content)
 
     def _validate_task_files(self, manifest: Mapping[str, Any]) -> None:
         for task in manifest["scheduledTasks"]:
-            path = Path(task["filePath"]).expanduser()
+            path = Path(task["filePath"])
+            expected = self.task_root / task["id"] / "SKILL.md"
             if (
                 not path.is_absolute()
-                or path.name != "SKILL.md"
-                or path.parent.name != task["id"]
-                or path.is_symlink()
+                or path != expected
+                or any(parent.is_symlink() for parent in (path, *path.parents))
                 or not path.is_file()
             ):
                 raise RoutineError("a routine definition file is missing or unsafe")
+            _read_regular(path)
 
     def _snapshot_path(self) -> Path:
         return self.config.state_dir / "code-routines-snapshot.json"
@@ -447,32 +555,72 @@ class RoutineSynchronizer:
         return self.config.state_dir / "routine-runs"
 
     def _allowed_paths(self, targets: Sequence[Any]) -> Set[str]:
-        return {str(target.path / "scheduled-tasks.json") for target in targets}
+        return {str(target.path / "scheduled-tasks.json") for target in targets} | {
+            str(self._snapshot_path())
+        }
 
-    def _write_journal(self, path: Path, document: Mapping[str, Any]) -> None:
-        atomic_write_bytes(path, _canonical(document) + b"\n")
-        os.chmod(str(path), 0o600)
+    def _journal(self, targets: Sequence[Any]) -> RecordJournal:
+        allowed = self._allowed_paths(targets)
 
-    def _journal_records(
-        self,
-        current: Mapping[Path, Optional[bytes]],
-        replacements: Mapping[Path, bytes],
-    ) -> Sequence[Dict[str, Any]]:
-        records = []
-        for path, after in sorted(replacements.items(), key=lambda item: str(item[0])):
-            before = current[path]
-            records.append(
-                {
-                    "path": str(path),
-                    "before": (
-                        None
-                        if before is None
-                        else base64.b64encode(before).decode("ascii")
-                    ),
-                    "after_sha256": hashlib.sha256(after).hexdigest(),
-                }
-            )
-        return records
+        def validate(target: str) -> None:
+            if target not in allowed:
+                raise RoutineRecoveryError(
+                    "routine target is outside configured storage"
+                )
+            path = Path(target)
+            if path.is_symlink() or not path.parent.is_dir():
+                raise RoutineRecoveryError("routine target is unsafe")
+            if path == self._snapshot_path():
+                if path.parent.is_symlink():
+                    raise RoutineRecoveryError("routine snapshot target is unsafe")
+                return
+            # The known target hierarchy must remain real directories.
+            if any(
+                parent.is_symlink()
+                for parent in (
+                    path.parent,
+                    path.parent.parent,
+                    path.parent.parent.parent,
+                )
+            ):
+                raise RoutineRecoveryError("routine target includes an unsafe symlink")
+
+        def write(target: str, value: bytes) -> None:
+            self._assert_stopped()
+            atomic_write_bytes(Path(target), value)
+            os.chmod(target, 0o600)
+
+        def delete(target: str) -> None:
+            self._assert_stopped()
+            durable_unlink(Path(target))
+
+        def legacy(document: Mapping[str, Any]) -> Sequence[Record]:
+            records = document["records"]
+            if not isinstance(records, list):
+                raise ValueError("invalid routine recovery records")
+            return [
+                Record(
+                    item["path"],
+                    None
+                    if item["before"] is None
+                    else base64.b64decode(item["before"], validate=True),
+                    None,
+                    item["after_sha256"],
+                    legacy=True,
+                )
+                for item in records
+            ]
+
+        return RecordJournal(
+            self._journal_root(),
+            read=lambda target: _read_optional(Path(target)),
+            write=write,
+            delete=delete,
+            validate=validate,
+            before_mutation=self._assert_stopped,
+            retention=self.config.retention,
+            legacy_loader=legacy,
+        )
 
     def _commit(
         self,
@@ -480,165 +628,21 @@ class RoutineSynchronizer:
         replacements: Mapping[Path, bytes],
         targets: Sequence[Any],
     ) -> None:
-        allowed = self._allowed_paths(targets)
-        if any(str(path) not in allowed for path in replacements):
-            raise RoutineError("routine write target is outside configured storage")
-        root = ensure_private_directory(self._journal_root())
-        journal_path = root / "{}.json".format(uuid.uuid4().hex)
-        journal = {
-            "version": JOURNAL_VERSION,
-            "state": "PREPARED",
-            "records": self._journal_records(current, replacements),
-        }
-        self._write_journal(journal_path, journal)
         try:
-            for path, content in sorted(
-                replacements.items(), key=lambda item: str(item[0])
-            ):
-                if _read_optional(path) != current[path]:
-                    raise RoutineError(
-                        "a routine manifest changed during synchronization"
-                    )
-                atomic_write_bytes(path, content)
-                os.chmod(str(path), 0o600)
-                if _read_optional(path) != content:
-                    raise RoutineError("routine manifest write failed verification")
-        except BaseException as write_error:
-            try:
-                self._restore(current, replacements)
-                journal["state"] = "ROLLED_BACK"
-                self._write_journal(journal_path, journal)
-            except BaseException as recovery_error:
-                journal["state"] = "RECOVERY_REQUIRED"
-                self._write_journal(journal_path, journal)
-                raise RoutineRecoveryError(
-                    "routine recovery is required before another write"
-                ) from recovery_error
-            raise RoutineError("routine update was rolled back safely") from write_error
-        journal["state"] = "COMMITTED"
-        self._write_journal(journal_path, journal)
-        self._prune_journals(root)
-
-    def _restore(
-        self,
-        before: Mapping[Path, Optional[bytes]],
-        replacements: Mapping[Path, bytes],
-    ) -> None:
-        for path, original in sorted(before.items(), key=lambda item: str(item[0])):
-            if path not in replacements:
-                continue
-            current = _read_optional(path)
-            after = replacements[path]
-            if current not in (original, after):
-                raise RoutineRecoveryError("routine manifest changed during recovery")
-            if original is None:
-                if current is not None:
-                    durable_unlink(path)
-            else:
-                atomic_write_bytes(path, original)
-                os.chmod(str(path), 0o600)
-            if _read_optional(path) != original:
-                raise RoutineRecoveryError("routine rollback failed verification")
+            after = dict(current)
+            after.update(replacements)
+            self._journal(targets).commit(
+                {str(path): value for path, value in current.items()},
+                {str(path): value for path, value in after.items()},
+            )
+        except RecordRecoveryError as error:
+            raise RoutineRecoveryError(str(error)) from error
+        except RecordJournalError as error:
+            raise RoutineError(str(error)) from error
 
     def _recover_pending(self, targets: Sequence[Any]) -> None:
-        root = self._journal_root()
-        if not root.exists():
-            return
-        if root.is_symlink() or not root.is_dir():
-            raise RoutineRecoveryError("routine recovery state is unsafe")
-        allowed = self._allowed_paths(targets)
-        for path in sorted(root.glob("*.json")):
-            if path.is_symlink() or not path.is_file():
-                raise RoutineRecoveryError("routine recovery record is unsafe")
-            try:
-                content, _mtime_ns = _read_regular(path)
-                document = json.loads(content.decode("utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError, RoutineError) as error:
-                raise RoutineRecoveryError(
-                    "routine recovery state is malformed"
-                ) from error
-            if not isinstance(document, dict):
-                raise RoutineRecoveryError("routine recovery state is malformed")
-            if document.get("state") in ("COMMITTED", "ROLLED_BACK"):
-                continue
-            if document.get("version") != JOURNAL_VERSION or document.get(
-                "state"
-            ) not in ("PREPARED", "RECOVERY_REQUIRED"):
-                raise RoutineRecoveryError("routine recovery state is malformed")
-            records = document.get("records")
-            if not isinstance(records, list) or not records:
-                raise RoutineRecoveryError("routine recovery state is malformed")
-            before: Dict[Path, Optional[bytes]] = {}
-            after_digests: Dict[Path, str] = {}
-            for record in records:
-                if not isinstance(record, dict) or record.get("path") not in allowed:
-                    raise RoutineRecoveryError("routine recovery state is malformed")
-                destination = Path(record["path"])
-                if destination in before:
-                    raise RoutineRecoveryError("routine recovery state is malformed")
-                raw_before = record.get("before")
-                digest = record.get("after_sha256")
-                try:
-                    decoded = (
-                        None
-                        if raw_before is None
-                        else base64.b64decode(raw_before, validate=True)
-                    )
-                except (TypeError, ValueError) as error:
-                    raise RoutineRecoveryError(
-                        "routine recovery state is malformed"
-                    ) from error
-                if (
-                    not isinstance(digest, str)
-                    or len(digest) != 64
-                    or any(character not in "0123456789abcdef" for character in digest)
-                ):
-                    raise RoutineRecoveryError("routine recovery state is malformed")
-                before[destination] = decoded
-                after_digests[destination] = digest
-            current = {
-                destination: _read_optional(destination) for destination in before
-            }
-            if all(
-                current[destination] == value for destination, value in before.items()
-            ):
-                document["state"] = "ROLLED_BACK"
-            elif all(
-                current[destination] is not None
-                and hashlib.sha256(current[destination]).hexdigest()
-                == after_digests[destination]
-                for destination in before
-            ):
-                document["state"] = "COMMITTED"
-            else:
-                replacements = {}
-                for destination, value in current.items():
-                    if value == before[destination]:
-                        continue
-                    if (
-                        value is None
-                        or hashlib.sha256(value).hexdigest()
-                        != after_digests[destination]
-                    ):
-                        document["state"] = "RECOVERY_REQUIRED"
-                        self._write_journal(path, document)
-                        raise RoutineRecoveryError(
-                            "routine recovery found an independently changed manifest"
-                        )
-                    replacements[destination] = value
-                try:
-                    self._restore(before, replacements)
-                except BaseException as error:
-                    document["state"] = "RECOVERY_REQUIRED"
-                    self._write_journal(path, document)
-                    raise RoutineRecoveryError(
-                        "routine recovery is required"
-                    ) from error
-                document["state"] = "ROLLED_BACK"
-            self._write_journal(path, document)
-
-    def _prune_journals(self, root: Path) -> None:
-        paths = sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        for path in paths[: -self.config.retention]:
-            durable_unlink(path)
-        fsync_directory(root)
+        self._assert_stopped()
+        try:
+            self._journal(targets).recover()
+        except RecordJournalError as error:
+            raise RoutineRecoveryError(str(error)) from error

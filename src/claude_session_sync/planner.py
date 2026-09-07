@@ -1,7 +1,7 @@
 """Pure synchronization planning over validated store discovery."""
 
 import hashlib
-import json
+from . import strict_json as json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 

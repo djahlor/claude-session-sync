@@ -72,28 +72,23 @@ run_source_cli() {
     'from claude_session_sync.cli import main; raise SystemExit(main())' "$@"
 }
 
-run_source_cli install --apply
-
-configure_args=()
+setup_args=()
 if [[ "$automatic_targets" == true ]]; then
-  configure_args+=(--automatic-targets)
+  setup_args+=(--automatic-targets)
 fi
 if [[ "$enable_personal" == true ]]; then
-  configure_args+=(--enable-personal)
+  setup_args+=(--enable-personal)
 fi
 if [[ "$disable_personal" == true ]]; then
-  configure_args+=(--disable-personal)
+  setup_args+=(--disable-personal)
 fi
 if [[ "$sync_layout" == true ]]; then
-  configure_args+=(--sync-layout)
+  setup_args+=(--sync-layout)
 fi
 if [[ "$sync_routines" == true ]]; then
-  configure_args+=(--sync-routines)
+  setup_args+=(--sync-routines)
 fi
-if (( ${#configure_args[@]} > 0 )); then
-  run_source_cli configure "${configure_args[@]}" --apply
-  run_source_cli install --apply
-fi
+run_source_cli setup "${setup_args[@]}" --apply
 
 echo
 echo "Claude Session Sync is installed."

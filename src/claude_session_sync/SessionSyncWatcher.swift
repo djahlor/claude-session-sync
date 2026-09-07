@@ -8,6 +8,8 @@ private final class SessionSyncWatcher: NSObject {
   private let queue = DispatchQueue(label: "com.claude-session-sync.watcher")
   private var running = false
   private var pending = false
+  private var retryDeadline: Date?
+  private var lastNotice: String?
 
   init(command: [String], claudeExecutable: String, statusURL: URL) {
     self.command = command
@@ -16,8 +18,14 @@ private final class SessionSyncWatcher: NSObject {
     super.init()
   }
 
-  func requestAuto() {
-    queue.async { [weak self] in self?.startAutoIfNeeded() }
+  func requestAuto(afterQuit: Bool = false) {
+    queue.async { [weak self] in
+      if afterQuit {
+        self?.retryDeadline = Date().addingTimeInterval(30)
+        self?.lastNotice = nil
+      }
+      self?.startAutoIfNeeded()
+    }
   }
 
   private func startAutoIfNeeded() {
@@ -30,18 +38,29 @@ private final class SessionSyncWatcher: NSObject {
     let task = Process()
     let output = Pipe()
     task.executableURL = URL(fileURLWithPath: executable)
-    task.arguments = Array(command.dropFirst()) + ["auto"]
+    task.arguments = Array(command.dropFirst()) + ["auto", "--json"]
     task.standardInput = FileHandle.nullDevice
     task.standardOutput = output
     task.standardError = FileHandle.nullDevice
-    task.terminationHandler = { [weak self] completed in
-      let data = output.fileHandleForReading.readDataToEndOfFile()
-      self?.queue.async {
-        self?.finishAuto(exitStatus: completed.terminationStatus, output: data)
+    do {
+      try task.run()
+      // Drain while the child runs, but retain only bounded aggregate output.
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        var data = Data()
+        while true {
+          let chunk = output.fileHandleForReading.readData(ofLength: 4_096)
+          if chunk.isEmpty { break }
+          data.append(chunk.prefix(max(0, 65_536 - data.count)))
+        }
+        task.waitUntilExit()
+        let captured = data
+        self?.queue.async {
+          self?.finishAuto(exitStatus: task.terminationStatus, output: captured)
+        }
       }
-    }
-    do { try task.run() } catch {
+    } catch {
       writeStatus(exitStatus: 127, output: Data(), launchFailed: true)
+      notify("Sync needs attention. The sync tool could not start.")
       NSLog("claude-session-sync watcher could not start auto")
       running = false
       runPendingIfNeeded()
@@ -49,12 +68,60 @@ private final class SessionSyncWatcher: NSObject {
   }
 
   private func finishAuto(exitStatus: Int32, output: Data) {
-    writeStatus(exitStatus: exitStatus, output: output, launchFailed: false)
+    let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+    writeStatus(exitStatus: result == nil ? 1 : exitStatus, output: output, launchFailed: false)
+    let reason = result?["reason"] as? String
+    let progress = result?["progress"] as? String
+    running = false
+    if reason == "app-running" && NSWorkspace.shared.runningApplications.contains(where: {
+      $0.executableURL?.standardizedFileURL.path == claudeExecutable
+    }) {
+      retryDeadline = nil
+      runPendingIfNeeded()
+      return
+    }
+    if reason == "busy" || (reason == "app-running" && retryDeadline != nil) {
+      if retryDeadline == nil { retryDeadline = Date().addingTimeInterval(30) }
+      if let deadline = retryDeadline, Date() < deadline {
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startAutoIfNeeded() }
+        return
+      }
+      writeStatus(exitStatus: 1, output: output, launchFailed: false)
+      notify("Sync is still waiting. Quit Claude completely, then run sync again.")
+    } else if progress == "finished" {
+      notify("Sync finished. You can open Claude.")
+    } else if exitStatus != 0 || progress == "needs-attention" || result == nil {
+      notify("Sync needs attention. Run claude-session-sync doctor for details.")
+    }
+    retryDeadline = nil
     if exitStatus != 0 {
       NSLog("claude-session-sync auto failed with exit status %d", exitStatus)
     }
-    running = false
     runPendingIfNeeded()
+  }
+
+  private func notify(_ message: String) {
+    if ProcessInfo.processInfo.environment["CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS"] == "1" {
+      return
+    }
+    guard lastNotice != message else { return }
+    lastNotice = message
+    let notification = Process()
+    notification.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    notification.arguments = ["-e", """
+      on run argv
+        display notification (item 1 of argv) with title "Claude Session Sync"
+      end run
+      """, message]
+    notification.standardInput = FileHandle.nullDevice
+    notification.standardOutput = FileHandle.nullDevice
+    notification.standardError = FileHandle.nullDevice
+    do {
+      try notification.run()
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+        if notification.isRunning { notification.terminate() }
+      }
+    } catch { NSLog("claude-session-sync could not request a notification") }
   }
 
   private func runPendingIfNeeded() {
@@ -98,7 +165,7 @@ private final class SessionSyncWatcher: NSObject {
       bundleIdentifier == "com.anthropic.claudefordesktop"
       || bundleIdentifier == "com.khiet.claude-personal"
       || bundleIdentifier.hasPrefix("com.claude-session-sync.")
-    if executableMatches || knownBundle { requestAuto() }
+    if executableMatches || knownBundle { requestAuto(afterQuit: true) }
   }
 }
 

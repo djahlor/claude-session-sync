@@ -1,6 +1,9 @@
 import copy
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,11 +15,14 @@ from claude_session_sync.layout import (
     GROUP_SCOPES_KEY,
     LOCAL_SLICE_KEY,
     LayoutError,
+    LayoutBusyError,
+    LayoutRecoveryError,
     LayoutSnapshot,
     LayoutSynchronizer,
     transform_layout_records,
 )
 from claude_session_sync.model import Profile
+import claude_session_sync.layout as layout_module
 
 
 def encoded(document):
@@ -28,9 +34,7 @@ def decoded(value):
 
 
 def scope(*groups, assignments=None):
-    entries = [
-        {"id": "id-{}".format(name.lower()), "name": name} for name in groups
-    ]
+    entries = [{"id": "id-{}".format(name.lower()), "name": name} for name in groups]
     return {
         "groups": entries,
         "assignments": assignments or {},
@@ -117,12 +121,8 @@ class LayoutTransformTests(unittest.TestCase):
             )
 
     def test_ambiguous_assignment_is_not_copied_to_a_new_scope(self):
-        first = scope(
-            "Focus", "Backlog", assignments={"code:local_one": "id-focus"}
-        )
-        second = scope(
-            "Focus", "Backlog", assignments={"code:local_one": "id-backlog"}
-        )
+        first = scope("Focus", "Backlog", assignments={"code:local_one": "id-focus"})
+        second = scope("Focus", "Backlog", assignments={"code:local_one": "id-backlog"})
         result = transform_layout_records(
             records({"a/w": first, "b/w": second}, active="a/w"),
             {
@@ -161,7 +161,10 @@ class LayoutTransformTests(unittest.TestCase):
         self.assertEqual(store["pinnedOrder"], local["pinnedOrder"])
         self.assertEqual(
             ["Focus"],
-            [group["name"] for group in store["customGroupsByScope"]["new/w"]["groups"]],
+            [
+                group["name"]
+                for group in store["customGroupsByScope"]["new/w"]["groups"]
+            ],
         )
 
     def test_snapshot_groups_survive_an_active_scope_update(self):
@@ -199,9 +202,7 @@ class LayoutTransformTests(unittest.TestCase):
         current = records(
             {"a/w": scope("Focus")}, active="a/w", extra={"keep": [1, 2, 3]}
         )
-        result = transform_layout_records(
-            current, {"a/w": set()}, timestamp_ms=10
-        )
+        result = transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
 
         self.assertEqual(
             {"keep": [1, 2, 3]},
@@ -260,6 +261,7 @@ class LayoutRecoveryTests(unittest.TestCase):
             journal_root = config.state_dir / "layout-runs"
             journal_root.mkdir(parents=True)
             database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+            database_path.mkdir(parents=True)
             before = b"before"
             journal_path = journal_root / "run.json"
             journal_path.write_text(
@@ -288,7 +290,9 @@ class LayoutRecoveryTests(unittest.TestCase):
                 def get(self, key):
                     return before
 
-            synchronizer = LayoutSynchronizer(config, helper=root / "helper")
+            synchronizer = LayoutSynchronizer(
+                config, helper=root / "helper", process_probe=lambda: ()
+            )
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 synchronizer._recover_pending()
 
@@ -296,6 +300,226 @@ class LayoutRecoveryTests(unittest.TestCase):
                 "ROLLED_BACK",
                 json.loads(journal_path.read_text(encoding="utf-8"))["state"],
             )
+
+    def test_legacy_mixed_recovery_preserves_independent_layout_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+            database_path.mkdir(parents=True)
+            journal_root = config.state_dir / "layout-runs"
+            journal_root.mkdir(parents=True)
+            journal_path = journal_root / "run.json"
+            journal_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "state": "PREPARED",
+                        "database": str(database_path),
+                        "records": [
+                            {
+                                "key": key.hex(),
+                                "before": b"before".hex(),
+                                "after_sha256": hashlib.sha256(b"after").hexdigest(),
+                            }
+                            for key in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY)
+                        ],
+                    }
+                )
+            )
+            values = {GROUP_SCOPES_KEY: b"after", DFRAME_STORE_KEY: b"independent"}
+            writes = []
+
+            class FakeDatabase:
+                def __init__(self, helper, database):
+                    pass
+
+                def get(self, key):
+                    return values[key]
+
+                def write(self, records, state):
+                    writes.append(records)
+                    values.update(records)
+
+            synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
+            with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
+                with self.assertRaisesRegex(LayoutRecoveryError, "independently"):
+                    synchronizer._recover_pending()
+            self.assertEqual([], writes)
+            self.assertEqual(b"independent", values[DFRAME_STORE_KEY])
+            self.assertEqual(
+                "RECOVERY_REQUIRED", json.loads(journal_path.read_text())["state"]
+            )
+
+    def test_probe_opens_only_copied_database_and_leaves_live_files_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+            database_path.mkdir(parents=True)
+            marker = database_path / "CURRENT"
+            marker.write_bytes(b"original")
+            (config.profiles[0].data_root / "claude-code-sessions" / "a" / "w").mkdir(
+                parents=True
+            )
+            helper = root / "helper"
+            helper.write_bytes(b"placeholder")
+            os.chmod(helper, 0o700)
+            data = records({"a/w": scope("Focus")}, active="a/w")
+            opened = []
+
+            class FakeDatabase:
+                def __init__(self, helper, database):
+                    opened.append(database)
+                    (database / "CURRENT").write_bytes(b"mutated on open")
+
+                def get(self, key):
+                    return data[key]
+
+            synchronizer = LayoutSynchronizer(
+                config, helper=helper, process_probe=lambda: ()
+            )
+            with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
+                result = synchronizer.probe()
+            self.assertEqual("compatible", result["state"])
+            self.assertEqual(1, result["group_count"])
+            self.assertEqual(b"original", marker.read_bytes())
+            self.assertTrue(opened)
+            self.assertNotIn(database_path, opened)
+            self.assertTrue(all(not path.exists() for path in opened))
+            self.assertFalse(config.state_dir.exists())
+
+    def test_running_claude_prevents_direct_sync_or_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer = LayoutSynchronizer(
+                self.config(Path(directory)), process_probe=lambda: (object(),)
+            )
+            with self.assertRaises(LayoutBusyError):
+                synchronizer.sync()
+            with self.assertRaises(LayoutBusyError):
+                synchronizer.probe()
+
+    def transaction_fixture(self, root):
+        config = self.config(root)
+        config.state_dir.mkdir()
+        database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+        database_path.mkdir(parents=True)
+        values = {DFRAME_STORE_KEY: b"before"}
+
+        class FakeDatabase:
+            def __init__(self, helper, database):
+                self.database = database
+
+            def get(self, key):
+                return values[key]
+
+            def write(self, records, state):
+                values.update(records)
+
+        synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
+        return synchronizer, FakeDatabase, FakeDatabase(None, database_path), values
+
+    def test_snapshot_and_layout_share_one_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, fake, database, values = self.transaction_fixture(
+                Path(directory)
+            )
+            snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                synchronizer._commit(
+                    database,
+                    values.copy(),
+                    {DFRAME_STORE_KEY: b"after"},
+                    snapshot_path=snapshot,
+                    snapshot_after=b"new snapshot",
+                )
+            document = json.loads(
+                next(synchronizer._journal_root().glob("*.json")).read_text()
+            )
+            self.assertEqual("COMMITTED", document["state"])
+            self.assertEqual(2, len(document["records"]))
+            self.assertEqual(b"new snapshot", snapshot.read_bytes())
+            self.assertEqual(b"after", values[DFRAME_STORE_KEY])
+
+    def test_snapshot_write_failure_rolls_back_layout_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, fake, database, values = self.transaction_fixture(
+                Path(directory)
+            )
+            snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            original_write = layout_module.atomic_write_bytes
+
+            def fail_snapshot(path, content):
+                if path == snapshot:
+                    raise OSError("snapshot disk full")
+                original_write(path, content)
+
+            with (
+                patch("claude_session_sync.layout.LevelDatabase", fake),
+                patch(
+                    "claude_session_sync.layout.atomic_write_bytes",
+                    side_effect=fail_snapshot,
+                ),
+            ):
+                with self.assertRaisesRegex(LayoutError, "rolled back"):
+                    synchronizer._commit(
+                        database,
+                        values.copy(),
+                        {DFRAME_STORE_KEY: b"after"},
+                        snapshot_path=snapshot,
+                        snapshot_after=b"new snapshot",
+                    )
+            self.assertEqual(b"before", values[DFRAME_STORE_KEY])
+            self.assertFalse(snapshot.exists())
+
+    def test_interrupted_snapshot_commit_recovers_before_and_after_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, fake, database, values = self.transaction_fixture(
+                Path(directory)
+            )
+            snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            journal = synchronizer._journal()
+            original_save = journal._save
+
+            def interrupt_commit(path, document):
+                if document["state"] == "COMMITTED":
+                    raise KeyboardInterrupt()
+                original_save(path, document)
+
+            with (
+                patch("claude_session_sync.layout.LevelDatabase", fake),
+                patch.object(synchronizer, "_journal", return_value=journal),
+                patch.object(journal, "_save", side_effect=interrupt_commit),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    synchronizer._commit(
+                        database,
+                        values.copy(),
+                        {DFRAME_STORE_KEY: b"after"},
+                        snapshot_path=snapshot,
+                        snapshot_after=b"new snapshot",
+                    )
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                synchronizer._recover_pending()
+            document = json.loads(
+                next(synchronizer._journal_root().glob("*.json")).read_text()
+            )
+            self.assertEqual("COMMITTED", document["state"])
+            self.assertEqual(b"new snapshot", snapshot.read_bytes())
+            self.assertEqual(b"after", values[DFRAME_STORE_KEY])
+
+    def test_fifo_snapshot_fails_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            os.mkfifo(path)
+            code = (
+                "from pathlib import Path; from claude_session_sync.layout import load_snapshot, LayoutError; "
+                "\ntry: load_snapshot(Path({!r}))\nexcept LayoutError: pass\nelse: raise AssertionError('accepted FIFO')"
+            ).format(str(path))
+            result = subprocess.run(
+                [sys.executable, "-c", code], capture_output=True, timeout=3
+            )
+            self.assertEqual(0, result.returncode, result.stderr.decode())
 
 
 if __name__ == "__main__":

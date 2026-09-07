@@ -1,12 +1,12 @@
 """Discovery and validation of Claude Code session replicas."""
 
 import hashlib
-import json
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .config import Config
+from . import strict_json as json
 from .hash_cache import HashCache
 from .model import Discovery, InvalidReplica, Replica, Target
 
@@ -25,8 +25,20 @@ class SessionStore:
         self._hash_cache = hash_cache
 
     def discover(self, config: Config) -> Discovery:
-        targets: List[Target] = []
+        discovery = self.discover_targets(config)
         replicas: List[Replica] = []
+        invalid = list(discovery.invalid_replicas)
+        for target in discovery.targets:
+            self._discover_target(target, replicas, invalid)
+        return Discovery(
+            discovery.targets,
+            tuple(sorted(replicas, key=_replica_key)),
+            tuple(sorted(invalid, key=lambda item: str(item.path))),
+        )
+
+    def discover_targets(self, config: Config) -> Discovery:
+        """Validate target directories without reading another adapter's records."""
+        targets: List[Target] = []
         invalid: List[InvalidReplica] = []
 
         for profile in sorted(config.profiles, key=lambda item: item.name):
@@ -93,7 +105,6 @@ class SessionStore:
                     )
                     targets.append(target)
                     profile_target_count += 1
-                    self._discover_target(target, replicas, invalid)
             if profile_target_count == 0:
                 invalid.append(
                     InvalidReplica(
@@ -104,7 +115,7 @@ class SessionStore:
 
         return Discovery(
             tuple(sorted(targets, key=_target_key)),
-            tuple(sorted(replicas, key=_replica_key)),
+            (),
             tuple(sorted(invalid, key=lambda item: str(item.path))),
         )
 

@@ -1,6 +1,6 @@
 """Strict configuration loading for explicitly selected Claude profiles."""
 
-import json
+from . import strict_json as json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Set, Tuple, Union

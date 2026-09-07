@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.4.0"
+version = "0.4.1"
 description = "Safely synchronize Claude Desktop Code chats, routines, and sidebar layout across local accounts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -15,11 +15,8 @@ classifiers = [
   "Environment :: MacOS X",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
-  "Programming Language :: Python :: 3.14",
 ]
 dependencies = []
 
