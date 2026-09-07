@@ -13,7 +13,7 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from . import strict_json as json
 from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_directory
@@ -71,6 +71,9 @@ class RecordJournal:
         before_mutation: Callable[[], None],
         retention: int,
         legacy_loader: Optional[Callable[[Mapping[str, Any]], Sequence[Record]]] = None,
+        recovery_equivalent: Optional[
+            Callable[[str, Optional[bytes], Optional[bytes]], bool]
+        ] = None,
     ) -> None:
         self.root = root
         self.read = read
@@ -80,6 +83,9 @@ class RecordJournal:
         self.before_mutation = before_mutation
         self.retention = max(1, retention)
         self.legacy_loader = legacy_loader
+        # Used only to settle an entire unchanged payload without writing data.
+        # Partial rollback and normal commits always require exact bytes.
+        self.recovery_equivalent = recovery_equivalent
 
     def _load(self, path: Path) -> Dict[str, Any]:
         try:
@@ -197,6 +203,21 @@ class RecordJournal:
             if self.read(record.target) != record.before:
                 raise RecordRecoveryError("rollback failed verification")
 
+    def _settled_phase(
+        self, records: Sequence[Record], current: Mapping[str, Optional[bytes]]
+    ) -> Tuple[Optional[str], bool]:
+        if all(current[item.target] == item.before for item in records):
+            return "ROLLED_BACK", False
+        if all(item.matches_after(current[item.target]) for item in records):
+            return "COMMITTED", False
+        if self.recovery_equivalent is not None and not any(item.legacy for item in records):
+            for phase, attribute in (("ROLLED_BACK", "before"), ("COMMITTED", "after")):
+                if all(self.recovery_equivalent(
+                    item.target, getattr(item, attribute), current[item.target]
+                ) for item in records):
+                    return phase, True
+        return None, False
+
     def recover(self) -> None:
         if not os.path.lexists(str(self.root)):
             return
@@ -208,10 +229,17 @@ class RecordJournal:
                 continue
             records = self._records(document)
             current = self._current(records)
-            if all(current[item.target] == item.before for item in records):
-                document["state"] = "ROLLED_BACK"
-            elif all(item.matches_after(current[item.target]) for item in records):
-                document["state"] = "COMMITTED"
+            phase, used_equivalence = self._settled_phase(records, current)
+            if phase is not None:
+                self.before_mutation()
+                if self._current(records) != current:
+                    raise RecordRecoveryError("data changed during recovery")
+                document["state"] = phase
+                if used_equivalence:
+                    document["recovery_comparison"] = "adapter-payload"
+                    document["recovery_observed_sha256"] = {
+                        target: digest(value) for target, value in current.items()
+                    }
             else:
                 try:
                     self._restore(records)

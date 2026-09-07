@@ -40,7 +40,7 @@ class RecordJournalTests(unittest.TestCase):
         self.writes.append(target)
         self.values.pop(target, None)
 
-    def journal(self, write=None):
+    def journal(self, write=None, recovery_equivalent=None):
         return RecordJournal(
             self.root,
             read=self.values.get,
@@ -49,7 +49,11 @@ class RecordJournalTests(unittest.TestCase):
             validate=self.validate,
             before_mutation=self.guard,
             retention=1,
+            recovery_equivalent=recovery_equivalent,
         )
+
+    def metadata_equivalent(self, target, expected, current):
+        return expected is not None and current == expected + b"|metadata"
 
     def pending(self, before=None, after=None, name="pending.json"):
         before = self.values.copy() if before is None else before
@@ -122,6 +126,70 @@ class RecordJournalTests(unittest.TestCase):
         self.journal().recover()
         self.assertEqual([], self.writes)
         self.assertEqual("COMMITTED", json.loads(path.read_text())["state"])
+
+    def test_settled_recovery_rechecks_data_before_marking_complete(self):
+        for phase in ("old", "new"):
+            for equivalent in (False, True):
+                with self.subTest(phase=phase, equivalent=equivalent):
+                    self.values = {"a": b"old-a", "b": b"old-b"}
+                    path = self.pending()
+                    self.values = {key: (phase + "-" + key).encode() + (
+                        b"|metadata" if equivalent else b""
+                    ) for key in self.values}
+                    journal = self.journal(recovery_equivalent=self.metadata_equivalent)
+                    journal.before_mutation = lambda: self.values.update(a=b"new independent edit")
+                    with self.assertRaisesRegex(RecordRecoveryError, "changed during recovery"):
+                        journal.recover()
+                    self.assertEqual([], self.writes)
+                    self.assertEqual("PREPARED", json.loads(path.read_text())["state"])
+
+    def test_settled_recovery_respects_running_app_guard(self):
+        for phase in ("old", "new"):
+            for equivalent in (False, True):
+                with self.subTest(phase=phase, equivalent=equivalent):
+                    self.values = {"a": b"old-a", "b": b"old-b"}
+                    path = self.pending()
+                    self.values = {key: (phase + "-" + key).encode() + (
+                        b"|metadata" if equivalent else b""
+                    ) for key in self.values}
+                    self.running = True
+                    with self.assertRaisesRegex(RuntimeError, "Claude running"):
+                        self.journal(recovery_equivalent=self.metadata_equivalent).recover()
+                    self.assertEqual("PREPARED", json.loads(path.read_text())["state"])
+                    self.assertEqual([], self.writes)
+
+    def test_settlement_marks_only_metadata_recovery_and_keeps_retention(self):
+        for phase in ("old", "new"):
+            for equivalent in (False, True):
+                with self.subTest(phase=phase, equivalent=equivalent):
+                    self.values = {"a": b"old-a", "b": b"old-b"}
+                    path = self.pending()
+                    self.values = {key: (phase + "-" + key).encode() + (
+                        b"|metadata" if equivalent else b""
+                    ) for key in self.values}
+                    current = self.values.copy()
+                    journal = self.journal(recovery_equivalent=self.metadata_equivalent)
+                    journal.recover()
+                    document = json.loads(path.read_text())
+                    self.assertEqual("ROLLED_BACK" if phase == "old" else "COMMITTED", document["state"])
+                    self.assertEqual(current, self.values)
+                    self.assertEqual(equivalent, "recovery_comparison" in document)
+                    self.assertEqual(equivalent, "recovery_observed_sha256" in document)
+                    journal.prune()
+                    self.assertTrue(path.exists())
+                    os.utime(path, ns=(1, 1))
+                    journal.commit(current, {"a": b"next-a", "b": b"next-b"})
+                    self.assertFalse(path.exists())
+
+    def test_mixed_metadata_payloads_never_authorize_rollback(self):
+        path = self.pending()
+        self.values = {"a": b"old-a|metadata", "b": b"new-b|metadata"}
+        current = self.values.copy()
+        with self.assertRaisesRegex(RecordRecoveryError, "independently"):
+            self.journal(recovery_equivalent=self.metadata_equivalent).recover()
+        self.assertEqual(current, self.values)
+        self.assertEqual([], self.writes)
+        self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
 
     def test_failed_write_restores_exact_values(self):
         original = self.values.copy()

@@ -287,6 +287,17 @@ Rollback revalidates live data before restoring journaled preimages. If it
 reports `RECOVERY_REQUIRED`, stop launching Claude and preserve the state
 directory for manual inspection. Never delete a journal to silence an error.
 
+During the next sync while Claude is closed, sidebar recovery recognizes an interrupted run whose
+entire payload still matches its before or after state. It ignores only valid
+wrapper timestamps and `collapsedGroups`, which Claude can update on reopen.
+It keeps the current bytes, retains the original journal, records the observed
+hashes, and checks the data again before closing that recovery. The completed
+journal follows the same configured retention limit as other completed runs.
+Reopening Claude is not required for recovery. Normal sync then
+continues. Changed pins, assignments, names, unknown fields, and mixed payloads
+with metadata changes still need attention; this exception never authorizes
+overwriting them. Normal commits and partial rollback keep exact-byte checks.
+
 Chat backups are now prepared outside the published `runs` directory. An
 ordinary backup failure removes only its unfinished copies, before any live
 write. A complete signed journal becomes visible in `runs` through one rename.

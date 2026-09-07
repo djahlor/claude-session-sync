@@ -1,3 +1,4 @@
+import base64
 import copy
 import hashlib
 import json
@@ -19,6 +20,7 @@ from claude_session_sync.layout import (
     LayoutRecoveryError,
     LayoutSnapshot,
     LayoutSynchronizer,
+    same_recovery_payload,
     transform_layout_records,
 )
 from claude_session_sync.model import Profile
@@ -77,6 +79,22 @@ def records(scopes, *, active=None, pins=None, extra=None):
 
 
 class LayoutTransformTests(unittest.TestCase):
+    def test_recovery_comparison_preserves_unknown_json_types(self):
+        before = encoded({"timestamp": 1, "value": {}, "unknown": True})
+        current = encoded({"timestamp": 2, "value": {}, "unknown": 1})
+        self.assertFalse(same_recovery_payload(GROUP_SCOPES_KEY, before, current))
+
+    def test_recovery_comparison_rejects_malformed_or_unknown_metadata(self):
+        before = encoded({"timestamp": 1, "value": {}})
+        for timestamp in ("2", True, -1, None):
+            with self.subTest(timestamp=timestamp):
+                self.assertFalse(same_recovery_payload(
+                    GROUP_SCOPES_KEY, before, encoded({"timestamp": timestamp, "value": {}})
+                ))
+        self.assertFalse(same_recovery_payload(GROUP_SCOPES_KEY, before, b"bad"))
+        self.assertFalse(same_recovery_payload(GROUP_SCOPES_KEY, before, None))
+        self.assertFalse(same_recovery_payload(b"unknown", before, encoded({"timestamp": 2, "value": {}})))
+
     def test_first_sync_unions_groups_and_populates_every_target_scope(self):
         first = scope(
             "Focus",
@@ -418,6 +436,112 @@ class LayoutRecoveryTests(unittest.TestCase):
 
         synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
         return synchronizer, FakeDatabase, FakeDatabase(None, database_path), values
+
+    def metadata_recovery_fixture(self, root, applied=False):
+        synchronizer, fake, database, values = self.transaction_fixture(root)
+        before = records(
+            {"a/w": scope("Focus", assignments={"code:local_one": "id-focus"})},
+            active="a/w",
+        )
+        store = decoded(before[DFRAME_STORE_KEY])
+        store["state"]["collapsedGroups"] = []
+        before[DFRAME_STORE_KEY] = encoded(store)
+        targets = {"a/w": {"code:local_one"}, "b/w": {"code:local_one"}}
+        transformed = transform_layout_records(before, targets, timestamp_ms=10)
+        after = dict(transformed.records)
+        values.clear()
+        values.update(after if applied else before)
+        for key in (GROUP_SCOPES_KEY, LOCAL_SLICE_KEY):
+            document = decoded(values[key])
+            document["timestamp"] = 20
+            values[key] = encoded(document)
+        store = decoded(values[DFRAME_STORE_KEY])
+        store["state"]["collapsedGroups"] = ["Focus"]
+        values[DFRAME_STORE_KEY] = encoded(store)
+        journal = synchronizer._journal()
+        journal.root.mkdir()
+        snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+        snapshot.write_text(json.dumps(transformed.snapshot.as_dict()))
+        items = [
+            (synchronizer._record_target(database.database, key), before[key], after[key])
+            for key in before
+        ]
+        items.append((synchronizer._snapshot_target(snapshot), snapshot.read_bytes(), snapshot.read_bytes()))
+        path = journal.root / "interrupted.json"
+        path.write_text(json.dumps({
+            "version": 2, "state": "RECOVERY_REQUIRED",
+            "records": [{
+                "target": target,
+                "before": base64.b64encode(old).decode(),
+                "after": base64.b64encode(new).decode(),
+                "before_sha256": hashlib.sha256(old).hexdigest(),
+                "after_sha256": hashlib.sha256(new).hexdigest(),
+            } for target, old, new in items],
+        }))
+        return synchronizer, fake, values, path, targets
+
+    def test_metadata_only_relaunch_recovers_and_next_sync_restores_groups(self):
+        for applied in (False, True):
+            with self.subTest(applied=applied), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                synchronizer, fake, values, path, targets = self.metadata_recovery_fixture(root, applied)
+                current = values.copy()
+                original_records = json.loads(path.read_text())["records"]
+                with patch("claude_session_sync.layout.LevelDatabase", fake):
+                    current_hashes = {
+                        item["target"]: hashlib.sha256(
+                            synchronizer._journal().read(item["target"])
+                        ).hexdigest()
+                        for item in original_records
+                    }
+                    synchronizer._recover_pending()
+                self.assertEqual(current, values)
+                document = json.loads(path.read_text())
+                self.assertEqual("COMMITTED" if applied else "ROLLED_BACK", document["state"])
+                self.assertEqual("adapter-payload", document["recovery_comparison"])
+                self.assertEqual(original_records, document["records"])
+                self.assertEqual(current_hashes, document["recovery_observed_sha256"])
+                synchronizer.helper = root / "helper"
+                synchronizer.helper.write_bytes(b"fixture")
+                os.chmod(synchronizer.helper, 0o700)
+                with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                    synchronizer, "_target_sessions", return_value=targets
+                ):
+                    first = synchronizer.sync()
+                    second = synchronizer.sync()
+                self.assertEqual(1, first.group_count)
+                self.assertEqual("noop", second.state)
+                store = decoded(values[DFRAME_STORE_KEY])["state"]
+                self.assertEqual(["Focus"], store["collapsedGroups"])
+                for target in targets:
+                    self.assertEqual("Focus", store["customGroupsByScope"][target]["groups"][0]["name"])
+
+    def test_metadata_recovery_does_not_hide_real_or_unknown_edits(self):
+        for field, value in (("pinnedOrder", ["code:other"]), ("unrelated", "new"),
+                             ("customGroupsByScope", {}), ("collapsedGroups", [3])):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                synchronizer, fake, values, path, _targets = self.metadata_recovery_fixture(Path(directory))
+                document = decoded(values[DFRAME_STORE_KEY])
+                document["state"][field] = value
+                values[DFRAME_STORE_KEY] = encoded(document)
+                current = values.copy()
+                with patch("claude_session_sync.layout.LevelDatabase", fake):
+                    with self.assertRaises(LayoutRecoveryError):
+                        synchronizer._recover_pending()
+                self.assertEqual(current, values)
+                self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
+
+    def test_metadata_recovery_keeps_mixed_payloads_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, fake, values, path, _targets = self.metadata_recovery_fixture(Path(directory))
+            document = json.loads(path.read_text())
+            group_after = base64.b64decode(document["records"][0]["after"])
+            values[GROUP_SCOPES_KEY] = group_after
+            current = values.copy()
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                with self.assertRaises(LayoutRecoveryError):
+                    synchronizer._recover_pending()
+            self.assertEqual(current, values)
 
     def test_snapshot_and_layout_share_one_journal(self):
         with tempfile.TemporaryDirectory() as directory:

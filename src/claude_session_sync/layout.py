@@ -135,6 +135,39 @@ def _encode_record(value: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def same_recovery_payload(key: bytes, expected: Optional[bytes], current: Optional[bytes]) -> bool:
+    """Ignore only known UI bookkeeping when deciding a no-write recovery.
+
+    Claude rewrites wrapper timestamps and collapsedGroups on reopen. They are
+    not synced, but every other field, including unknown fields, must match.
+    This comparison never authorizes replacing either record's bytes.
+    """
+    if expected == current:
+        return True
+    if expected is None or current is None:
+        return False
+    try:
+        previous = _decode_record(expected, "recovery preimage")
+        present = _decode_record(current, "recovery current record")
+        for document in (previous, present):
+            if key in (GROUP_SCOPES_KEY, LOCAL_SLICE_KEY):
+                if type(document.get("timestamp")) is not int or document["timestamp"] < 0:
+                    return False
+                del document["timestamp"]
+            elif key == DFRAME_STORE_KEY:
+                state = document.get("state")
+                if not isinstance(state, dict):
+                    return False
+                _string_list(state.get("collapsedGroups"), "collapsed groups")
+                del state["collapsedGroups"]
+            else:
+                return False
+        # Dict equality treats True == 1; unknown schema types must stay exact.
+        return json.dumps(previous, sort_keys=True) == json.dumps(present, sort_keys=True)
+    except LayoutError:
+        return False
+
+
 def _ordered_group_pairs(scope: Any) -> List[Tuple[str, str]]:
     if not isinstance(scope, dict):
         raise LayoutError("custom group scope has an unknown shape")
@@ -823,6 +856,12 @@ class LayoutSynchronizer:
         ]
 
     def _journal(self) -> RecordJournal:
+        def recovery_equivalent(target: str, expected: Optional[bytes], current: Optional[bytes]) -> bool:
+            _path, key = self._parse_target(target)
+            if key is None:
+                return expected == current
+            return same_recovery_payload(key, expected, current)
+
         def read(target: str) -> Optional[bytes]:
             path, key = self._parse_target(target)
             if key is None:
@@ -856,6 +895,7 @@ class LayoutSynchronizer:
             before_mutation=self._assert_stopped,
             retention=self.config.retention,
             legacy_loader=self._legacy_records,
+            recovery_equivalent=recovery_equivalent,
         )
 
     def _recover_pending(self) -> None:
