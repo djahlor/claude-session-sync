@@ -233,6 +233,22 @@ assignment stays in place and no assignment is guessed for a new scope. A
 private snapshot restores pins and groups if a new account starts with empty
 sidebar state.
 
+Claude also syncs the group list through its account settings. Restoring only
+the local records is not enough: on startup, the server's older list can remove
+restored groups and their local chat assignments. When a restore changes the
+active scope's group list, the adapter sets Claude's account-scoped
+`ccd-sync-pending:ccd/dframe-store` migration marker. Claude then merges the
+restored groups into its own settings sync, taking unrelated preferences from
+the server. Group names therefore also reach that signed-in Claude account;
+this step does not upload local chat messages.
+
+The marker is committed and backed up with the layout records. The adapter
+requires an exact account-owner match and refuses a quarantined or differently
+scoped pending update. It never changes identity markers, credentials, or other
+account settings. Clients without enabled account settings sync keep the local
+path. This is a private Claude protocol, verified against the installed Desktop
+build, not a supported public API or a guarantee against future changes.
+
 ## Claude Code routines
 
 Claude Code stores routines in `scheduled-tasks.json`, separate from chat files.

@@ -44,6 +44,11 @@ GROUP_SCOPES_KEY = ORIGIN_PREFIX + b"LSS-persisted.dframe-group-scopes"
 LOCAL_SLICE_KEY = ORIGIN_PREFIX + b"LSS-persisted.dframe-local-slice"
 DFRAME_STORE_KEY = ORIGIN_PREFIX + b"dframe-store"
 LAYOUT_KEYS = (GROUP_SCOPES_KEY, LOCAL_SLICE_KEY, DFRAME_STORE_KEY)
+GROUP_UPLOAD_KEY = ORIGIN_PREFIX + b"ccd-sync-pending:ccd/dframe-store"
+SYNC_OWNER_KEY = ORIGIN_PREFIX + b"ccd-sync-owner"
+SYNC_ACTIVE_KEY = ORIGIN_PREFIX + b"ccd-sync-active"
+SYNC_QUARANTINE_KEY = ORIGIN_PREFIX + b"ccd-sync-quarantine"
+SYNC_METADATA_KEYS = (SYNC_OWNER_KEY, SYNC_ACTIVE_KEY, SYNC_QUARANTINE_KEY, GROUP_UPLOAD_KEY)
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
 
@@ -567,6 +572,12 @@ class LevelDatabase:
         self.database = Path(database)
 
     def get(self, key: bytes) -> bytes:
+        value = self.get_optional(key)
+        if value is None:
+            raise LayoutError("required sidebar record is missing")
+        return value
+
+    def get_optional(self, key: bytes) -> Optional[bytes]:
         result = subprocess.run(
             [str(self.helper), "get", str(self.database), key.hex()],
             check=False,
@@ -574,6 +585,8 @@ class LevelDatabase:
             capture_output=True,
             timeout=10,
         )
+        if result.returncode == 3:
+            return None
         if result.returncode != 0:
             raise LayoutError("Claude sidebar record could not be read safely")
         encoded = result.stdout.strip()
@@ -582,14 +595,17 @@ class LevelDatabase:
         except ValueError as error:
             raise LayoutError("sidebar helper returned malformed data") from error
 
-    def write(self, records: Mapping[bytes, bytes], state_dir: Path) -> None:
+    def write(self, records: Mapping[bytes, Optional[bytes]], state_dir: Path) -> None:
         ensure_private_directory(state_dir)
         descriptor, name = tempfile.mkstemp(prefix=".layout-ops-", dir=str(state_dir))
         path = Path(name)
         try:
             with os.fdopen(descriptor, "w", encoding="ascii") as handle:
                 for key, value in sorted(records.items()):
-                    handle.write("P\t{}\t{}\n".format(key.hex(), value.hex()))
+                    if value is None:
+                        handle.write("D\t{}\n".format(key.hex()))
+                    else:
+                        handle.write("P\t{}\t{}\n".format(key.hex(), value.hex()))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(path, 0o600)
@@ -632,6 +648,53 @@ class LayoutSynchronizer:
             raise LayoutBusyError(
                 "waiting for Claude to quit before syncing sidebar layout"
             )
+
+    def _group_upload_marker(
+        self,
+        database: LevelDatabase,
+        current: Mapping[bytes, bytes],
+        replacements: Mapping[bytes, bytes],
+        target_sessions: Mapping[str, Set[str]],
+    ) -> Optional[Tuple[Optional[bytes], bytes]]:
+        """Use Claude's scoped migration path, never replace server preferences.
+
+        Claude's account settings own the group list. Without a pending seed,
+        startup replaces restored groups with the server list and drops local
+        assignments to missing IDs. The |migrate seed merges groups while taking
+        unrelated preferences from the server. Identity and quarantine markers
+        are read-only; only the dframe migration marker may be written.
+        """
+        before = _decode_record(current[DFRAME_STORE_KEY], "dframe store")["state"]
+        after = _decode_record(replacements[DFRAME_STORE_KEY], "dframe store")["state"]
+        active = after.get("lastSidebarScopeKey")
+        if active not in target_sessions:
+            return None
+        old_groups = before.get("customGroupsByScope", {}).get(active, {}).get("groups", [])
+        new_groups = after["customGroupsByScope"][active]["groups"]
+        if old_groups == new_groups:
+            return None
+        metadata = {}
+        for key in SYNC_METADATA_KEYS:
+            self._assert_stopped()
+            metadata[key] = database.get_optional(key)
+        # Older clients and accounts without settings sync need only local data.
+        if metadata[SYNC_ACTIVE_KEY] in (None, b"\x010"):
+            return None
+        if metadata[SYNC_ACTIVE_KEY] != b"\x011":
+            raise LayoutError("account sidebar sync has an unknown state")
+        if metadata[SYNC_QUARANTINE_KEY] is not None:
+            raise LayoutError("account sidebar sync is quarantined; sign in again before syncing")
+        account, separator, workspace = active.partition("/")
+        if not account or not separator or not workspace or "/" in workspace:
+            raise LayoutError("account sidebar scope is malformed")
+        if metadata[SYNC_OWNER_KEY] != b"\x01" + account.encode("utf-8"):
+            raise LayoutError("account sidebar identity does not match the active scope")
+        pending = metadata[GROUP_UPLOAD_KEY]
+        scoped = b"\x01" + active.encode("utf-8")
+        if pending not in (None, scoped, scoped + b"|migrate"):
+            raise LayoutError("another account sidebar update is pending")
+        # Keep a genuine unsent user edit; otherwise request a merge, not replace.
+        return pending, pending if pending is not None else scoped + b"|migrate"
 
     def _check_database_path(self, path: Path) -> None:
         allowed = {
@@ -680,6 +743,7 @@ class LayoutSynchronizer:
                         self.config.state_dir / "sidebar-layout-{}.json".format(index)
                     ),
                 )
+                self._group_upload_marker(database, current, transformed.records, targets)
                 profiles += 1
                 groups += transformed.group_count
                 pins += transformed.pin_count
@@ -730,9 +794,13 @@ class LayoutSynchronizer:
                     target_sessions,
                     snapshot=_decode_snapshot(snapshot_before),
                 )
+                planned_records = dict(transformed.records)
+                marker = self._group_upload_marker(database, current, planned_records, target_sessions)
+                if marker is not None:
+                    current[GROUP_UPLOAD_KEY], planned_records[GROUP_UPLOAD_KEY] = marker
                 replacements = {
                     key: value
-                    for key, value in transformed.records.items()
+                    for key, value in planned_records.items()
                     if current[key] != value
                 }
                 snapshot_after = (
@@ -743,7 +811,7 @@ class LayoutSynchronizer:
                     self._commit(
                         database,
                         current,
-                        transformed.records,
+                        planned_records,
                         snapshot_path=snapshot_path,
                         snapshot_before=snapshot_before,
                         snapshot_after=snapshot_after,
@@ -833,7 +901,7 @@ class LayoutSynchronizer:
             path = Path(database)
         except (TypeError, ValueError) as error:
             raise LayoutRecoveryError("sidebar recovery target is malformed") from error
-        if key not in LAYOUT_KEYS:
+        if key not in (*LAYOUT_KEYS, GROUP_UPLOAD_KEY):
             raise LayoutRecoveryError("sidebar recovery key is not allowed")
         self._check_database_path(path)
         return path, key
@@ -867,7 +935,8 @@ class LayoutSynchronizer:
             if key is None:
                 return _snapshot_bytes(path)
             self._assert_stopped()  # Opening LevelDB can itself mutate its files.
-            return LevelDatabase(self.helper, path).get(key)
+            database = LevelDatabase(self.helper, path)
+            return database.get_optional(key) if key == GROUP_UPLOAD_KEY else database.get(key)
 
         def write(target: str, value: bytes) -> None:
             path, key = self._parse_target(target)
@@ -881,10 +950,13 @@ class LayoutSynchronizer:
 
         def delete(target: str) -> None:
             path, key = self._parse_target(target)
-            if key is not None:
+            if key is not None and key != GROUP_UPLOAD_KEY:
                 raise LayoutRecoveryError("sidebar records cannot be deleted")
             self._assert_stopped()
-            durable_unlink(path)
+            if key == GROUP_UPLOAD_KEY:
+                LevelDatabase(self.helper, path).write({key: None}, self.config.state_dir)
+            else:
+                durable_unlink(path)
 
         return RecordJournal(
             self._journal_root(),
@@ -908,7 +980,7 @@ class LayoutSynchronizer:
     def _commit(
         self,
         database: LevelDatabase,
-        current: Mapping[bytes, bytes],
+        current: Mapping[bytes, Optional[bytes]],
         replacements: Mapping[bytes, bytes],
         *,
         snapshot_path: Optional[Path] = None,
