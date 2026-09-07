@@ -66,7 +66,7 @@ Live installation, recovery, and visible account-switch proof remain pending.
 - Passed: installer rollback, uncaught process exit, interrupted-upgrade recovery, and overlapping-run lock tests.
 - Passed: packaged install with real macOS helpers in an isolated home, using simulated launchctl.
 - Passed: independent review, with no unresolved code-level safety finding in the reviewed scope.
-- Pending delivery: GitHub checks on the pushed revision.
+- Passed: [GitHub checks on the pushed code revision](https://github.com/popcorn-so/claude-session-sync/actions/runs/34127484263), `a1ffa7a6e248c53c77b7cc12aece7dceae600d56`, with Python 3.9, 3.12, and 3.13.
 - Not completed: real service activation and live account-switch proof; both remain required before a public release claim.
 
 The local 184-test suite passes with Python 3.9 and 3.12, with three explicitly

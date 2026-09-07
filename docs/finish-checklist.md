@@ -1,11 +1,16 @@
 # Finish checklist
 
+Source fixes, tests, and documentation are delivered to the private repository.
+GitHub checks passed for the code revision on Python 3.9, 3.12, and 3.13.
+Live installation and recovery remain pending because this agent cannot verify
+that Claude has stopped.
+
 ## Scope and starting state
 
-The live watcher reports a chat-sync failure, and the health check reports a
-recovery problem. The current tests pass, but that does not prove live recovery.
-Routine and sidebar sync have completed independently. The installed fixes are
-local changes; the private GitHub repository still has the earlier revision.
+At the start, the live watcher reported a chat-sync failure and the health check
+reported a recovery problem. Tests passed, but did not prove live recovery.
+Routine and sidebar sync had completed independently. Earlier installed fixes
+were local changes; the private GitHub repository had the earlier revision.
 
 Finish the sync repair, installation recovery, verification, and delivery to the
 existing private repository. Keep repository visibility unchanged and do not
@@ -21,8 +26,8 @@ account permissions, recovery records, and unrelated work.
 - [x] Complete independent code review and resolve concrete safety findings.
 - [ ] Install the tested runtime and verify live sync while Claude is stopped.
 - [ ] Verify the resulting account data and record exact remaining limitations.
-- [ ] Commit and push the source, tests, and current documentation.
-- [ ] Verify GitHub checks pass on the pushed revision.
+- [x] Commit and push the source, tests, and current documentation.
+- [x] Verify GitHub checks pass on the pushed code revision.
 
 ## Evidence rules
 
@@ -35,6 +40,7 @@ effect before continuing.
 ## Verification results
 
 - The 184-test suite passed on Python 3.9 and 3.12, with three opt-in integrations skipped.
+- [GitHub checks passed](https://github.com/popcorn-so/claude-session-sync/actions/runs/34127484263) for code revision `a1ffa7a6e248c53c77b7cc12aece7dceae600d56`, including the Python 3.13 real-artifact installer checks.
 - Real helpers compiled, and the isolated install, config upgrade, and uninstall passed with simulated launchctl.
 - The same real-artifact lifecycle passed after importing the built wheel from an isolated package directory.
 - An uncaught subprocess exit recovered on the next installer invocation; an overlapping installer was rejected by the operating-system lock.
