@@ -34,10 +34,11 @@ New accounts you sign into on this Mac join the sync automatically.
 
 ## Switch accounts
 
-1. Sign out and sign in to the other account in Claude.
-2. Quit Claude.
-3. Wait for **Sync finished**.
-4. Open Claude normally.
+1. Sign out of Claude.
+2. Sign in to the other account.
+3. Quit Claude.
+4. Wait for **Sync finished**.
+5. Open Claude normally.
 
 Sync starts after Claude fully closes, not when you sign out. Leave it closed
 until sync finishes. Larger histories take longer, so the notification is your
