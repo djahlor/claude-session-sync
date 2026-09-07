@@ -9,8 +9,8 @@ from .adapters import desktop_build, read_status, run_adapters
 
 
 def watcher_failure(state_dir: Path) -> int:
-    state = read_status(state_dir, "watcher-status.json").get("state")
-    return int(state not in ("ok", "unknown"))
+    status = read_status(state_dir, "watcher-status.json")
+    return int(status.get("state") not in ("ok", "unknown") or status.get("restart_phase") == "needs-attention")
 
 
 def abandoned_preparation_count(state_dir: Path) -> int:

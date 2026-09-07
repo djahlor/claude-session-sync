@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -445,6 +446,40 @@ class CliAutomaticTests(unittest.TestCase):
 
 
 class CliSwitchTests(unittest.TestCase):
+    def test_restart_check_normalizes_default_profile_paths(self):
+        from claude_session_sync.processes import ManagedProcess
+
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
+            primary = loaded.profiles[0]
+            process = ManagedProcess(1234, ("/usr/bin/true",), primary.data_root)
+            for data_root in (primary.data_root / ".." / primary.data_root.name, Path(os.path.relpath(primary.data_root))):
+                with self.subTest(data_root=data_root):
+                    variant = replace(loaded, profiles=(replace(primary, data_root=data_root),))
+                    deps = CliDependencies(config_loader=lambda _: variant, process_probe=FakeProcessProbe((process,)))
+                    out = io.StringIO()
+                    self.assertEqual(0, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=io.StringIO()))
+                    self.assertEqual([1234], json.loads(out.getvalue())["pids"])
+
+    def test_restart_check_returns_only_default_profile_pids(self):
+        from claude_session_sync.processes import ManagedProcess
+
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
+            primary = ManagedProcess(1234, ("/usr/bin/true",), loaded.profiles[0].data_root)
+            other = ManagedProcess(5678, ("/usr/bin/true",), loaded.profiles[1].data_root)
+            for processes, expected in (((primary,), 0), ((primary, other), 1), ((), 0)):
+                out = io.StringIO()
+                deps = CliDependencies(config_loader=lambda _: loaded, process_probe=FakeProcessProbe(processes))
+                self.assertEqual(expected, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=io.StringIO()))
+                if expected == 0:
+                    self.assertEqual([p.pid for p in processes], json.loads(out.getvalue())["pids"])
+                else:
+                    self.assertEqual("", out.getvalue())
+            for target in ("Work", "Personal"):
+                deps = CliDependencies(config_loader=lambda _: config(Path(directory)), process_probe=FakeProcessProbe((primary,)))
+                self.assertEqual(1, run(("restart-check", target), dependencies=deps, stdout=io.StringIO(), stderr=io.StringIO()))
+
     def test_switch_rejects_an_unbounded_wait_value(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -933,16 +968,18 @@ class CliSwitchTests(unittest.TestCase):
                 launch_confirmation_timeout=0,
             )
 
+            out = io.StringIO()
             exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Personal"],
+                ["--config", str(root / "config.json"), "switch", "Personal", "--json"],
                 dependencies=dependencies,
-                stdout=io.StringIO(),
+                stdout=out,
                 stderr=io.StringIO(),
             )
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(events[0], ("apply", "plan-safe"))
             self.assertEqual(events[1], ("launch", loaded.profiles[1].launch_command))
+            self.assertEqual("finished", json.loads(out.getvalue())["progress"])
 
     def test_switch_refuses_to_sync_or_launch_while_managed_app_runs(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -29,20 +29,28 @@ Tools, Apple's build tools.
 4. Double-click `Install Claude Session Sync.command` inside the folder.
 5. Choose **1** for automatic sync.
 
-The installer adds a background helper. It does not replace the Claude app.
+The installer adds a background helper and a small **Sync** menu-bar item.
+It does not replace the Claude app.
 New accounts you sign into on this Mac join the sync automatically.
 
 ## Switch accounts
 
 1. Sign out of Claude.
 2. Sign in to the other account.
-3. Quit Claude.
-4. Wait for **Sync finished**.
-5. Open Claude normally.
+3. Wait. In automatic mode, the helper detects the new account, quits Claude
+   once, syncs, and reopens it. Do not start a new task during that short restart.
 
-Sync starts after Claude fully closes, not when you sign out. Leave it closed
-until sync finishes. Larger histories take longer, so the notification is your
-signal to reopen.
+A small status window shows what is happening, even if macOS hides notifications.
+The **Sync** menu keeps the latest status. Larger histories take longer.
+
+Safe mode still needs a manual quit. If automatic restart needs attention,
+quit Claude, wait for **Sync finished**, then reopen it. The helper never
+force-kills Claude or keeps retrying a failed restart.
+
+## Update
+
+Quit Claude, download a fresh ZIP, and run the installer again. Choose **1**
+to enable automatic account-switch restart. No separate Claude app is needed.
 
 ## If something goes wrong
 
@@ -53,7 +61,7 @@ If no notification appears, open Terminal and run:
 ```
 
 Status tells you whether sync is waiting, running, finished, or needs attention.
-macOS notification settings can hide the banner.
+The menu-bar item and status window do not depend on macOS notification banners.
 
 If it needs attention, run:
 

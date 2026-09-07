@@ -240,6 +240,7 @@ class Installer:
         }
 
     def _launch_agent(self, config_data: Optional[bytes] = None) -> bytes:
+        configured = None
         if config_data is not None:
             configured = self._load_config_bytes(config_data)
             claude_executable = configured.claude_executable
@@ -252,6 +253,14 @@ class Installer:
             template = json.loads(self._config_template().decode("utf-8"))
             claude_executable = Path(template["claude_executable"])
             watcher_status = Path(template["state_dir"]) / "watcher-status.json"
+        account_arguments = ()
+        if configured is not None and configured.target_policy == "all-configured-profiles":
+            defaults = [profile for profile in configured.profiles if profile.is_default]
+            if len(defaults) == 1:
+                account_arguments = (
+                    "--account-file", str(defaults[0].data_root / "config.json"),
+                    "--profile", defaults[0].name,
+                )
         arguments = (
             (
                 str(self.layout.watcher_binary),
@@ -259,8 +268,9 @@ class Installer:
                 str(claude_executable),
                 "--status",
                 str(watcher_status),
-                "--",
             )
+            + account_arguments
+            + ("--",)
             + self.layout.cli_command
             + ("--config", str(self.layout.config_path))
         )

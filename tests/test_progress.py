@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from datetime import datetime, timezone
 
 from claude_session_sync import strict_json
 from claude_session_sync.adapters import read_status, save_status
@@ -23,6 +24,30 @@ from test_cli import (
 
 
 class ProgressTests(unittest.TestCase):
+    def test_invalid_restart_timestamps_do_not_break_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = config(Path(directory))
+            for timestamp in (None, 123, [], {}, "not-a-date"):
+                with self.subTest(timestamp=timestamp):
+                    save_status(loaded.state_dir, "watcher-status.json", {"restart_phase": "quitting", "timestamp": timestamp})
+                    self.assertEqual("waiting-for-Claude", current_progress(loaded, app_running=True)["progress"])
+
+    def test_account_restart_progress_is_visible_and_stale_receipts_do_not_look_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = config(Path(directory))
+            record_progress(loaded, "finished")
+            watcher = {"automatic_restart": True, "restart_phase": "quitting", "timestamp": datetime.now(timezone.utc).isoformat()}
+            save_status(loaded.state_dir, "watcher-status.json", watcher)
+            status = current_progress(loaded, app_running=True)
+            self.assertEqual("quitting-Claude", status["progress"])
+            self.assertEqual("wait-for-automatic-restart", status["next_action"])
+            watcher["timestamp"] = "2000-01-01T00:00:00Z"
+            save_status(loaded.state_dir, "watcher-status.json", watcher)
+            self.assertEqual("waiting-for-Claude", current_progress(loaded, app_running=True)["progress"])
+            watcher["restart_phase"] = "needs-attention"
+            save_status(loaded.state_dir, "watcher-status.json", watcher)
+            self.assertEqual("needs-attention", current_progress(loaded, app_running=True)["progress"])
+
     def test_missing_finished_waiting_and_interrupted_are_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             loaded = config(Path(directory))

@@ -134,6 +134,9 @@ def _parser() -> argparse.ArgumentParser:
     auto.add_argument("--json", action="store_true", dest="as_json")
     switch = commands.add_parser("switch", help="sync and launch a profile")
     switch.add_argument("profile")
+    switch.add_argument("--json", action="store_true", dest="as_json")
+    restart_check = commands.add_parser("restart-check", help="inspect which default-profile processes may be restarted")
+    restart_check.add_argument("profile")
     switch.add_argument("--no-launch", action="store_true")
     switch.add_argument(
         "--wait-for-exit",
@@ -547,6 +550,7 @@ def _run_switch(
 ) -> int:
     from .locking import ExclusiveFileLock, LockUnavailableError
 
+    as_json = arguments.as_json
     profile = _find_profile(config, arguments.profile)
     handoff = ExclusiveFileLock(
         config.state_dir / "switch-handoff.lock",
@@ -558,7 +562,7 @@ def _run_switch(
     except LockUnavailableError:
         _write(
             {"state": "blocked_switch", "reason": "handoff-running"},
-            as_json=False,
+            as_json=as_json,
             stream=output,
         )
         return 1
@@ -567,7 +571,7 @@ def _run_switch(
         if not _reconcile_launch_guard(config, dependencies):
             _write(
                 {"state": "blocked_switch", "reason": "launch-unconfirmed"},
-                as_json=False,
+                as_json=as_json,
                 stream=output,
             )
             return 1
@@ -578,7 +582,7 @@ def _run_switch(
         ):
             _write(
                 {"state": "blocked_app", "reason": "app-running"},
-                as_json=False,
+                as_json=as_json,
                 stream=output,
             )
             return 1
@@ -594,7 +598,7 @@ def _run_switch(
         )
         payload["progress"] = finish_progress(config, payload)
         if payload["progress"] == "needs-attention":
-            _write(payload, as_json=False, stream=output)
+            _write(payload, as_json=as_json, stream=output)
             return 1
         if not arguments.no_launch:
             confirmation_enabled = dependencies.launch_confirmation_timeout > 0
@@ -619,14 +623,14 @@ def _run_switch(
                             "state": "launch_unconfirmed",
                             "reason": confirmation,
                         },
-                        as_json=False,
+                        as_json=as_json,
                         stream=output,
                     )
                     return 1
                 _clear_launch_guard(config)
         _write(
             payload,
-            as_json=False,
+            as_json=as_json,
             stream=output,
         )
         return 0
@@ -859,6 +863,16 @@ def run(
             _write(payload, as_json=False, stream=output)
             return 0
         config = deps.config_loader(arguments.config)
+        if arguments.command == "restart-check":
+            profile = _find_profile(config, arguments.profile)
+            if not profile.is_default or config.target_policy != "all-configured-profiles":
+                raise ValueError("automatic restart is enabled only for the default profile in automatic mode")
+            processes = _running_processes(config, deps)
+            selected_root = _normalized_path(profile.data_root)
+            if any(_normalized_path(process.user_data_dir) != selected_root for process in processes):
+                raise ValueError("another managed profile is open; leave Claude open until it is closed")
+            _write({"state": "ready", "pids": [process.pid for process in processes]}, as_json=True, stream=output)
+            return 0
         if arguments.command == "plan":
             started = deps.clock()
             plan = deps.planner_factory(config).plan(SyncRequest(config))
