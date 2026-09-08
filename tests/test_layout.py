@@ -79,6 +79,67 @@ def records(scopes, *, active=None, pins=None, extra=None):
 
 
 class LayoutTransformTests(unittest.TestCase):
+    def test_stale_non_target_scope_cannot_override_a_valid_placement(self):
+        snapshot = LayoutSnapshot(
+            groups=("Focus", "Backlog"),
+            assignments={"code:local_one": "Focus"},
+            pinned_order=(), home_projects_pinned_order=(),
+        )
+        stale = scope("Backlog", assignments={"code:local_one": "id-backlog"})
+        current = records({
+            "a/w": scope("Focus", assignments={"code:local_one": "id-focus"}),
+            "stale/w": stale,
+        }, active="stale/w")
+        targets = {key: {"code:local_one"} for key in ("a/w", "b/w")}
+        for baseline in (None, snapshot):
+            with self.subTest(snapshot=baseline is not None):
+                result = transform_layout_records(current, targets, snapshot=baseline)
+                self.assertEqual(0, result.ambiguous_assignments)
+                self.assertEqual({"code:local_one": "Focus"}, result.snapshot.assignments)
+                scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+                self.assertEqual(stale, scopes["stale/w"])
+                for key in targets:
+                    target = scopes[key]
+                    names = {group["id"]: group["name"] for group in target["groups"]}
+                    self.assertEqual("Focus", names[target["assignments"]["code:local_one"]])
+                    self.assertIn("Backlog", names.values())
+
+    def test_stale_chat_in_a_target_scope_cannot_override_a_valid_placement(self):
+        snapshot = LayoutSnapshot(
+            groups=("Focus", "Backlog"),
+            assignments={"code:local_one": "Focus"},
+            pinned_order=(), home_projects_pinned_order=(),
+        )
+        current = records({
+            "a/w": scope("Focus", assignments={"code:local_one": "id-focus"}),
+            "b/w": scope("Backlog", assignments={
+                "code:local_one": "id-backlog", "code:other": "id-backlog",
+            }),
+        }, active="b/w")
+        targets = {
+            "a/w": {"code:local_one"},
+            "b/w": {"code:other"},
+            "c/w": {"code:local_one", "code:other"},
+        }
+        for baseline in (None, snapshot):
+            with self.subTest(snapshot=baseline is not None):
+                result = transform_layout_records(current, targets, snapshot=baseline)
+                self.assertEqual(0, result.ambiguous_assignments)
+                self.assertEqual(
+                    {"code:local_one": "Focus", "code:other": "Backlog"},
+                    result.snapshot.assignments,
+                )
+                scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+                for key, sessions in targets.items():
+                    target = scopes[key]
+                    self.assertEqual(sessions, set(target["assignments"]))
+                    names = {group["id"]: group["name"] for group in target["groups"]}
+                    for session in sessions:
+                        self.assertEqual(
+                            result.snapshot.assignments[session],
+                            names[target["assignments"][session]],
+                        )
+
     def test_one_folder_move_since_snapshot_reaches_all_accounts(self):
         snapshot = LayoutSnapshot(
             groups=("Focus", "Backlog"),
@@ -159,10 +220,14 @@ class LayoutTransformTests(unittest.TestCase):
         current = records({
             "a/w": scope("Focus", "Backlog", assignments={"code:missing": "id-focus"}),
             "b/w": scope("Focus", "Backlog", assignments={"code:missing": "id-backlog", "code:ungrouped": "id-focus"}),
-            "c/w": scope("Focus", "Backlog", assignments={"code:ungrouped": "id-backlog"}),
+            "c/w": scope("Focus", "Backlog", assignments={"code:missing": "id-focus", "code:ungrouped": "id-backlog"}),
         }, active="a/w")
         result = transform_layout_records(
-            current, {"a/w": {"code:ungrouped"}, "b/w": {"code:missing", "code:ungrouped"}},
+            current, {
+                "a/w": {"code:ungrouped"},
+                "b/w": {"code:missing", "code:ungrouped"},
+                "c/w": {"code:missing", "code:ungrouped"},
+            },
             prefer_current_sidebar=True,
         )
         self.assertEqual(2, result.ambiguous_assignments)

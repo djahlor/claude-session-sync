@@ -9,6 +9,22 @@ private enum RestartCheck {
   case blocked
 }
 
+private struct RestartReceipt: Codable {
+  let accountHash: String
+  let phase: String
+  var candidateHash: String?
+  var preflightAttempts: Int?
+  var retryNotBefore: Double?
+
+  private enum CodingKeys: String, CodingKey {
+    case accountHash = "account_hash"
+    case phase
+    case candidateHash = "candidate_hash"
+    case preflightAttempts = "preflight_attempts"
+    case retryNotBefore = "retry_not_before"
+  }
+}
+
 private final class SessionSyncWatcher: NSObject {
   private let command: [String]
   private let claudeExecutable: String
@@ -23,7 +39,7 @@ private final class SessionSyncWatcher: NSObject {
   private var accountHash: String?
   private var candidateHash: String?
   private var candidateSince: Date?
-  private var preflightFailures = 0
+  private var preflightAttempts = 0
   private var preflightRetryAt: Date?
   private var preflightPending = false
   private var accountTimer: DispatchSourceTimer?
@@ -47,13 +63,28 @@ private final class SessionSyncWatcher: NSObject {
     if accountURL != nil {
       do {
         if FileManager.default.fileExists(atPath: restartURL.path) {
-          guard let saved = try JSONSerialization.jsonObject(with: privateData(restartURL)) as? [String: String],
-            let hash = saved["account_hash"], hash.count == 64,
-            hash.allSatisfy({ $0.isHexDigit }), let phase = saved["phase"],
-            ["ready", "finished", "quitting", "syncing", "needs-attention"].contains(phase)
+          let saved = try JSONDecoder().decode(RestartReceipt.self, from: privateData(restartURL))
+          let hash = saved.accountHash
+          let phase = saved.phase
+          guard hash.count == 64, hash.allSatisfy({ $0.isHexDigit }),
+            ["ready", "finished", "checking", "quitting", "syncing", "needs-attention"].contains(phase)
           else { throw CocoaError(.fileReadCorruptFile) }
           accountHash = hash
-          if !["ready", "finished"].contains(phase) { restartPhase = "needs-attention" }
+          if phase == "checking" {
+            guard let candidate = saved.candidateHash, candidate.count == 64,
+              candidate.allSatisfy({ $0.isHexDigit }), candidate != hash,
+              let attempts = saved.preflightAttempts, (1...3).contains(attempts),
+              let retryAt = saved.retryNotBefore, retryAt.isFinite, retryAt >= 0
+            else { throw CocoaError(.fileReadCorruptFile) }
+            candidateHash = candidate
+            candidateSince = Date()
+            preflightAttempts = attempts
+            // A clock change must not extend the bounded retry delay indefinitely.
+            preflightRetryAt = min(Date(timeIntervalSince1970: retryAt), Date().addingTimeInterval(Double(attempts * 2)))
+            restartPhase = "checking"
+          } else if !["ready", "finished"].contains(phase) {
+            restartPhase = "needs-attention"
+          }
         } else if let hash = readAccountHash() {
           accountHash = hash
           try saveRestartState()
@@ -98,7 +129,16 @@ private final class SessionSyncWatcher: NSObject {
     guard (try directory.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true
     else { throw CocoaError(.fileWriteNoPermission) }
     if FileManager.default.fileExists(atPath: restartURL.path) { _ = try privateData(restartURL) }
-    let data = try JSONSerialization.data(withJSONObject: ["account_hash": hash, "phase": restartPhase])
+    var receipt = RestartReceipt(accountHash: hash, phase: restartPhase)
+    if restartPhase == "checking" {
+      guard let candidate = candidateHash, let retryAt = preflightRetryAt,
+        candidate != hash, (1...3).contains(preflightAttempts)
+      else { throw CocoaError(.fileWriteUnknown) }
+      receipt.candidateHash = candidate
+      receipt.preflightAttempts = preflightAttempts
+      receipt.retryNotBefore = retryAt.timeIntervalSince1970
+    }
+    let data = try JSONEncoder().encode(receipt)
     try data.write(to: restartURL, options: [.atomic])
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: restartURL.path)
     let file = try FileHandle(forWritingTo: restartURL)
@@ -145,14 +185,20 @@ private final class SessionSyncWatcher: NSObject {
     } catch { return .blocked }
   }
 
-  private func resetPreflight() {
-    preflightFailures = 0
+  @discardableResult
+  private func resetPreflight() -> Bool {
+    preflightAttempts = 0
     preflightRetryAt = nil
     if restartPhase == "checking" {
       restartPhase = "ready"
+      do { try saveRestartState() } catch {
+        restartFailed("Could not reset the account-check receipt. Claude was left open.")
+        return false
+      }
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"waiting-for-Claude\"}".utf8), launchFailed: false)
       showStatus("Sync ready, Claude open")
     }
+    return true
   }
 
   private func checkAccount() {
@@ -191,13 +237,18 @@ private final class SessionSyncWatcher: NSObject {
       return
     }
     if candidateHash != hash {
-      resetPreflight()
+      guard resetPreflight() else { return }
       candidateHash = hash
       candidateSince = Date()
       return
     }
     guard let since = candidateSince, Date().timeIntervalSince(since) >= 3 else { return }
     if let retryAt = preflightRetryAt, Date() < retryAt { return }
+    guard preflightAttempts < 3 else {
+      restartFailed("The process check used all three attempts. Claude was left open. Quit Claude to retry sync.",
+        reason: "process-inspection-timeout")
+      return
+    }
     // Request a normal quit only for the configured executable, never force-kill.
     preflightPending = true
     DispatchQueue.main.async { [weak self] in
@@ -210,23 +261,33 @@ private final class SessionSyncWatcher: NSObject {
         guard !self.running, !self.restartRequested, self.restartPhase != "needs-attention",
           self.accountHash != hash, self.readAccountHash() == hash,
           !applications.isEmpty else { return }
+        // Consume the attempt durably before the read. A crash during the probe
+        // must not give a replacement helper a fresh account-switch budget.
+        self.preflightAttempts += 1
+        self.restartPhase = "checking"
+        self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightAttempts * 2))
+        do { try self.saveRestartState() } catch {
+          self.restartFailed("Could not save the account-check budget. Claude was left open.")
+          return
+        }
         let approvedPIDs: Set<pid_t>
         switch self.restartPIDs() {
         case .ready(let pids):
           approvedPIDs = pids
         case .retryable:
-          self.preflightFailures += 1
-          guard self.preflightFailures < 3 else {
+          guard self.preflightAttempts < 3 else {
             self.restartFailed("The process check timed out three times. Claude was left open. Quit Claude to retry sync.",
               reason: "process-inspection-timeout")
             return
           }
-          // No quit or data write has happened. Keep the old account receipt so
-          // this same account change can recover without another sign-in.
-          self.restartPhase = "checking"
-          self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightFailures * 2))
+          // Keep the old account hash and this candidate's remaining budget.
+          self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightAttempts * 2))
+          do { try self.saveRestartState() } catch {
+            self.restartFailed("Could not save the account-check retry. Claude was left open.")
+            return
+          }
           self.writeStatus(exitStatus: 0, output: Data("{\"progress\":\"checking-account\",\"reason\":\"process-inspection-timeout\"}".utf8), launchFailed: false)
-          self.showStatus("Mac is busy. Retrying the account check automatically.", banner: self.preflightFailures == 1)
+          self.showStatus("Mac is busy. Retrying the account check automatically.", banner: self.preflightAttempts == 1)
           return
         case .blocked:
           self.restartFailed("Could not confirm the default Claude profile. Claude was left open.")
@@ -342,6 +403,9 @@ private final class SessionSyncWatcher: NSObject {
     }
     if exitStatus == 0 && progress == "finished" {
       restartPhase = "finished"
+      resetPreflight()
+      candidateHash = nil
+      candidateSince = nil
       if let hash = readAccountHash() { accountHash = hash }
       do { try saveRestartState() } catch {
         restartFailed("Sync finished, but its account-switch receipt could not be saved.")

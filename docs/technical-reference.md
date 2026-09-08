@@ -232,7 +232,8 @@ assignments still stop the layout write.
 
 On first use, existing group names are combined and added to every discovered
 account/workspace scope. Unambiguous chat assignments are copied by group name.
-Later syncs compare folder placements with the last successful snapshot. A move
+Later syncs compare folder placements with the last successful snapshot. Only
+placements from sync targets that still contain the chat can supply a move. A move
 to one different folder is copied to the other accounts, even if the account you
 just signed into still has the old placement. Empty state is treated as missing
 data, not a request to remove a chat from its folder.
@@ -299,8 +300,10 @@ temporary timeout retries after two seconds, then four seconds; malformed output
 and unsafe profiles do not retry. Each CLI process check has a five-second total
 budget, including one retry of the read itself. The watcher also allows for CLI
 startup time. While checking, it keeps the previous account fingerprint, shows
-progress, and prevents overlapping checks. Three timeouts leave Claude open and
-report the cause. These retries never repeat a data write or force-kill Claude.
+progress, and prevents overlapping checks. Each attempt is saved before it starts,
+so replacing or crashing the helper cannot reset that account's retry budget.
+Three failed checks leave Claude open and report the cause. These retries never
+repeat a data write or force-kill Claude.
 
 The watcher owns a persistent menu-bar status item and a non-activating status
 window. Completion stays visible in the menu after the window disappears. It

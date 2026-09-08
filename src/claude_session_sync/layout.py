@@ -458,9 +458,11 @@ def transform_layout_records(
         assignments = {}
 
     candidate_assignments = {}  # type: Dict[str, Set[str]]
-    for scope in store_scopes.values():
+    for scope_key, scope in store_scopes.items():
+        sessions = target_sessions.get(scope_key, set())
         for session, name in _scope_assignments_by_name(scope).items():
-            candidate_assignments.setdefault(session, set()).add(name)
+            if session in sessions:
+                candidate_assignments.setdefault(session, set()).add(name)
     ambiguous_sessions = set()
     for session, names in candidate_assignments.items():
         # Compare explicit placements with the last successful sync, not with

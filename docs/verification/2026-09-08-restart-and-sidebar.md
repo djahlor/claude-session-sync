@@ -15,6 +15,13 @@ that future Claude versions keep the same private storage format.
   propagates regardless of which account is active.
 - Existing unresolved placements can be reconciled explicitly with
   `sync --prefer-current-sidebar`, using the normal journal and safety checks.
+- Review caught stale assignments in scopes that no longer contain a chat.
+  Only discovered source sessions can now supply a folder move, with regressions
+  for both missing scopes and missing chats within a target scope.
+- Review also caught retry counts resetting when the helper was replaced.
+  Each attempt is now saved before its process check, so helper restarts and
+  crashes cannot exceed the same account's three-check budget. Receipt failures
+  leave Claude open. Native tests cover these cases and legacy receipts.
 
 ## Live checks
 
@@ -43,7 +50,7 @@ enabled, and status reported zero watcher, layout, or routine failures.
 
 ## Automated checks
 
-The 227-test suite passed with three optional macOS installer tests skipped in
+The 235-test suite passed with three optional macOS installer tests skipped in
 the default invocation. The three optional compiler, installer, and LaunchAgent
 checks were run separately with their integration flags enabled and passed. Ruff and
 `git diff --check` passed. Five consecutive native retry-exhaustion tests also
