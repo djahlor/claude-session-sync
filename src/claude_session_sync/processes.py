@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
@@ -138,9 +139,20 @@ class ProcessProbe:
             "text": True,
             "capture_output": True,
         }
+        deadline = None if timeout is None else time.monotonic() + timeout
         if timeout is not None:
-            options["timeout"] = timeout
-        completed = self._runner(["ps", "-axo", "pid=,command="], **options)
+            options["timeout"] = min(2.0, timeout)
+        command = ["ps", "-axo", "pid=,command="]
+        try:
+            completed = self._runner(command, **options)
+        except subprocess.TimeoutExpired:
+            # Retry only this read, never a write, and share the caller's total
+            # deadline so exit/launch safety checks remain bounded.
+            remaining = 0 if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            options["timeout"] = remaining
+            completed = self._runner(command, **options)
         return parse_process_table(
             completed.stdout,
             executable=executable,

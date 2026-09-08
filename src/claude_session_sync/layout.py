@@ -391,6 +391,7 @@ def transform_layout_records(
     *,
     snapshot: Optional[LayoutSnapshot] = None,
     timestamp_ms: Optional[int] = None,
+    prefer_current_sidebar: bool = False,
 ) -> LayoutTransform:
     """Return exact allowlisted record replacements for one Claude data root."""
 
@@ -452,31 +453,37 @@ def transform_layout_records(
             ]
         groups = _stable_union((active_groups, snapshot.groups, current_groups))
         assignments = dict(snapshot.assignments)
-        if active_has_groups:
-            assignments.update(_scope_assignments_by_name(store_scopes[active_scope]))
     else:
         groups = current_groups
         assignments = {}
-        candidate_assignments = {}  # type: Dict[str, Set[str]]
-        for scope in store_scopes.values():
-            for session, name in _scope_assignments_by_name(scope).items():
-                candidate_assignments.setdefault(session, set()).add(name)
-        assignments = {
-            session: next(iter(names))
-            for session, names in candidate_assignments.items()
-            if len(names) == 1
-        }
 
     candidate_assignments = {}  # type: Dict[str, Set[str]]
-    for scope in store_scopes.values():
+    for scope_key, scope in store_scopes.items():
+        sessions = target_sessions.get(scope_key, set())
         for session, name in _scope_assignments_by_name(scope).items():
-            candidate_assignments.setdefault(session, set()).add(name)
-    ambiguous_sessions = {
-        session for session, names in candidate_assignments.items() if len(names) > 1
-    }
+            if session in sessions:
+                candidate_assignments.setdefault(session, set()).add(name)
+    ambiguous_sessions = set()
     for session, names in candidate_assignments.items():
-        if session not in assignments and len(names) == 1:
-            assignments[session] = next(iter(names))
+        # Compare explicit placements with the last successful sync, not with
+        # the newly signed-in account. One changed placement is a normal move.
+        # Absence is not deletion: new accounts may have empty local state.
+        baseline = assignments.get(session)
+        changed = names - {baseline}
+        if len(changed) == 1:
+            assignments[session] = next(iter(changed))
+        elif len(changed) > 1:
+            ambiguous_sessions.add(session)
+    if prefer_current_sidebar:
+        if not active_has_groups or active_scope not in target_sessions:
+            raise LayoutError("current sidebar must have groups and belong to an approved sync target")
+        current_assignments = _scope_assignments_by_name(store_scopes[active_scope])
+        for session in tuple(ambiguous_sessions):
+            # Resolve only chats present in the selected account. Never infer
+            # a placement from an account that does not contain the chat.
+            if session in target_sessions[active_scope] and session in current_assignments:
+                assignments[session] = current_assignments[session]
+                ambiguous_sessions.remove(session)
     group_names = set(groups)
     assignments = {
         session: name
@@ -786,9 +793,11 @@ class LayoutSynchronizer:
             "assignment_count": assignments,
         }
 
-    def sync(self) -> LayoutReceipt:
+    def sync(self, *, prefer_current_sidebar: bool = False) -> LayoutReceipt:
         if not self.config.sync_sidebar_layout:
             return LayoutReceipt("disabled", 0, 0, 0, 0, 0, 0)
+        if prefer_current_sidebar and len(self.config.profiles) != 1:
+            raise LayoutError("choose one data profile before preferring its current sidebar")
         self._assert_stopped()
         if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
             raise LayoutError("sidebar helper is not installed")
@@ -822,6 +831,7 @@ class LayoutSynchronizer:
                     current,
                     target_sessions,
                     snapshot=_decode_snapshot(snapshot_before),
+                    prefer_current_sidebar=prefer_current_sidebar,
                 )
                 planned_records = dict(transformed.records)
                 marker = self._group_upload_marker(database, current, planned_records, target_sessions)

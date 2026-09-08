@@ -232,10 +232,26 @@ assignments still stop the layout write.
 
 On first use, existing group names are combined and added to every discovered
 account/workspace scope. Unambiguous chat assignments are copied by group name.
-If the same chat has different group assignments in two scopes, each existing
-assignment stays in place and no assignment is guessed for a new scope. A
-private snapshot restores pins and groups if a new account starts with empty
-sidebar state.
+Later syncs compare folder placements with the last successful snapshot. Only
+placements from sync targets that still contain the chat can supply a move. A move
+to one different folder is copied to the other accounts, even if the account you
+just signed into still has the old placement. Empty state is treated as missing
+data, not a request to remove a chat from its folder.
+
+If two accounts move the same chat to different folders, or older placements
+disagree without a shared snapshot, those placements stay separate. To resolve
+these conflicts using the folders in your current sidebar, quit Claude and run:
+
+```sh
+claude-session-sync sync --prefer-current-sidebar
+```
+
+This recovery command requires one configured data profile. It uses the current
+sidebar only for conflicting chats present and grouped in that account. Other
+conflicts remain untouched and are counted as `ambiguous_assignments`. Changes
+and the new snapshot use the normal recovery journal. Future single-folder moves
+then sync automatically. A private snapshot also restores pins and groups if a
+new account starts with empty sidebar state.
 
 Claude also syncs the group list through its account settings. Restoring only
 the local records is not enough: on startup, the server's older list can remove
@@ -278,6 +294,16 @@ The first observed account establishes a baseline, so installing while signed in
 does not itself quit Claude. Signing back into the same account does not restart.
 Only account UUID changes are watched, not organization-only switches or custom
 non-default profile apps. This field is a private Desktop interface and can change.
+
+Before quitting, the watcher allows up to three account/process checks. A
+temporary timeout retries after two seconds, then four seconds; malformed output
+and unsafe profiles do not retry. Each CLI process check has a five-second total
+budget, including one retry of the read itself. The watcher also allows for CLI
+startup time. While checking, it keeps the previous account fingerprint, shows
+progress, and prevents overlapping checks. Each attempt is saved before it starts,
+so replacing or crashing the helper cannot reset that account's retry budget.
+Three failed checks leave Claude open and report the cause. These retries never
+repeat a data write or force-kill Claude.
 
 The watcher owns a persistent menu-bar status item and a non-activating status
 window. Completion stays visible in the menu after the window disappears. It

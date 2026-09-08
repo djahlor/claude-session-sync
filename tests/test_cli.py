@@ -446,6 +446,19 @@ class CliAutomaticTests(unittest.TestCase):
 
 
 class CliSwitchTests(unittest.TestCase):
+    def test_restart_check_reports_retryable_timeout_without_process_details(self):
+        class SlowProbe:
+            def running(self, **kwargs):
+                raise subprocess.TimeoutExpired(["ps", "private-command-argument"], 5)
+
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
+            deps = CliDependencies(config_loader=lambda _: loaded, process_probe=SlowProbe())
+            out, errors = io.StringIO(), io.StringIO()
+            self.assertEqual(1, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=errors))
+            self.assertEqual("process-inspection-timeout", json.loads(out.getvalue())["reason"])
+            self.assertNotIn("private-command-argument", out.getvalue() + errors.getvalue())
+
     def test_restart_check_normalizes_default_profile_paths(self):
         from claude_session_sync.processes import ManagedProcess
 
@@ -1539,6 +1552,58 @@ class CliRoutineTests(unittest.TestCase):
 
 
 class CliLayoutTests(unittest.TestCase):
+    def test_explicit_current_sidebar_option_reaches_only_layout_adapter(self):
+        calls = []
+
+        class RecordingLayout:
+            def sync(self, *, prefer_current_sidebar=False):
+                calls.append(prefer_current_sidebar)
+                return FakeLayoutReceipt()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            loaded = replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=True, sync_code_routines=True)
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            deps = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: RecordingLayout(),
+                routine_factory=lambda _config: FakeRoutine(),
+                process_probe=FakeProcessProbe(),
+            )
+            output = io.StringIO()
+            self.assertEqual(0, run(
+                ["sync", "--prefer-current-sidebar", "--json"],
+                dependencies=deps, stdout=output, stderr=io.StringIO(),
+            ))
+            self.assertEqual([True], calls)
+            self.assertEqual("synced", json.loads(output.getvalue())["routines"]["state"])
+
+    def test_current_sidebar_resolution_requires_one_profile_and_layout_sync_before_any_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            for unsafe in (
+                replace(loaded, sync_sidebar_layout=True),
+                replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False),
+            ):
+                with self.subTest(config=unsafe):
+                    planner_calls = []
+                    deps = CliDependencies(
+                        config_loader=lambda path: unsafe,
+                        planner_factory=lambda config: planner_calls.append(config),
+                    )
+                    errors = io.StringIO()
+                    self.assertNotEqual(0, run(
+                        ["sync", "--prefer-current-sidebar"], dependencies=deps,
+                        stdout=io.StringIO(), stderr=errors,
+                    ))
+                    self.assertEqual([], planner_calls)
+                    self.assertIn("exactly one profile", errors.getvalue())
+
     def test_sync_reports_layout_without_changing_chat_receipt_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
