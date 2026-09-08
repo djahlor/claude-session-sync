@@ -61,8 +61,23 @@ def _writer_active(config) -> bool:
 
 def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
     payload = read_status(config.state_dir, "sync-progress.json")
+    watcher = read_status(config.state_dir, "watcher-status.json")
+    restart_phase = watcher.get("restart_phase")
+    restart_active = False
+    saved_timestamp = watcher.get("timestamp")
+    if restart_phase in ("quitting", "syncing") and isinstance(saved_timestamp, str):
+        try:
+            timestamp = datetime.fromisoformat(saved_timestamp.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+            restart_active = 0 <= age < 45
+        except (KeyError, TypeError, ValueError):
+            pass
     saved_state = payload.get("state")
-    if saved_state == "syncing":
+    if restart_active and not failures:
+        state = "quitting-Claude" if restart_phase == "quitting" else "syncing"
+    elif restart_phase == "needs-attention":
+        state = "needs-attention"
+    elif saved_state == "syncing":
         try:
             state = "syncing" if _writer_active(config) else "needs-attention"
         except OSError:
@@ -82,8 +97,13 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
         "waiting-for-sync": "wait-for-watcher-or-run-sync",
         "needs-attention": "run-doctor",
         "not-synced-yet": "run-sync",
+        "quitting-Claude": "wait-for-automatic-restart",
     }
     result = {"progress": state, "last_success_at": payload.get("last_success_at")}
+    if watcher.get("automatic_restart") is True:
+        result["automatic_restart"] = True
+        result["restart_phase"] = restart_phase
+        actions["waiting-for-Claude"] = "switch-account-or-quit-to-sync"
     if state in actions:
         result["next_action"] = actions[state]
     return result

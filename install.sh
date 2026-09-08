@@ -100,6 +100,8 @@ else
 fi
 if [[ "$automatic_targets" == true ]]; then
   echo "Future account and workspace IDs inside configured profiles will sync after Claude quits."
+  echo "A changed account in regular Claude triggers one quit, sync, and automatic reopen."
+  echo "Look for the Sync menu-bar item and the visible status window."
 else
   echo "Safe mode is active. New account and workspace IDs need explicit approval."
 fi

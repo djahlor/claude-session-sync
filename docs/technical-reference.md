@@ -118,6 +118,7 @@ profile, enable automatic targets:
 ```sh
 claude-session-sync configure --automatic-targets --dry-run
 claude-session-sync configure --automatic-targets --apply
+claude-session-sync install --apply
 ```
 
 Validate before the first write:
@@ -131,17 +132,20 @@ claude-session-sync plan --json
 
 ## Use
 
-The normal workflow has three steps:
+The automatic-mode workflow has three steps:
 
 1. Sign out and sign in to another account in Claude when needed.
-2. Quit Claude once.
-3. Wait for the “Sync finished” notification, then open Claude normally.
-   `claude-session-sync status` also reports `progress=finished`.
+2. Wait while the helper detects the changed account, quits Claude, and syncs.
+3. Claude reopens automatically after successful sync and confirmed launch.
 
 Status reports waiting for Claude, syncing, finished, or needs attention. It also
 shows the last successful sync time. A missing or interrupted run is never
-reported as finished. macOS notification settings can suppress banners, so use
-the status command if no banner appears.
+reported as finished. A menu-bar status item and a non-activating status window
+show progress without depending on macOS notification permissions.
+
+Safe mode and non-default profile apps still use manual quit, wait for
+“Sync finished”, then reopen. Signing back into the same account does not trigger
+an automatic restart. The first account observed on installation is the baseline.
 
 If Claude reopens before the watcher can write, no data is changed. Quit it
 again and let the watcher finish the pending sync.
@@ -232,6 +236,52 @@ If the same chat has different group assignments in two scopes, each existing
 assignment stays in place and no assignment is guessed for a new scope. A
 private snapshot restores pins and groups if a new account starts with empty
 sidebar state.
+
+Claude also syncs the group list through its account settings. Restoring only
+the local records is not enough: on startup, the server's older list can remove
+restored groups and their local chat assignments. When a restore changes the
+active scope's group list, the adapter sets Claude's account-scoped
+`ccd-sync-pending:ccd/dframe-store` migration marker. Claude then merges the
+restored groups into its own settings sync, taking unrelated preferences from
+the server. Group names therefore also reach that signed-in Claude account;
+this step does not upload local chat messages.
+
+The marker is committed and backed up with the layout records. The adapter
+requires an exact account-owner match and refuses a quarantined or differently
+scoped pending update, including when only an inactive scope changes. If a
+restore would change a scope with pending user edits, it leaves the payload and
+snapshot unchanged until Claude sends those edits. Crash recovery can recognize
+a consumed migration marker without rolling
+back a completed restore, but only when the other records match the completed
+transaction. It never changes identity markers, credentials, or other
+account settings. Clients without enabled account settings sync keep the local
+path. This is a private Claude protocol, verified against the installed Desktop
+build, not a supported public API or a guarantee against future changes.
+
+## Automatic account-switch restart
+
+In automatic target mode, the macOS watcher observes only the default profile's
+`config.json` account marker, `lastKnownAccountUuid`. Claude Desktop's installed
+account handler writes this field after its account identity changes. The helper
+waits for the new UUID to remain stable for three seconds, saves a private
+SHA-256 account fingerprint, then requests a normal quit. It never reads browser
+cookies, copies credentials, or writes Claude's account config. The containing
+JSON can include credentials; only the UUID is used, and no config data is logged
+or copied into the restart receipt.
+
+Once Claude exits, the watcher calls the existing `switch <profile> --json`
+handoff. That path holds the sync/launch lock, waits for remaining processes,
+syncs all enabled adapters, and confirms launch before reporting success. A
+failed or interrupted restart does not keep quitting the app or reopen it after
+failed sync. A normal manual quit and successful sync clears the attention state.
+The first observed account establishes a baseline, so installing while signed in
+does not itself quit Claude. Signing back into the same account does not restart.
+Only account UUID changes are watched, not organization-only switches or custom
+non-default profile apps. This field is a private Desktop interface and can change.
+
+The watcher owns a persistent menu-bar status item and a non-activating status
+window. Completion stays visible in the menu after the window disappears. It
+does not rely on AppleScript or Notification Center delivery.
 
 ## Claude Code routines
 

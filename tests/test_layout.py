@@ -95,6 +95,20 @@ class LayoutTransformTests(unittest.TestCase):
         self.assertFalse(same_recovery_payload(GROUP_SCOPES_KEY, before, None))
         self.assertFalse(same_recovery_payload(b"unknown", before, encoded({"timestamp": 2, "value": {}})))
 
+    def test_recovery_comparison_accepts_only_consumed_scoped_migration_markers(self):
+        marker = layout_module.GROUP_UPLOAD_KEY
+        self.assertTrue(same_recovery_payload(marker, b"\x01a/w|migrate", None))
+        for expected in (
+            b"\x01a/w", b"\x01a/w|unknown", b"a/w|migrate", b"\x01|migrate",
+            b"\x01/w|migrate", b"\x01a/|migrate", b"\x01a/w/extra|migrate",
+            b"\x01a/w|migrate|migrate", b"\x01a/ w|migrate", b"\x01a/\x00w|migrate",
+            b"\x01a/\xff|migrate",
+        ):
+            with self.subTest(expected=expected):
+                self.assertFalse(same_recovery_payload(marker, expected, None))
+        self.assertFalse(same_recovery_payload(marker, b"\x01a/w|migrate", b"\x01other/w|migrate"))
+        self.assertFalse(same_recovery_payload(marker, None, b"\x01a/w|migrate"))
+
     def test_first_sync_unions_groups_and_populates_every_target_scope(self):
         first = scope(
             "Focus",
@@ -431,13 +445,207 @@ class LayoutRecoveryTests(unittest.TestCase):
             def get(self, key):
                 return values[key]
 
+            def get_optional(self, key):
+                return values.get(key)
+
             def write(self, records, state):
-                values.update(records)
+                for key, value in records.items():
+                    if value is None:
+                        values.pop(key, None)
+                    else:
+                        values[key] = value
 
         synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
         return synchronizer, FakeDatabase, FakeDatabase(None, database_path), values
 
-    def metadata_recovery_fixture(self, root, applied=False):
+    def test_restored_groups_are_marked_for_account_settings_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, database, values = self.transaction_fixture(root)
+            values.clear()
+            values.update(records({"a/w": scope("Focus")}, active="a/w"))
+            prefix = layout_module.ORIGIN_PREFIX
+            values[prefix + b"ccd-sync-owner"] = b"\x01a"
+            values[prefix + b"ccd-sync-active"] = b"\x011"
+            marker = prefix + b"ccd-sync-pending:ccd/dframe-store"
+            snapshot = LayoutSnapshot(("Focus", "Backlog"), {"code:local_one": "Backlog"}, (), ())
+            (synchronizer.config.state_dir / "sidebar-layout-0.json").write_text(json.dumps(snapshot.as_dict()))
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value={"a/w": {"code:local_one"}}
+            ):
+                synchronizer.sync()
+                self.assertEqual(b"\x01a/w|migrate", values.get(marker))
+                repeated = synchronizer.sync()
+            self.assertEqual("noop", repeated.state)
+            journal = max(synchronizer._journal_root().glob("*.json"), key=lambda p: p.stat().st_mtime)
+            targets = {item["target"] for item in json.loads(journal.read_text())["records"]}
+            self.assertIn(synchronizer._record_target(database.database, marker), targets)
+
+    def test_group_upload_marker_checks_identity_and_preserves_pending_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, _fake, database, values = self.transaction_fixture(Path(directory))
+            before = records({"a/w": scope("Focus")}, active="a/w")
+            after = records({"a/w": scope("Focus", "Backlog")}, active="a/w")
+            baseline = {
+                layout_module.SYNC_OWNER_KEY: b"\x01a",
+                layout_module.SYNC_ACTIVE_KEY: b"\x011",
+            }
+            for pending in (None, b"\x01a/w|migrate"):
+                with self.subTest(pending=pending):
+                    values.clear()
+                    values.update(baseline)
+                    if pending is not None:
+                        values[layout_module.GROUP_UPLOAD_KEY] = pending
+                    result = synchronizer._group_upload_marker(database, before, after, {"a/w": set()})
+                    self.assertEqual((pending, pending or b"\x01a/w|migrate"), result)
+                    self.assertEqual(None, synchronizer._group_upload_marker(database, after, after, {"a/w": set()}))
+            for changed in (
+                {layout_module.GROUP_UPLOAD_KEY: b"\x01a/w"},
+                {layout_module.SYNC_OWNER_KEY: b"\x01other"},
+                {layout_module.SYNC_OWNER_KEY: None},
+                {layout_module.SYNC_ACTIVE_KEY: b"\x01unknown"},
+                {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
+                {layout_module.GROUP_UPLOAD_KEY: b"\x01other/w|migrate"},
+                {layout_module.GROUP_UPLOAD_KEY: b"\x011"},
+            ):
+                with self.subTest(changed=changed):
+                    values.clear()
+                    values.update(baseline)
+                    values.update(changed)
+                    with self.assertRaises(LayoutError):
+                        synchronizer._group_upload_marker(database, before, after, {"a/w": set()})
+            for active in (None, b"\x010"):
+                values.clear()
+                values[layout_module.SYNC_ACTIVE_KEY] = active
+                self.assertIsNone(synchronizer._group_upload_marker(database, before, after, {"a/w": set()}))
+            self.assertIsNone(synchronizer._group_upload_marker(database, before, after, {"other/w": set()}))
+
+    def test_pending_group_delete_or_rename_defers_records_and_snapshot(self):
+        renamed = scope("Focus", "Backlog")
+        renamed["groups"][1]["name"] = "Renamed"
+        for edited in (scope(), scope("Focus"), renamed):
+            with self.subTest(edited=edited), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                synchronizer, fake, _database, values = self.transaction_fixture(root)
+                values.clear()
+                values.update(records({"a/w": edited}, active="a/w"))
+                values.update({
+                    layout_module.SYNC_OWNER_KEY: b"\x01a",
+                    layout_module.SYNC_ACTIVE_KEY: b"\x011",
+                    layout_module.GROUP_UPLOAD_KEY: b"\x01a/w",
+                })
+                snapshot = LayoutSnapshot(("Focus", "Backlog"), {}, (), ())
+                snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+                snapshot_path.write_text(json.dumps(snapshot.as_dict()))
+                snapshot_before = snapshot_path.read_bytes()
+                records_before = values.copy()
+                synchronizer.helper = root / "helper"
+                synchronizer.helper.write_bytes(b"fixture")
+                os.chmod(synchronizer.helper, 0o700)
+                with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                    synchronizer, "_target_sessions", return_value={"a/w": set()}
+                ), patch.object(fake, "write", side_effect=AssertionError("must not write")):
+                    with self.assertRaisesRegex(LayoutError, "user edit is pending"):
+                        synchronizer.sync()
+                self.assertEqual(records_before, values)
+                self.assertEqual(snapshot_before, snapshot_path.read_bytes())
+                self.assertFalse(synchronizer._journal_root().exists())
+
+    def test_inactive_scope_changes_still_validate_account_metadata(self):
+        for active_in_targets in (False, True):
+            for changed_record in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY):
+                with self.subTest(active_in_targets=active_in_targets, changed_record=changed_record), tempfile.TemporaryDirectory() as directory:
+                    synchronizer, _fake, database, values = self.transaction_fixture(Path(directory))
+                    before = records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w")
+                    after = dict(before)
+                    updated = records({"a/w": scope("Focus"), "b/w": scope("Focus")}, active="a/w")
+                    after[changed_record] = updated[changed_record]
+                    targets = {"b/w": set()}
+                    if active_in_targets:
+                        targets["a/w"] = set()
+                    baseline = {
+                        layout_module.SYNC_OWNER_KEY: b"\x01a",
+                        layout_module.SYNC_ACTIVE_KEY: b"\x011",
+                    }
+                    for changed in (
+                        {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w"},
+                        {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w|migrate"},
+                        {layout_module.GROUP_UPLOAD_KEY: b"\x01unknown"},
+                        {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
+                        {layout_module.SYNC_OWNER_KEY: b"\x01b"},
+                        {layout_module.SYNC_OWNER_KEY: None},
+                    ):
+                        with self.subTest(changed=changed):
+                            values.clear()
+                            values.update(baseline)
+                            values.update(changed)
+                            with self.assertRaises(LayoutError):
+                                synchronizer._group_upload_marker(database, before, after, targets)
+                    for pending in (None, b"\x01a/w", b"\x01a/w|migrate"):
+                        values.clear()
+                        values.update(baseline)
+                        if pending is not None:
+                            values[layout_module.GROUP_UPLOAD_KEY] = pending
+                        self.assertIsNone(synchronizer._group_upload_marker(database, before, after, targets))
+                        self.assertEqual(pending, values.get(layout_module.GROUP_UPLOAD_KEY))
+
+    def test_inactive_scope_metadata_failure_preserves_records_and_snapshot(self):
+        for changed in (
+            {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w"},
+            {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
+            {layout_module.SYNC_OWNER_KEY: b"\x01b"},
+        ):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                synchronizer, fake, _database, values = self.transaction_fixture(root)
+                values.clear()
+                values.update(records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w"))
+                values.update({layout_module.SYNC_OWNER_KEY: b"\x01a", layout_module.SYNC_ACTIVE_KEY: b"\x011"})
+                values.update(changed)
+                snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+                snapshot.write_text(json.dumps(LayoutSnapshot(("Focus",), {}, (), ()).as_dict()))
+                snapshot_before = snapshot.read_bytes()
+                records_before = values.copy()
+                synchronizer.helper = root / "helper"
+                synchronizer.helper.write_bytes(b"fixture")
+                os.chmod(synchronizer.helper, 0o700)
+                with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                    synchronizer, "_target_sessions", return_value={"b/w": set()}
+                ), patch.object(fake, "write") as write:
+                    with self.assertRaises(LayoutError):
+                        synchronizer.sync()
+                    write.assert_not_called()
+                self.assertEqual(records_before, values)
+                self.assertEqual(snapshot_before, snapshot.read_bytes())
+                self.assertFalse(synchronizer._journal_root().exists())
+
+    def test_group_upload_marker_is_removed_when_the_layout_write_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, fake, database, values = self.transaction_fixture(Path(directory))
+            marker = layout_module.GROUP_UPLOAD_KEY
+            original = dict(values)
+            original_write = fake.write
+
+            def fail_store_write(self, replacements, state):
+                if replacements.get(DFRAME_STORE_KEY) == b"after":
+                    raise LayoutError("injected layout write failure")
+                original_write(self, replacements, state)
+
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(fake, "write", fail_store_write):
+                with self.assertRaises(LayoutError):
+                    synchronizer._commit(
+                        database,
+                        {marker: None, DFRAME_STORE_KEY: b"before"},
+                        {marker: b"\x01a/w|migrate", DFRAME_STORE_KEY: b"after"},
+                    )
+            self.assertEqual(original, values)
+            journal = next(synchronizer._journal_root().glob("*.json"))
+            self.assertEqual("ROLLED_BACK", json.loads(journal.read_text())["state"])
+
+    def metadata_recovery_fixture(self, root, applied=False, marker=None, relaunch=True):
         synchronizer, fake, database, values = self.transaction_fixture(root)
         before = records(
             {"a/w": scope("Focus", assignments={"code:local_one": "id-focus"})},
@@ -447,38 +655,100 @@ class LayoutRecoveryTests(unittest.TestCase):
         store["state"]["collapsedGroups"] = []
         before[DFRAME_STORE_KEY] = encoded(store)
         targets = {"a/w": {"code:local_one"}, "b/w": {"code:local_one"}}
-        transformed = transform_layout_records(before, targets, timestamp_ms=10)
+        snapshot_before = LayoutSnapshot(("Focus",), {"code:local_one": "Focus"}, (), ())
+        transformed = transform_layout_records(
+            before, targets, timestamp_ms=10,
+            snapshot=LayoutSnapshot(("Focus", "Backlog"), {}, (), ()) if marker is not None else None,
+        )
         after = dict(transformed.records)
         values.clear()
         values.update(after if applied else before)
-        for key in (GROUP_SCOPES_KEY, LOCAL_SLICE_KEY):
-            document = decoded(values[key])
-            document["timestamp"] = 20
-            values[key] = encoded(document)
-        store = decoded(values[DFRAME_STORE_KEY])
-        store["state"]["collapsedGroups"] = ["Focus"]
-        values[DFRAME_STORE_KEY] = encoded(store)
+        if relaunch:
+            for key in (GROUP_SCOPES_KEY, LOCAL_SLICE_KEY):
+                document = decoded(values[key])
+                document["timestamp"] = 20
+                values[key] = encoded(document)
+            store = decoded(values[DFRAME_STORE_KEY])
+            store["state"]["collapsedGroups"] = ["Focus"]
+            values[DFRAME_STORE_KEY] = encoded(store)
         journal = synchronizer._journal()
         journal.root.mkdir()
         snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
-        snapshot.write_text(json.dumps(transformed.snapshot.as_dict()))
+        old_snapshot = json.dumps(snapshot_before.as_dict()).encode()
+        new_snapshot = json.dumps(transformed.snapshot.as_dict()).encode()
+        if marker is None:
+            old_snapshot = new_snapshot
+        snapshot.write_bytes(new_snapshot if applied else old_snapshot)
         items = [
             (synchronizer._record_target(database.database, key), before[key], after[key])
             for key in before
         ]
-        items.append((synchronizer._snapshot_target(snapshot), snapshot.read_bytes(), snapshot.read_bytes()))
+        items.append((synchronizer._snapshot_target(snapshot), old_snapshot, new_snapshot))
+        if marker is not None:
+            items.append((synchronizer._record_target(database.database, layout_module.GROUP_UPLOAD_KEY), None, marker))
         path = journal.root / "interrupted.json"
         path.write_text(json.dumps({
-            "version": 2, "state": "RECOVERY_REQUIRED",
+            "version": 2, "state": "PREPARED" if marker is not None else "RECOVERY_REQUIRED",
             "records": [{
                 "target": target,
-                "before": base64.b64encode(old).decode(),
+                "before": None if old is None else base64.b64encode(old).decode(),
                 "after": base64.b64encode(new).decode(),
-                "before_sha256": hashlib.sha256(old).hexdigest(),
+                "before_sha256": None if old is None else hashlib.sha256(old).hexdigest(),
                 "after_sha256": hashlib.sha256(new).hexdigest(),
             } for target, old, new in items],
         }))
         return synchronizer, fake, values, path, targets
+
+    def test_consumed_migration_marker_recovers_only_whole_transaction_phases_without_writes(self):
+        for applied in (False, True):
+            for relaunch in (False, True):
+                with self.subTest(applied=applied, relaunch=relaunch), tempfile.TemporaryDirectory() as directory:
+                    synchronizer, fake, values, path, _targets = self.metadata_recovery_fixture(
+                        Path(directory), applied, marker=b"\x01a/w|migrate", relaunch=relaunch,
+                    )
+                    snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+                    current = values.copy()
+                    snapshot_before = snapshot.read_bytes()
+                    with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                        fake, "write", side_effect=AssertionError("must not rewrite layout")
+                    ) as write, patch.object(layout_module, "atomic_write_bytes") as write_snapshot:
+                        synchronizer._recover_pending()
+                        write.assert_not_called()
+                        write_snapshot.assert_not_called()
+                    self.assertEqual("COMMITTED" if applied else "ROLLED_BACK", json.loads(path.read_text())["state"])
+                    self.assertEqual(current, values)
+                    self.assertEqual(snapshot_before, snapshot.read_bytes())
+
+    def test_consumed_marker_does_not_hide_user_edits_unknown_markers_or_mixed_payloads(self):
+        cases = ("user-edit", "unknown-marker", "unknown-data", "mixed-layout", "mixed-snapshot")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                marker = {"user-edit": b"\x01a/w", "unknown-marker": b"\x01a/w|unknown"}.get(case, b"\x01a/w|migrate")
+                synchronizer, fake, values, path, _targets = self.metadata_recovery_fixture(
+                    Path(directory), True, marker=marker,
+                )
+                document = json.loads(path.read_text())
+                snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+                if case == "unknown-data":
+                    store = decoded(values[DFRAME_STORE_KEY])
+                    store["state"]["unknown"] = "independent edit"
+                    values[DFRAME_STORE_KEY] = encoded(store)
+                elif case == "mixed-layout":
+                    values[GROUP_SCOPES_KEY] = base64.b64decode(document["records"][0]["before"])
+                elif case == "mixed-snapshot":
+                    snapshot.write_bytes(base64.b64decode(document["records"][-2]["before"]))
+                current = values.copy()
+                snapshot_before = snapshot.read_bytes()
+                with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                    fake, "write", side_effect=AssertionError("must not rewrite layout")
+                ) as write, patch.object(layout_module, "atomic_write_bytes") as write_snapshot:
+                    with self.assertRaises(LayoutRecoveryError):
+                        synchronizer._recover_pending()
+                    write.assert_not_called()
+                    write_snapshot.assert_not_called()
+                self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
+                self.assertEqual(current, values)
+                self.assertEqual(snapshot_before, snapshot.read_bytes())
 
     def test_metadata_only_relaunch_recovers_and_next_sync_restores_groups(self):
         for applied in (False, True):

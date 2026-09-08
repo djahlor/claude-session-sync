@@ -31,6 +31,21 @@ class InstallerTests(unittest.TestCase):
     def layout(self, home: Path) -> InstallLayout:
         return InstallLayout.for_home(home)
 
+    def test_only_automatic_mode_watches_default_profile_account_changes(self):
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            installer = Installer(self.layout(Path(directory)), runner=FakeCommandRunner())
+            document = json.loads(installer.default_config_data())
+            safe = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            self.assertNotIn("--account-file", safe)
+            document["target_policy"] = "all-configured-profiles"
+            document["acknowledge_cross_account_copy"] = True
+            automatic = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            self.assertEqual(str(Path(document["profiles"][0]["data_root"]) / "config.json"), automatic[automatic.index("--account-file") + 1])
+            self.assertEqual("Work", automatic[automatic.index("--profile") + 1])
+            self.assertLess(automatic.index("--profile"), automatic.index("--"))
+
     def test_dry_run_describes_install_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "fresh-home"

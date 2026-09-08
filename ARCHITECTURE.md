@@ -25,6 +25,14 @@ simultaneous profile launches. A durable guard written before launch remains
 fail-closed until the selected profile is confirmed or the user explicitly
 clears a known failed launch. It adds no synchronization policy.
 
+In automatic target mode, the native watcher observes the default profile's
+account UUID marker. A stable change requests one normal quit, then reuses
+`switch(profile)` for sync and confirmed launch. A private account fingerprint
+and phase receipt is saved before requesting quit, preventing helper restarts
+from repeating a failed quit. Manual quits still trigger ordinary sync without
+reopening the app. A persistent status menu and a non-activating window display
+progress without depending on Notification Center.
+
 ## Domain language
 
 - **Profile**: one Claude Electron data directory and launch command.
@@ -60,7 +68,8 @@ clears a known failed launch. It adds no synchronization policy.
     probe runtime cannot silently extend a configured handoff limit.
 11. Chat sync changes only validated session registry files. Sidebar sync is a
     separate, optional adapter that changes only the three allowlisted Local
-    Storage records needed for pins and custom groups. It never copies an opaque
+    Storage records needed for pins and custom groups plus the account-scoped
+    group migration marker when required. It never copies an opaque
     Electron database, account tokens, cookies, or login state.
 12. Sidebar writes use one atomic LevelDB batch, checksum-verified reads,
     exact preimage journals, post-write verification, and automatic rollback.
