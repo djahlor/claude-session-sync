@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from claude_session_sync.model import Profile
@@ -65,6 +66,49 @@ class ProcessParsingTests(unittest.TestCase):
 
 
 class ProcessProbeTests(unittest.TestCase):
+    def test_transient_read_timeout_retries_within_the_original_budget(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(kwargs["timeout"])
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return subprocess.CompletedProcess(command, 0, stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n")
+
+        probe = ProcessProbe(runner=runner)
+        result = probe.running(executable=DEFAULT_CLAUDE_EXECUTABLE,
+            managed_profile_roots=(Path("/tmp/work"),), default_profile_root=Path("/tmp/work"), timeout=5)
+        self.assertEqual([301], [item.pid for item in result])
+        self.assertEqual(2, len(calls))
+        self.assertEqual(2.0, calls[0])
+        self.assertGreater(calls[1], 0)
+        self.assertLessEqual(calls[1], 5)
+
+    def test_repeated_read_timeout_stays_bounded_and_never_means_app_closed(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ProcessProbe(runner=runner).running(executable=DEFAULT_CLAUDE_EXECUTABLE,
+                managed_profile_roots=(Path("/tmp/work"),), timeout=5)
+        self.assertEqual(2, len(calls))
+
+    def test_exhausted_budget_does_not_start_another_read(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with patch("claude_session_sync.processes.time.monotonic", side_effect=(100, 105)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                ProcessProbe(runner=runner).running(executable=DEFAULT_CLAUDE_EXECUTABLE,
+                    managed_profile_roots=(Path("/tmp/work"),), timeout=5)
+        self.assertEqual(1, len(calls))
+
     def test_probe_reads_process_table_through_injected_runner(self):
         calls = []
 

@@ -3,6 +3,12 @@ import Foundation
 import CryptoKit
 import Darwin
 
+private enum RestartCheck {
+  case ready(Set<pid_t>)
+  case retryable
+  case blocked
+}
+
 private final class SessionSyncWatcher: NSObject {
   private let command: [String]
   private let claudeExecutable: String
@@ -17,6 +23,9 @@ private final class SessionSyncWatcher: NSObject {
   private var accountHash: String?
   private var candidateHash: String?
   private var candidateSince: Date?
+  private var preflightFailures = 0
+  private var preflightRetryAt: Date?
+  private var preflightPending = false
   private var accountTimer: DispatchSourceTimer?
   private var restartRequested = false
   private var restartAttempt: UUID?
@@ -101,8 +110,8 @@ private final class SessionSyncWatcher: NSObject {
     guard fsync(descriptor) == 0 else { throw CocoaError(.fileWriteUnknown) }
   }
 
-  private func restartPIDs() -> Set<pid_t>? {
-    guard let executable = command.first, let profile = profile else { return nil }
+  private func restartPIDs() -> RestartCheck {
+    guard let executable = command.first, let profile = profile else { return .blocked }
     let process = Process()
     let pipe = Pipe()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -112,17 +121,38 @@ private final class SessionSyncWatcher: NSObject {
     process.standardError = FileHandle.nullDevice
     do {
       try process.run()
-      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 4) {
+      // Allow the CLI's bounded process probe plus interpreter startup time.
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
         if process.isRunning { process.terminate() }
       }
       let data = pipe.fileHandleForReading.readData(ofLength: 4_097)
       process.waitUntilExit()
-      guard process.terminationStatus == 0, data.count <= 4_096,
-        let document = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      if process.terminationReason == .uncaughtSignal && process.terminationStatus == SIGTERM {
+        return .retryable
+      }
+      guard data.count <= 4_096,
+        let document = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else { return .blocked }
+      if process.terminationStatus != 0,
+        document["error_type"] as? String == "process-timeout",
+        document["reason"] as? String == "process-inspection-timeout" {
+        return .retryable
+      }
+      guard process.terminationStatus == 0,
         document["state"] as? String == "ready", let pids = document["pids"] as? [Int],
-        pids.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) }) else { return nil }
-      return Set(pids.map { pid_t($0) })
-    } catch { return nil }
+        pids.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) }) else { return .blocked }
+      return .ready(Set(pids.map { pid_t($0) }))
+    } catch { return .blocked }
+  }
+
+  private func resetPreflight() {
+    preflightFailures = 0
+    preflightRetryAt = nil
+    if restartPhase == "checking" {
+      restartPhase = "ready"
+      writeStatus(exitStatus: 0, output: Data("{\"progress\":\"waiting-for-Claude\"}".utf8), launchFailed: false)
+      showStatus("Sync ready, Claude open")
+    }
   }
 
   private func checkAccount() {
@@ -142,10 +172,11 @@ private final class SessionSyncWatcher: NSObject {
       }
       return
     }
-    guard !running, !restartRequested, restartPhase != "needs-attention" else { return }
+    guard !running, !restartRequested, !preflightPending, restartPhase != "needs-attention" else { return }
     guard let hash = readAccountHash() else {
       candidateHash = nil
       candidateSince = nil
+      resetPreflight()
       return
     }
     guard let previous = accountHash else {
@@ -156,24 +187,48 @@ private final class SessionSyncWatcher: NSObject {
     guard hash != previous else {
       candidateHash = nil
       candidateSince = nil
+      resetPreflight()
       return
     }
     if candidateHash != hash {
+      resetPreflight()
       candidateHash = hash
       candidateSince = Date()
       return
     }
     guard let since = candidateSince, Date().timeIntervalSince(since) >= 3 else { return }
+    if let retryAt = preflightRetryAt, Date() < retryAt { return }
     // Request a normal quit only for the configured executable, never force-kill.
+    preflightPending = true
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       let applications = NSWorkspace.shared.runningApplications.filter {
         $0.executableURL?.standardizedFileURL.path == self.claudeExecutable
       }
       self.queue.async {
-        guard !self.running, !self.restartRequested, self.accountHash != hash, self.readAccountHash() == hash,
+        self.preflightPending = false
+        guard !self.running, !self.restartRequested, self.restartPhase != "needs-attention",
+          self.accountHash != hash, self.readAccountHash() == hash,
           !applications.isEmpty else { return }
-        guard let approvedPIDs = self.restartPIDs() else {
+        let approvedPIDs: Set<pid_t>
+        switch self.restartPIDs() {
+        case .ready(let pids):
+          approvedPIDs = pids
+        case .retryable:
+          self.preflightFailures += 1
+          guard self.preflightFailures < 3 else {
+            self.restartFailed("The process check timed out three times. Claude was left open. Quit Claude to retry sync.",
+              reason: "process-inspection-timeout")
+            return
+          }
+          // No quit or data write has happened. Keep the old account receipt so
+          // this same account change can recover without another sign-in.
+          self.restartPhase = "checking"
+          self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightFailures * 2))
+          self.writeStatus(exitStatus: 0, output: Data("{\"progress\":\"checking-account\",\"reason\":\"process-inspection-timeout\"}".utf8), launchFailed: false)
+          self.showStatus("Mac is busy. Retrying the account check automatically.", banner: self.preflightFailures == 1)
+          return
+        case .blocked:
           self.restartFailed("Could not confirm the default Claude profile. Claude was left open.")
           return
         }
@@ -203,11 +258,11 @@ private final class SessionSyncWatcher: NSObject {
     }
   }
 
-  private func restartFailed(_ message: String) {
+  private func restartFailed(_ message: String, reason: String = "restart-failed") {
     restartRequested = false
     restartPhase = "needs-attention"
     try? saveRestartState()
-    let data = (try? JSONSerialization.data(withJSONObject: ["progress": "needs-attention"])) ?? Data()
+    let data = (try? JSONSerialization.data(withJSONObject: ["progress": "needs-attention", "reason": reason])) ?? Data()
     writeStatus(exitStatus: 1, output: data, launchFailed: false)
     notify("Sync needs attention. " + message)
   }

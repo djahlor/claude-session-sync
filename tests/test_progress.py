@@ -24,6 +24,27 @@ from test_cli import (
 
 
 class ProgressTests(unittest.TestCase):
+    def test_active_recovery_overrides_the_previous_restart_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = config(Path(directory))
+            save_status(loaded.state_dir, "watcher-status.json", {"restart_phase": "needs-attention"})
+            record_progress(loaded, "syncing")
+            with ExclusiveFileLock(loaded.state_dir / "switch-handoff.lock"):
+                self.assertEqual("syncing", current_progress(loaded, app_running=False, failures=1)["progress"])
+            self.assertEqual("needs-attention", current_progress(loaded, app_running=False)["progress"])
+
+    def test_retrying_account_check_is_visible_without_claiming_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = config(Path(directory))
+            save_status(loaded.state_dir, "watcher-status.json", {
+                "automatic_restart": True,
+                "restart_phase": "checking",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            result = current_progress(loaded, app_running=True)
+            self.assertEqual("checking-account", result["progress"])
+            self.assertEqual("wait-for-automatic-restart", result["next_action"])
+
     def test_invalid_restart_timestamps_do_not_break_status(self):
         with tempfile.TemporaryDirectory() as directory:
             loaded = config(Path(directory))

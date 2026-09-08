@@ -31,7 +31,7 @@ InstallerFactory = Callable[[Path], Any]
 LayoutFactory = Callable[[Config], Any]
 RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
-PROCESS_PROBE_TIMEOUT_SECONDS = 2.0
+PROCESS_PROBE_TIMEOUT_SECONDS = 5.0
 LAUNCH_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 LAUNCH_GUARD_FILENAME = "launch-pending.json"
 SWITCH_WRITER_WAIT_SECONDS = 15.0
@@ -130,6 +130,10 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", dest="as_json")
     sync = commands.add_parser("sync", help="apply the next synchronization")
     sync.add_argument("--json", action="store_true", dest="as_json")
+    sync.add_argument(
+        "--prefer-current-sidebar", action="store_true",
+        help="resolve conflicting chat folders using the current sidebar (one profile only)",
+    )
     auto = commands.add_parser("auto", help="sync after Claude terminates")
     auto.add_argument("--json", action="store_true", dest="as_json")
     switch = commands.add_parser("switch", help="sync and launch a profile")
@@ -764,7 +768,10 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
                 return 0 if arguments.command == "auto" else 1
             payload = _chat_failure(error)
         payload.update(
-            run_adapters(config, deps, lambda: bool(_running_processes(config, deps)))
+            run_adapters(
+                config, deps, lambda: bool(_running_processes(config, deps)),
+                prefer_current_sidebar=getattr(arguments, "prefer_current_sidebar", False),
+            )
         )
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
@@ -863,11 +870,19 @@ def run(
             _write(payload, as_json=False, stream=output)
             return 0
         config = deps.config_loader(arguments.config)
+        if getattr(arguments, "prefer_current_sidebar", False) and (
+            not config.sync_sidebar_layout or len(config.profiles) != 1
+        ):
+            raise ValueError("--prefer-current-sidebar requires sidebar sync and exactly one profile")
         if arguments.command == "restart-check":
             profile = _find_profile(config, arguments.profile)
             if not profile.is_default or config.target_policy != "all-configured-profiles":
                 raise ValueError("automatic restart is enabled only for the default profile in automatic mode")
-            processes = _running_processes(config, deps)
+            try:
+                processes = _running_processes(config, deps)
+            except subprocess.TimeoutExpired as error:
+                _write(_chat_failure(error), as_json=True, stream=output)
+                return 1
             selected_root = _normalized_path(profile.data_root)
             if any(_normalized_path(process.user_data_dir) != selected_root for process in processes):
                 raise ValueError("another managed profile is open; leave Claude open until it is closed")

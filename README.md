@@ -46,6 +46,8 @@ The **Sync** menu keeps the latest status. Larger histories take longer.
 Safe mode still needs a manual quit. If automatic restart needs attention,
 quit Claude, wait for **Sync finished**, then reopen it. The helper never
 force-kills Claude or keeps retrying a failed restart.
+Temporary account-check timeouts retry automatically, up to three checks, before
+Claude is closed. If they all fail, Claude stays open and the status explains why.
 
 ## Update
 

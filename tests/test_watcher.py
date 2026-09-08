@@ -98,7 +98,17 @@ class WatcherTests(unittest.TestCase):
     def test_failed_sync_does_not_reopen_or_repeat_after_helper_restart(self):
         self.account_change_scenario(fail_sync=True)
 
-    def account_change_scenario(self, fail_sync=False):
+    def test_transient_restart_check_retries_without_another_account_change(self):
+        self.account_change_scenario(fail_preflight_once=True)
+
+    def test_repeated_preflight_timeouts_stop_without_quitting_or_looping(self):
+        self.account_change_scenario(fail_preflight_always=True)
+
+    def test_invalid_preflight_never_quits_or_retries(self):
+        self.account_change_scenario(block_preflight=True)
+
+    def account_change_scenario(self, fail_sync=False, fail_preflight_once=False,
+                                fail_preflight_always=False, block_preflight=False):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app = root / "SyncTest.app"
@@ -119,6 +129,13 @@ class WatcherTests(unittest.TestCase):
                 "import json, pathlib, subprocess, sys\n"
                 f"calls = pathlib.Path({str(calls)!r})\n"
                 "if sys.argv[1] == 'restart-check':\n"
+                " failure = calls.with_suffix('.preflight-failed')\n"
+                " checks = calls.with_suffix('.checks')\n"
+                " checks.write_text(str(int(checks.read_text()) + 1 if checks.exists() else 1))\n"
+                f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
+                f" if {fail_preflight_always!r} or ({fail_preflight_once!r} and not failure.exists()):\n"
+                "  failure.touch()\n"
+                "  print(json.dumps({'state': 'failed', 'error_type': 'process-timeout', 'reason': 'process-inspection-timeout', 'next_action': 'retry-sync'})); raise SystemExit(1)\n"
                 f" result = subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], text=True, capture_output=True)\n"
                 " print(json.dumps({'state': 'ready', 'pids': [int(pid) for pid in result.stdout.split()]})); raise SystemExit(0)\n"
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -151,16 +168,19 @@ class WatcherTests(unittest.TestCase):
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                    if any(item[0] == "switch" for item in entries):
+                    if any(item[0] == "switch" for item in entries) or json.loads(status.read_text()).get("restart_phase") == "needs-attention":
                         break
                     time.sleep(0.1)
                 receipt = root / "account-restart.json"
                 detail = (status.read_text(), receipt.read_text() if receipt.exists() else "no restart receipt", entries)
-                self.assertEqual(1, sum(item[0] == "switch" for item in entries), "account change must quit and hand off to sync-and-launch: " + repr(detail))
+                expected_switches = 0 if fail_preflight_always or block_preflight else 1
+                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "account change must quit and hand off to sync-and-launch: " + repr(detail))
+                if not expected_switches:
+                    self.assertEqual(0, subprocess.run(['/usr/bin/pgrep', '-f', str(executable)], stdout=subprocess.DEVNULL).returncode, "failed preflight must leave the app running")
                 time.sleep(4)
                 entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(1, sum(item[0] == "switch" for item in entries), "reopen must not create a restart loop")
-                phase = "needs-attention" if fail_sync else "finished"
+                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "reopen must not create a restart loop")
+                phase = "needs-attention" if fail_sync or not expected_switches else "finished"
                 self.assertEqual(phase, json.loads(status.read_text())["restart_phase"])
                 state = json.loads(receipt.read_text())
                 self.assertEqual({"account_hash", "phase"}, set(state))
@@ -170,8 +190,10 @@ class WatcherTests(unittest.TestCase):
                 process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 time.sleep(5)
                 entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(1, sum(item[0] == "switch" for item in entries), "helper restart must preserve the once-only guard")
+                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "helper restart must preserve the once-only guard")
                 self.assertEqual(phase, json.loads(receipt.read_text())["phase"])
+                expected_checks = 3 if fail_preflight_always else 2 if fail_preflight_once else 1
+                self.assertEqual(expected_checks, int(calls.with_suffix('.checks').read_text()), "preflight retries must be bounded across helper restarts")
             finally:
                 if process.poll() is None:
                     process.terminate()
