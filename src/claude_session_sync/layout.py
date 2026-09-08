@@ -143,12 +143,26 @@ def _encode_record(value: Mapping[str, Any]) -> bytes:
 def same_recovery_payload(key: bytes, expected: Optional[bytes], current: Optional[bytes]) -> bool:
     """Ignore only known UI bookkeeping when deciding a no-write recovery.
 
-    Claude rewrites wrapper timestamps and collapsedGroups on reopen. They are
-    not synced, but every other field, including unknown fields, must match.
-    This comparison never authorizes replacing either record's bytes.
+    Claude rewrites wrapper timestamps and collapsedGroups on reopen, and
+    consumes scoped migration markers. All other fields must match, including
+    unknown fields. Only the journal's whole-transaction phase check uses this
+    comparison; it never authorizes replacing either record's bytes.
     """
     if expected == current:
         return True
+    if key == GROUP_UPLOAD_KEY and current is None and expected is not None:
+        if not expected.startswith(b"\x01") or not expected.endswith(b"|migrate"):
+            return False
+        try:
+            scope = expected[1:-len(b"|migrate")].decode("utf-8")
+        except UnicodeError:
+            return False
+        account, separator, workspace = scope.partition("/")
+        return bool(
+            account and separator and workspace and "/" not in workspace
+            and not any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                        or character == "|" for character in scope)
+        )
     if expected is None or current is None:
         return False
     try:
@@ -666,24 +680,34 @@ class LayoutSynchronizer:
         """
         before = _decode_record(current[DFRAME_STORE_KEY], "dframe store")["state"]
         after = _decode_record(replacements[DFRAME_STORE_KEY], "dframe store")["state"]
+        old_scopes = before.get("customGroupsByScope", {})
+        new_scopes = after.get("customGroupsByScope", {})
+        old_persisted = _decode_record(current[GROUP_SCOPES_KEY], "group scopes")["value"]
+        new_persisted = _decode_record(replacements[GROUP_SCOPES_KEY], "group scopes")["value"]
+        changed_scopes = set()
+        for old, new in ((old_scopes, new_scopes), (old_persisted, new_persisted)):
+            changed_scopes.update(
+                scope for scope in set(old) | set(new) if old.get(scope) != new.get(scope)
+            )
+        if not changed_scopes:
+            return None
         active = after.get("lastSidebarScopeKey")
-        if active not in target_sessions:
-            return None
-        old_groups = before.get("customGroupsByScope", {}).get(active, {}).get("groups", [])
-        new_groups = after["customGroupsByScope"][active]["groups"]
-        if old_groups == new_groups:
-            return None
         metadata = {}
         for key in SYNC_METADATA_KEYS:
             self._assert_stopped()
             metadata[key] = database.get_optional(key)
-        # Older clients and accounts without settings sync need only local data.
-        if metadata[SYNC_ACTIVE_KEY] in (None, b"\x010"):
-            return None
-        if metadata[SYNC_ACTIVE_KEY] != b"\x011":
+        if metadata[SYNC_ACTIVE_KEY] not in (None, b"\x010", b"\x011"):
             raise LayoutError("account sidebar sync has an unknown state")
         if metadata[SYNC_QUARANTINE_KEY] is not None:
             raise LayoutError("account sidebar sync is quarantined; sign in again before syncing")
+        settings_sync_active = metadata[SYNC_ACTIVE_KEY] == b"\x011"
+        # Older clients need only local data when no account update is pending.
+        if not settings_sync_active and all(
+            metadata[key] is None for key in (SYNC_OWNER_KEY, GROUP_UPLOAD_KEY)
+        ):
+            return None
+        if not isinstance(active, str):
+            raise LayoutError("account sidebar scope is malformed")
         account, separator, workspace = active.partition("/")
         if not account or not separator or not workspace or "/" in workspace:
             raise LayoutError("account sidebar scope is malformed")
@@ -693,8 +717,13 @@ class LayoutSynchronizer:
         scoped = b"\x01" + active.encode("utf-8")
         if pending not in (None, scoped, scoped + b"|migrate"):
             raise LayoutError("another account sidebar update is pending")
-        # Keep a genuine unsent user edit; otherwise request a merge, not replace.
-        return pending, pending if pending is not None else scoped + b"|migrate"
+        if pending == scoped and active in changed_scopes:
+            raise LayoutBusyError("account sidebar user edit is pending; reopen Claude to upload it before syncing")
+        old_groups = old_scopes.get(active, {}).get("groups", [])
+        new_groups = new_scopes.get(active, {}).get("groups", [])
+        if not settings_sync_active or active not in target_sessions or old_groups == new_groups:
+            return None
+        return pending, scoped + b"|migrate"
 
     def _check_database_path(self, path: Path) -> None:
         allowed = {

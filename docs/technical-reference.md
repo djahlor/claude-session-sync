@@ -248,7 +248,12 @@ this step does not upload local chat messages.
 
 The marker is committed and backed up with the layout records. The adapter
 requires an exact account-owner match and refuses a quarantined or differently
-scoped pending update. It never changes identity markers, credentials, or other
+scoped pending update, including when only an inactive scope changes. If a
+restore would change a scope with pending user edits, it leaves the payload and
+snapshot unchanged until Claude sends those edits. Crash recovery can recognize
+a consumed migration marker without rolling
+back a completed restore, but only when the other records match the completed
+transaction. It never changes identity markers, credentials, or other
 account settings. Clients without enabled account settings sync keep the local
 path. This is a private Claude protocol, verified against the installed Desktop
 build, not a supported public API or a guarantee against future changes.
