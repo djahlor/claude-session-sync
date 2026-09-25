@@ -264,6 +264,9 @@ class Installer:
                     "--account-file", str(defaults[0].data_root / "config.json"),
                     "--profile", defaults[0].name,
                 )
+                if configured.sync_sidebar_layout:
+                    # Pins and groups move only with Claude closed.
+                    account_arguments += ("--restart-on-switch", "1")
         arguments = (
             (
                 str(self.layout.watcher_binary),

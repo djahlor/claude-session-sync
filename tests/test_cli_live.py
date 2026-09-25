@@ -220,6 +220,26 @@ class LiveCliTests(unittest.TestCase):
         self.assertIsNone(self.read(self.a, X))
         self.assertEqual({}, load_state(state_path(self.config.state_dir)).sync.synced)
 
+    def test_keep_sidebar_marks_the_signed_in_account_for_the_next_closed_sync(self):
+        from dataclasses import replace
+        from claude_session_sync.layout import read_pending_adoption
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+
+        code, out, _errors = self.cli("keep-sidebar", "--dry-run")
+        self.assertEqual((0, "state=planned next_action=restart-claude\n"), (code, out))
+        self.assertIsNone(read_pending_adoption(self.config.state_dir))
+
+        code, out, _errors = self.cli("keep-sidebar", "--apply")
+        self.assertEqual(0, code)
+        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), read_pending_adoption(self.config.state_dir))
+
+    def test_keep_sidebar_refuses_when_pins_and_groups_do_not_sync(self):
+        code, out, _errors = self.cli("keep-sidebar", "--apply")
+
+        self.assertEqual(1, code)
+        self.assertIn("sidebar-sync-off", out)
+
 
 if __name__ == "__main__":
     unittest.main()

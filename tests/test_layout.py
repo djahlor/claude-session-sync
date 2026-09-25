@@ -211,8 +211,10 @@ class LayoutTransformTests(unittest.TestCase):
         new_scope = repeated_state["customGroupsByScope"]["c/w"]
         self.assertEqual(["Focus 🚀", "Backlog"], [g["name"] for g in new_scope["groups"]])
         self.assertEqual("violet", new_scope["groups"][0]["color"])
+        # After adoption the signed-in account's filing is copied whole, so a
+        # chat that has not reached this account yet is already filed when it does.
         self.assertEqual(
-            ["code:keep"], new_scope["order"]["id-focus 🚀"]
+            ["code:keep", "code:dangling"], new_scope["order"]["id-focus 🚀"]
         )
         self.assertEqual(["code:moved"], new_scope["order"]["id-backlog"])
 
@@ -1297,6 +1299,162 @@ class LayoutRecoveryTests(unittest.TestCase):
                 [sys.executable, "-c", code], capture_output=True, timeout=3
             )
             self.assertEqual(0, result.returncode, result.stderr.decode())
+
+
+class FollowAccountTests(unittest.TestCase):
+    """After adoption, one account's sidebar is the source of truth at a time."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+
+    def adopted(self, source, other, targets):
+        return transform_layout_records(
+            records({"a/w": source, "b/w": other}, active="a/w"),
+            targets,
+            adopt_current_sidebar=True,
+            timestamp_ms=10,
+        )
+
+    def switched_to_b(self, adopted, b_scope):
+        document = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
+        document["state"]["lastSidebarScopeKey"] = "b/w"
+        document["state"]["customGroupsByScope"]["b/w"] = b_scope
+        current = dict(adopted.records)
+        current[DFRAME_STORE_KEY] = _encode_record(document)
+        return current
+
+    def test_after_a_switch_the_account_just_left_is_copied_into_the_new_one(self):
+        targets = {"a/w": {"code:x", "code:y"}, "b/w": {"code:x", "code:y"}}
+        latest = scope("Focus", "Admin", assignments={"code:x": "id-focus", "code:y": "id-admin"})
+        adopted = self.adopted(latest, scope("Old"), targets)
+        # Claude reloaded b's groups from its servers at sign-in: an old list.
+        current = self.switched_to_b(adopted, scope("Old", "Stale"))
+
+        result = transform_layout_records(
+            current, targets, snapshot=adopted.snapshot, timestamp_ms=20,
+            after_account_switch=True, owner_account="b",
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        self.assertEqual(latest["groups"], scopes["b/w"]["groups"])
+        self.assertEqual(latest["assignments"], scopes["b/w"]["assignments"])
+        self.assertEqual("b/w", result.canonical_upload_scope, "b's servers must get the copy")
+        self.assertEqual("b/w", result.snapshot.adopted_scope)
+
+    def test_without_a_switch_the_signed_in_account_is_copied_and_a_deleted_group_stays_gone(self):
+        targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+        adopted = self.adopted(
+            scope("Focus", "Old idea", assignments={"code:x": "id-focus"}), scope(), targets
+        )
+        document = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
+        document["state"]["customGroupsByScope"]["a/w"] = scope(
+            "Focus", assignments={"code:x": "id-focus"}
+        )
+        current = dict(adopted.records)
+        current[DFRAME_STORE_KEY] = _encode_record(document)
+
+        result = transform_layout_records(
+            current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="a"
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        for key in targets:
+            self.assertEqual(["Focus"], [group["name"] for group in scopes[key]["groups"]])
+        self.assertIsNone(result.canonical_upload_scope)
+
+    def test_an_account_whose_sidebar_claude_has_not_shown_yet_is_found_by_sign_in(self):
+        targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+        latest = scope("Focus", assignments={"code:x": "id-focus"})
+        adopted = self.adopted(latest, scope(), targets)
+
+        result = transform_layout_records(
+            adopted.records, targets, snapshot=adopted.snapshot, timestamp_ms=20,
+            after_account_switch=True, owner_account="b",
+        )
+
+        state = decoded(result.records[DFRAME_STORE_KEY])["state"]
+        self.assertEqual("b/w", state["lastSidebarScopeKey"])
+        self.assertEqual(latest["groups"], state["customGroupsByScope"]["b/w"]["groups"])
+        self.assertEqual("b/w", result.canonical_upload_scope)
+
+    def test_an_account_that_does_not_sync_yet_leaves_every_record_alone(self):
+        targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+        adopted = self.adopted(scope("Focus"), scope(), targets)
+
+        result = transform_layout_records(
+            adopted.records, targets, snapshot=adopted.snapshot, timestamp_ms=20,
+            after_account_switch=True, owner_account="new",
+        )
+
+        self.assertEqual(dict(adopted.records), dict(result.records))
+        self.assertEqual(adopted.snapshot, result.snapshot)
+
+    def test_a_divergent_account_without_a_switch_is_left_for_a_choice(self):
+        targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+        adopted = self.adopted(scope("Focus"), scope(), targets)
+        current = self.switched_to_b(adopted, scope("Edited in b"))
+
+        with self.assertRaisesRegex(LayoutError, "adopt-current-sidebar"):
+            transform_layout_records(
+                current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="b"
+            )
+
+    def test_a_switch_sync_writes_the_copy_and_asks_claude_to_upload_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+            latest = scope("Focus", assignments={"code:x": "id-focus"})
+            adopted = self.adopted(latest, scope(), targets)
+            values.clear()
+            values.update(self.switched_to_b(adopted, scope("Old")))
+            prefix = layout_module.ORIGIN_PREFIX
+            values[prefix + b"ccd-sync-owner"] = b"\x01b"
+            values[prefix + b"ccd-sync-active"] = b"\x011"
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            snapshot_path.write_text(json.dumps(adopted.snapshot.as_dict()))
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=targets
+            ):
+                receipt = synchronizer.sync(after_account_switch=True)
+                repeated = synchronizer.sync()
+
+            self.assertEqual("synced", receipt.state)
+            self.assertEqual("noop", repeated.state)
+            scopes = decoded(values[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+            self.assertEqual(latest["groups"], scopes["b/w"]["groups"])
+            self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+            self.assertEqual("b/w", json.loads(snapshot_path.read_text())["adopted_scope"])
+
+    def test_a_pending_adoption_is_applied_once_when_claude_is_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+            latest = scope("Focus", assignments={"code:x": "id-focus"})
+            values.clear()
+            # b is signed in; a holds the organization to keep.
+            values.update(records({"a/w": latest, "b/w": scope("Old")}, active="b/w"))
+            prefix = layout_module.ORIGIN_PREFIX
+            values[prefix + b"ccd-sync-owner"] = b"\x01b"
+            values[prefix + b"ccd-sync-active"] = b"\x011"
+            layout_module.request_adoption(synchronizer.config.state_dir, "a/w")
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=targets
+            ):
+                receipt = synchronizer.sync()
+
+            self.assertEqual("synced", receipt.state)
+            scopes = decoded(values[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+            self.assertEqual(latest["groups"], scopes["b/w"]["groups"])
+            self.assertIsNone(layout_module.read_pending_adoption(synchronizer.config.state_dir))
+            self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
 
 
 if __name__ == "__main__":

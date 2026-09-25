@@ -40,8 +40,14 @@ A new account joins the sync once you start a chat in it.
 3. Keep working. Chats sync in the background while Claude is open, so the
    other account's sidebar is already up to date.
 
-If chats arrive after Claude loaded the new account, the **Sync** menu says how
-many and offers **Restart Claude now**. Claude never restarts on its own.
+With pin and group sync on, Claude restarts once right after the switch. Claude
+keeps pins and groups in its own locked database and reloads each account's
+groups from its servers at sign-in, so they can only be carried over with
+Claude closed. The restart copies the organization from the account you just
+left.
+
+Without it, if chats arrive after Claude loaded the new account, the **Sync**
+menu says how many and offers **Restart Claude now**.
 
 A small status window shows what is happening, even if macOS hides notifications.
 The **Sync** menu keeps the latest status.
@@ -55,7 +61,9 @@ The **Sync** menu keeps the latest status.
 - Only folders of accounts you really use take part. Leftover folders from an
   old Mac are ignored.
 
-Pins, groups, and routines still sync when Claude quits.
+Pins and groups follow the account you use: the one you just left is the
+source when you switch, and the one you are signed into wins otherwise.
+Routines sync when Claude quits.
 
 ## Update
 

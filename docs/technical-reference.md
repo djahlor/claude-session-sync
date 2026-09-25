@@ -334,6 +334,28 @@ kept runs fit in 500 MB.
 The watcher owns a persistent menu-bar status item and a non-activating status
 window. It does not rely on AppleScript or Notification Center delivery.
 
+## Pins and groups across accounts
+
+Claude keeps pins and custom groups in its Local Storage database, which it
+locks while open, and each account's group list also lives in that account's
+settings on Anthropic's servers. At sign-in Claude replaces the local list with
+the server list. So pins and groups can only be carried between accounts with
+Claude closed, and the new account must then upload the copy.
+
+- **One source of truth.** After an adoption, one account's organization is the
+  source. The signed-in account wins when Claude closes normally.
+- **Account switches.** With `sync_sidebar_layout` on, the watcher restarts
+  Claude once after a switch and runs `switch <profile> --after-account-switch`.
+  The account just left holds the newest organization, so it is copied into the
+  new account, which is then marked for a canonical upload to its servers.
+- **Deletes stick.** A deleted group is gone from every account after the next
+  sync; nothing is merged back from older copies.
+- **A choice when unclear.** If the signed-in account's groups changed without
+  a switch restart, sync stops and asks. `claude-session-sync keep-sidebar
+  --apply` marks the signed-in account as the source for the next time Claude
+  closes, and `restart-claude` does that restart.
+- **Accounts not yet synced** are left alone.
+
 ## Claude Code routines
 
 Claude Code stores routines in `scheduled-tasks.json`, separate from chat files.

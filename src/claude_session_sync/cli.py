@@ -173,6 +173,18 @@ def _parser() -> argparse.ArgumentParser:
     restart_check = commands.add_parser("restart-check", help="inspect which default-profile processes may be restarted")
     restart_check.add_argument("profile")
     switch.add_argument("--no-launch", action="store_true")
+    switch_layout = switch.add_mutually_exclusive_group()
+    switch_layout.add_argument(
+        "--after-account-switch",
+        action="store_true",
+        help="copy pins and groups from the account just left into the new one",
+    )
+    switch_layout.add_argument(
+        "--adopt-current-sidebar",
+        action="store_true",
+        dest="adopt_current_sidebar",
+        help="make the signed-in account's pins and groups the source of truth",
+    )
     switch.add_argument(
         "--wait-for-exit",
         type=_nonnegative_seconds,
@@ -188,10 +200,23 @@ def _parser() -> argparse.ArgumentParser:
     seed_mode = seed.add_mutually_exclusive_group(required=True)
     seed_mode.add_argument("--dry-run", action="store_true")
     seed_mode.add_argument("--apply", action="store_true")
-    commands.add_parser(
+    restart_claude = commands.add_parser(
         "restart-claude",
         help="ask the Sync helper to quit, sync, and reopen Claude once",
     )
+    restart_claude.add_argument(
+        "--adopt-current-sidebar",
+        action="store_true",
+        dest="adopt_current_sidebar",
+        help="while Claude is closed, make the signed-in account's pins and groups the source of truth",
+    )
+    keep_sidebar = commands.add_parser(
+        "keep-sidebar",
+        help="make the signed-in account's pins and groups the source of truth next time Claude closes",
+    )
+    keep_mode = keep_sidebar.add_mutually_exclusive_group(required=True)
+    keep_mode.add_argument("--dry-run", action="store_true")
+    keep_mode.add_argument("--apply", action="store_true")
     forget = commands.add_parser(
         "forget-lost",
         help="let the next sync put back one chat reported as lost",
@@ -657,6 +682,8 @@ def _run_switch(
                 config,
                 dependencies,
                 lambda: bool(_running_processes(config, dependencies)),
+                adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
+                after_account_switch=getattr(arguments, "after_account_switch", False),
             )
         )
         payload["progress"] = finish_progress(config, payload)
@@ -750,6 +777,34 @@ def _chat_failure(error: Exception) -> dict:
         "next_action": "run-doctor",
         "error_type": "chat-sync-error",
     }
+
+
+def _keep_sidebar(config: Config, *, apply: bool) -> tuple:
+    """Choose the signed-in account's synced folder as the pins-and-groups source."""
+
+    from .enrollment import selected_targets
+    from .layout import request_adoption
+    from .liveness import last_known_account
+    from .store import SessionStore
+
+    if not config.sync_sidebar_layout:
+        return {"state": "blocked", "reason": "sidebar-sync-off"}, 1
+    defaults = [profile for profile in config.profiles if profile.is_default]
+    if len(defaults) != 1:
+        return {"state": "blocked", "reason": "needs-one-default-profile"}, 1
+    account = last_known_account(defaults[0].data_root)
+    folders = [
+        target
+        for target in selected_targets(config, SessionStore().discover_targets(config).targets)
+        if target.profile_name == defaults[0].name and target.account_id.lower() == account
+    ]
+    if account is None or len(folders) != 1:
+        return {"state": "blocked", "reason": "signed-in-account-not-synced"}, 1
+    if apply:
+        request_adoption(
+            config.state_dir, "{}/{}".format(folders[0].account_id, folders[0].workspace_id)
+        )
+    return {"state": "pending" if apply else "planned", "next_action": "restart-claude"}, 0
 
 
 def _chat_run_summary(run: Any, duration_ms: int) -> dict:
@@ -1131,10 +1186,17 @@ def run(
 
             ensure_private_directory(config.state_dir)
             request = config.state_dir / "restart-request"
-            atomic_write_bytes(request, b"restart\n")
+            atomic_write_bytes(
+                request,
+                b"adopt-current-sidebar\n" if arguments.adopt_current_sidebar else b"restart\n",
+            )
             os.chmod(str(request), 0o600)
             _write({"state": "requested"}, as_json=False, stream=output)
             return 0
+        if arguments.command == "keep-sidebar":
+            payload, exit_code = _keep_sidebar(config, apply=arguments.apply)
+            _write(payload, as_json=False, stream=output)
+            return exit_code
         if arguments.command == "forget-lost":
             from .chat_sync import forget_seen
 

@@ -144,9 +144,15 @@ class WatcherTests(unittest.TestCase):
     def test_a_restart_requested_during_a_sync_waits_for_it(self):
         self.live_scenario(request_restart=True, request_during_sync=True)
 
+    def test_with_pins_and_groups_a_switch_restarts_once_and_copies_them(self):
+        self.live_scenario(change_account=True, restart_on_switch=True)
+
+    def test_an_adoption_request_reaches_the_closed_claude_sync(self):
+        self.live_scenario(request_restart=True, request_text="adopt-current-sidebar\n")
+
     def live_scenario(self, change_account=False, touch_folder=False, suggest_restart=False,
                       request_restart=False, fail_sync=False, block_preflight=False,
-                      request_during_sync=False):
+                      request_during_sync=False, restart_on_switch=False, request_text=""):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app = root / "SyncTest.app"
@@ -187,7 +193,8 @@ class WatcherTests(unittest.TestCase):
             env = dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1")
             watcher_command = [
                 str(self.binary), "--claude-executable", str(executable), "--status", str(status),
-                "--account-file", str(account), "--profile", "Work", "--",
+                "--account-file", str(account), "--profile", "Work",
+                *(["--restart-on-switch", "1"] if restart_on_switch else []), "--",
                 sys.executable, str(child),
             ]
             process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -215,9 +222,17 @@ class WatcherTests(unittest.TestCase):
                     time.sleep(2)
                     self.assertEqual(1, len(entries()), "logout alone must not sync")
                     account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
-                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 10), "a switch must trigger a sync")
-                    self.assertTrue(app_running(), "a switch must never quit Claude")
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 20), "a switch must trigger a sync")
                     self.assertNotIn("must-not-be-copied", (root / "account-restart.json").read_text())
+                    if restart_on_switch:
+                        switches = lambda: [item for item in entries() if item[0] == "switch"]
+                        self.assertTrue(wait_for(lambda: switches(), 30), "a switch must restart once")
+                        self.assertIn("--after-account-switch", switches()[0])
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
+                        time.sleep(4)
+                        self.assertEqual(1, len(switches()), "no restart loop")
+                    else:
+                        self.assertTrue(app_running(), "a switch must never quit Claude")
                 if touch_folder:
                     time.sleep(1)
                     (folder / "local_new.json").write_text("{}")
@@ -231,7 +246,7 @@ class WatcherTests(unittest.TestCase):
                     (folder / "local_new.json").write_text("{}")
                     self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a sync must be running")
                 if request_restart:
-                    (root / "restart-request").touch()
+                    (root / "restart-request").write_text(request_text)
                     finished = wait_for(
                         lambda: any(item[0] == "switch" for item in entries())
                         or json.loads(status.read_text()).get("restart_phase") == "needs-attention",
@@ -246,6 +261,9 @@ class WatcherTests(unittest.TestCase):
                     expected = 0 if block_preflight else 1
                     time.sleep(4)
                     self.assertEqual(expected, sum(item[0] == "switch" for item in entries()))
+                    if expected and request_text:
+                        switch_call = next(item for item in entries() if item[0] == "switch")
+                        self.assertIn("--adopt-current-sidebar", switch_call)
                     self.assertFalse((root / "restart-request").exists())
                     phase = json.loads(status.read_text())["restart_phase"]
                     self.assertEqual("needs-attention" if fail_sync or block_preflight else "finished", phase)
@@ -253,7 +271,9 @@ class WatcherTests(unittest.TestCase):
                         self.assertTrue(app_running(), "a blocked check must leave Claude open")
                     elif not fail_sync:
                         self.assertTrue(wait_for(app_running, 10), "Claude must reopen after the sync")
-                self.assertTrue(all(item[0] != "switch" for item in entries()) or request_restart)
+                self.assertTrue(
+                    all(item[0] != "switch" for item in entries()) or request_restart or restart_on_switch
+                )
             finally:
                 if process.poll() is None:
                     process.terminate()

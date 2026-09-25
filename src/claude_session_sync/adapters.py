@@ -109,6 +109,7 @@ def run_adapters(
     prefer_current_sidebar=False,
     adopt_current_sidebar=False,
     adopt_source_scope=None,
+    after_account_switch=False,
 ) -> dict:
     """A failed adapter cannot prevent the other enabled adapter from running."""
     results = {}
@@ -135,6 +136,8 @@ def run_adapters(
                         receipt = adapter.sync(adopt_current_sidebar=True)
                     elif name == "layout" and prefer_current_sidebar:
                         receipt = adapter.sync(prefer_current_sidebar=True)
+                    elif name == "layout" and after_account_switch:
+                        receipt = adapter.sync(after_account_switch=True)
                     else:
                         receipt = adapter.sync()
                     result = {"state": receipt.state}

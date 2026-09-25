@@ -51,6 +51,7 @@ SYNC_QUARANTINE_KEY = ORIGIN_PREFIX + b"ccd-sync-quarantine"
 SYNC_METADATA_KEYS = (SYNC_OWNER_KEY, SYNC_ACTIVE_KEY, SYNC_QUARANTINE_KEY, GROUP_UPLOAD_KEY)
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
+ADOPT_PENDING_FILENAME = "sidebar-adopt-pending.json"
 
 
 class LayoutError(RuntimeError):
@@ -498,13 +499,16 @@ def _adopt_current_sidebar_records(
     *,
     timestamp_ms: Optional[int],
     source_scope: Optional[str] = None,
+    active_scope: Optional[str] = None,
 ) -> LayoutTransform:
     """Bootstrap from the currently displayed scope without historical union."""
 
     store_state = store_record["state"]
     store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
     persisted_scopes = _validated_scopes(group_record["value"])
-    active_scope = store_state.get("lastSidebarScopeKey")
+    stored_active = store_state.get("lastSidebarScopeKey")
+    if active_scope is None:
+        active_scope = stored_active
     if (
         not isinstance(active_scope, str)
         or active_scope not in target_sessions
@@ -551,6 +555,9 @@ def _adopt_current_sidebar_records(
     updated_group = copy.deepcopy(group_record)
     updated_local = copy.deepcopy(local_record)
     updated_store["state"]["customGroupsByScope"] = updated_store_scopes
+    if active_scope != stored_active:
+        # The signed-in account's folder, when Claude had not shown it yet.
+        updated_store["state"]["lastSidebarScopeKey"] = active_scope
     updated_group["value"] = updated_persisted_scopes
     updated_store["state"]["pinnedOrder"] = current_pins
     updated_local["value"]["pinnedOrder"] = current_pins
@@ -575,7 +582,9 @@ def _adopt_current_sidebar_records(
             home_projects_pinned_order=tuple(current_project_pins),
             group_order=group_order,
             group_records=tuple(copy.deepcopy(source["groups"])),
-            adopted_scope=selected_scope,
+            # The account in use now holds the copy, so it is the source of
+            # truth from here: its later edits win until the next switch.
+            adopted_scope=active_scope,
         ),
         group_count=len(groups),
         assignment_count=len(assignments),
@@ -596,8 +605,17 @@ def transform_layout_records(
     prefer_current_sidebar: bool = False,
     adopt_current_sidebar: bool = False,
     adopt_source_scope: Optional[str] = None,
+    after_account_switch: bool = False,
+    owner_account: Optional[str] = None,
 ) -> LayoutTransform:
-    """Return exact allowlisted record replacements for one Claude data root."""
+    """Return exact allowlisted record replacements for one Claude data root.
+
+    Once a layout has been adopted, one account's sidebar is the source of
+    truth at a time. The signed-in account's groups are copied to the other
+    accounts. Right after an account switch, the account just left still
+    holds the newest organization, because Claude reloads the new account's
+    groups from its servers at sign-in, so that one is copied instead.
+    """
 
     if set(records) != set(LAYOUT_KEYS):
         raise LayoutError("required sidebar records are missing")
@@ -622,6 +640,19 @@ def transform_layout_records(
             target_sessions,
             timestamp_ms=timestamp_ms,
             source_scope=adopt_source_scope,
+        )
+
+    if snapshot is not None and snapshot.adopted_scope is not None and not prefer_current_sidebar:
+        return _follow_adopted_sidebar(
+            records,
+            group_record,
+            local_record,
+            store_record,
+            target_sessions,
+            snapshot,
+            timestamp_ms=timestamp_ms,
+            after_account_switch=after_account_switch,
+            owner_account=owner_account,
         )
 
     store_state = store_record["state"]
@@ -868,6 +899,134 @@ def transform_layout_records(
     )
 
 
+def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
+    if scope is None:
+        return True
+    return (
+        not _ordered_group_pairs(scope)
+        and not scope.get("assignments", {})
+        and not any(scope.get("order", {}).values())
+    )
+
+
+def _follow_adopted_sidebar(
+    records: Mapping[bytes, bytes],
+    group_record: Mapping[str, Any],
+    local_record: Mapping[str, Any],
+    store_record: Mapping[str, Any],
+    target_sessions: Mapping[str, Set[str]],
+    snapshot: LayoutSnapshot,
+    *,
+    timestamp_ms: Optional[int],
+    after_account_switch: bool,
+    owner_account: Optional[str],
+) -> LayoutTransform:
+    store_state = store_record["state"]
+    store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
+    persisted_scopes = _validated_scopes(group_record["value"])
+    active = store_state.get("lastSidebarScopeKey")
+    if active is not None and not isinstance(active, str):
+        raise LayoutError("last sidebar scope has an unknown shape")
+    if owner_account is not None and (
+        not isinstance(active, str) or active.partition("/")[0] != owner_account
+    ):
+        # Claude has not shown the signed-in account's Code sidebar yet.
+        owned = [key for key in target_sessions if key.partition("/")[0] == owner_account]
+        if len(owned) != 1:
+            return _unchanged(records, snapshot)
+        active = owned[0]
+    if not isinstance(active, str) or active not in target_sessions:
+        return _unchanged(records, snapshot)  # an account that does not sync yet
+
+    adopted = snapshot.adopted_scope
+    if active == adopted:
+        source = active
+    elif after_account_switch or _scope_is_empty(
+        store_scopes.get(active, persisted_scopes.get(active))
+    ):
+        source = adopted
+    else:
+        raise LayoutError(
+            "current account sidebar differs from the adopted canonical layout; "
+            "keep one with sync --adopt-current-sidebar or --adopt-source-scope"
+        )
+    if (
+        source not in target_sessions
+        or source not in store_scopes
+        or not _ordered_group_pairs(store_scopes[source])
+    ):
+        raise LayoutError(
+            "the last synced sidebar is not available; keep one with "
+            "sync --adopt-current-sidebar or --adopt-source-scope"
+        )
+    return _adopt_current_sidebar_records(
+        group_record,
+        local_record,
+        store_record,
+        target_sessions,
+        timestamp_ms=timestamp_ms,
+        source_scope=source,
+        active_scope=active,
+    )
+
+
+def request_adoption(state_dir: Path, source_scope: str) -> None:
+    """Make one account's pins and groups the source of truth at the next closed-Claude sync."""
+
+    account, separator, workspace = source_scope.partition("/")
+    if not account or not separator or not workspace or "/" in workspace:
+        raise LayoutError("sidebar scope must be ACCOUNT/WORKSPACE")
+    ensure_private_directory(state_dir)
+    path = Path(state_dir) / ADOPT_PENDING_FILENAME
+    atomic_write_bytes(
+        path, (json.dumps({"version": 1, "source_scope": source_scope}) + "\n").encode("utf-8")
+    )
+    os.chmod(str(path), 0o600)
+
+
+def read_pending_adoption(state_dir: Path) -> Optional[str]:
+    content = _snapshot_bytes(Path(state_dir) / ADOPT_PENDING_FILENAME)
+    if content is None:
+        return None
+    try:
+        document = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise LayoutError("pending sidebar adoption is malformed") from error
+    scope = document.get("source_scope") if isinstance(document, dict) else None
+    if document.get("version") != 1 or not isinstance(scope, str) or scope.count("/") != 1:
+        raise LayoutError("pending sidebar adoption is malformed")
+    return scope
+
+
+def clear_pending_adoption(state_dir: Path) -> None:
+    path = Path(state_dir) / ADOPT_PENDING_FILENAME
+    if os.path.lexists(str(path)):
+        durable_unlink(path)
+
+
+def _owner_account(value: Optional[bytes]) -> Optional[str]:
+    """The signed-in account Claude recorded for its settings sync, if any."""
+
+    if value is None or not value.startswith(b"\x01"):
+        return None
+    try:
+        account = value[1:].decode("utf-8")
+    except UnicodeError:
+        return None
+    return account if account and "/" not in account else None
+
+
+def _unchanged(records: Mapping[bytes, bytes], snapshot: LayoutSnapshot) -> LayoutTransform:
+    return LayoutTransform(
+        records={key: records[key] for key in LAYOUT_KEYS},
+        snapshot=snapshot,
+        group_count=len(snapshot.groups),
+        assignment_count=len(snapshot.assignments),
+        pin_count=len(snapshot.pinned_order),
+        ambiguous_assignments=0,
+    )
+
+
 class LevelDatabase:
     """Narrow process adapter for the bundled LevelDB helper."""
 
@@ -1089,6 +1248,7 @@ class LayoutSynchronizer:
         prefer_current_sidebar: bool = False,
         adopt_current_sidebar: bool = False,
         adopt_source_scope: Optional[str] = None,
+        after_account_switch: bool = False,
     ) -> LayoutReceipt:
         if not self.config.sync_sidebar_layout:
             return LayoutReceipt("disabled", 0, 0, 0, 0, 0, 0)
@@ -1098,6 +1258,14 @@ class LayoutSynchronizer:
             raise LayoutError("current sidebar modes cannot be combined")
         if prefer_current_sidebar and len(self.config.profiles) != 1:
             raise LayoutError("choose one data profile before preferring its current sidebar")
+        pending = None
+        if not (prefer_current_sidebar or adopt_current_sidebar or adopt_source_scope):
+            pending = read_pending_adoption(self.config.state_dir)
+            if pending is not None:
+                # An adoption asked for while Claude was open: the chosen
+                # account's organization becomes the source of truth.
+                adopt_source_scope = pending
+                after_account_switch = False
         if (adopt_current_sidebar or adopt_source_scope is not None) and (
             len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
         ):
@@ -1133,6 +1301,7 @@ class LayoutSynchronizer:
                     index
                 )
                 snapshot_before = _snapshot_bytes(snapshot_path)
+                self._assert_stopped()
                 transformed = transform_layout_records(
                     current,
                     target_sessions,
@@ -1140,6 +1309,8 @@ class LayoutSynchronizer:
                     prefer_current_sidebar=prefer_current_sidebar,
                     adopt_current_sidebar=adopt_current_sidebar,
                     adopt_source_scope=adopt_source_scope,
+                    after_account_switch=after_account_switch,
+                    owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
                 )
                 planned_records = dict(transformed.records)
                 marker = self._group_upload_marker(
@@ -1176,6 +1347,8 @@ class LayoutSynchronizer:
                 totals[2] = max(totals[2], transformed.assignment_count)
                 totals[3] = max(totals[3], transformed.pin_count)
                 totals[4] += transformed.ambiguous_assignments
+            if pending is not None:
+                clear_pending_adoption(self.config.state_dir)
             return LayoutReceipt(
                 "synced" if changed_profiles else "noop",
                 len(self.config.profiles),
