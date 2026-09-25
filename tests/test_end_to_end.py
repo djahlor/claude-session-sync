@@ -13,7 +13,7 @@ def _replica(target: Path, session_id: str, marker: str) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     path = target / "local_{}.json".format(session_id)
     path.write_text(
-        json.dumps({"sessionId": session_id, "marker": marker}),
+        json.dumps({"sessionId": "local_" + session_id, "marker": marker}),
         encoding="utf-8",
     )
     return path

@@ -25,6 +25,10 @@ private struct RestartReceipt: Codable {
   }
 }
 
+// Chats sync while Claude runs. An account switch only triggers a sync; Claude
+// is never quit for it. When new chats land in the signed-in account's folder,
+// Claude shows them only after a restart, so the menu offers one. It never
+// restarts Claude on its own.
 private final class SessionSyncWatcher: NSObject {
   private let command: [String]
   private let claudeExecutable: String
@@ -34,22 +38,26 @@ private final class SessionSyncWatcher: NSObject {
   private var pending = false
   private var retryDeadline: Date?
   private let accountURL: URL?
+  private let sessionsURL: URL?
   private let profile: String?
   private let restartURL: URL
+  private let restartRequestURL: URL
   private var accountHash: String?
   private var candidateHash: String?
   private var candidateSince: Date?
-  private var preflightAttempts = 0
-  private var preflightRetryAt: Date?
-  private var preflightPending = false
   private var accountTimer: DispatchSourceTimer?
   private var restartRequested = false
   private var restartAttempt: UUID?
   private var quittingPIDs = Set<pid_t>()
   private var restartPhase = "ready"
+  private var restartSuggested = 0
+  private var folderSignature: String?
+  private var lastFolderCheck = Date.distantPast
+  private var lastFallbackRun = Date()
   private var statusItem: NSStatusItem?
   private var noticePanel: NSPanel?
   private var noticeGeneration = 0
+  private var lastMessage = ""
 
   init(command: [String], claudeExecutable: String, statusURL: URL,
        accountURL: URL?, profile: String?) {
@@ -57,8 +65,11 @@ private final class SessionSyncWatcher: NSObject {
     self.claudeExecutable = URL(fileURLWithPath: claudeExecutable).standardizedFileURL.path
     self.statusURL = statusURL
     self.accountURL = accountURL
+    self.sessionsURL = accountURL?.deletingLastPathComponent().appendingPathComponent("claude-code-sessions")
     self.profile = profile
-    self.restartURL = statusURL.deletingLastPathComponent().appendingPathComponent("account-restart.json")
+    let directory = statusURL.deletingLastPathComponent()
+    self.restartURL = directory.appendingPathComponent("account-restart.json")
+    self.restartRequestURL = directory.appendingPathComponent("restart-request")
     super.init()
     if accountURL != nil {
       do {
@@ -71,17 +82,14 @@ private final class SessionSyncWatcher: NSObject {
           else { throw CocoaError(.fileReadCorruptFile) }
           accountHash = hash
           if phase == "checking" {
+            // Older helpers quit Claude after an account check. Validate the
+            // receipt, then drop the pending check: switches never quit Claude.
             guard let candidate = saved.candidateHash, candidate.count == 64,
               candidate.allSatisfy({ $0.isHexDigit }), candidate != hash,
               let attempts = saved.preflightAttempts, (1...3).contains(attempts),
               let retryAt = saved.retryNotBefore, retryAt.isFinite, retryAt >= 0
             else { throw CocoaError(.fileReadCorruptFile) }
-            candidateHash = candidate
-            candidateSince = Date()
-            preflightAttempts = attempts
-            // A clock change must not extend the bounded retry delay indefinitely.
-            preflightRetryAt = min(Date(timeIntervalSince1970: retryAt), Date().addingTimeInterval(Double(attempts * 2)))
-            restartPhase = "checking"
+            restartPhase = "ready"
           } else if !["ready", "finished"].contains(phase) {
             restartPhase = "needs-attention"
           }
@@ -91,16 +99,17 @@ private final class SessionSyncWatcher: NSObject {
         }
       } catch {
         restartPhase = "needs-attention"
-        // An unreadable receipt must never become permission to quit again.
+        // An unreadable receipt must never become permission to quit.
       }
+      folderSignature = currentFolderSignature()
       let timer = DispatchSource.makeTimerSource(queue: queue)
       timer.schedule(deadline: .now() + 1, repeating: 1)
-      timer.setEventHandler { [weak self] in self?.checkAccount() }
+      timer.setEventHandler { [weak self] in self?.tick() }
       timer.resume()
       accountTimer = timer
     }
     showStatus(restartPhase == "needs-attention" ? "Sync needs attention" :
-      accountURL != nil ? "Sync ready. Automatic account-switch restart is on." : "Sync ready. Quit Claude to sync.", banner: true)
+      accountURL != nil ? "Sync is on. Chats sync while Claude is open." : "Sync ready. Quit Claude to sync.", banner: true)
   }
 
   private func privateData(_ url: URL) throws -> Data {
@@ -129,15 +138,7 @@ private final class SessionSyncWatcher: NSObject {
     guard (try directory.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true
     else { throw CocoaError(.fileWriteNoPermission) }
     if FileManager.default.fileExists(atPath: restartURL.path) { _ = try privateData(restartURL) }
-    var receipt = RestartReceipt(accountHash: hash, phase: restartPhase)
-    if restartPhase == "checking" {
-      guard let candidate = candidateHash, let retryAt = preflightRetryAt,
-        candidate != hash, (1...3).contains(preflightAttempts)
-      else { throw CocoaError(.fileWriteUnknown) }
-      receipt.candidateHash = candidate
-      receipt.preflightAttempts = preflightAttempts
-      receipt.retryNotBefore = retryAt.timeIntervalSince1970
-    }
+    let receipt = RestartReceipt(accountHash: hash, phase: restartPhase)
     let data = try JSONEncoder().encode(receipt)
     try data.write(to: restartURL, options: [.atomic])
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: restartURL.path)
@@ -185,23 +186,7 @@ private final class SessionSyncWatcher: NSObject {
     } catch { return .blocked }
   }
 
-  @discardableResult
-  private func resetPreflight() -> Bool {
-    preflightAttempts = 0
-    preflightRetryAt = nil
-    if restartPhase == "checking" {
-      restartPhase = "ready"
-      do { try saveRestartState() } catch {
-        restartFailed("Could not reset the account-check receipt. Claude was left open.")
-        return false
-      }
-      writeStatus(exitStatus: 0, output: Data("{\"progress\":\"waiting-for-Claude\"}".utf8), launchFailed: false)
-      showStatus("Sync ready, Claude open")
-    }
-    return true
-  }
-
-  private func checkAccount() {
+  private func tick() {
     if restartRequested && restartPhase == "quitting" {
       let attempt = restartAttempt
       // Quit notifications can omit the executable URL. Also observe actual exit.
@@ -218,11 +203,55 @@ private final class SessionSyncWatcher: NSObject {
       }
       return
     }
-    guard !running, !restartRequested, !preflightPending, restartPhase != "needs-attention" else { return }
+    if FileManager.default.fileExists(atPath: restartRequestURL.path) {
+      try? FileManager.default.removeItem(at: restartRequestURL)
+      beginRestart()
+      return
+    }
+    checkFolders()
+    checkAccount()
+  }
+
+  private func currentFolderSignature() -> String? {
+    guard let root = sessionsURL else { return nil }
+    let manager = FileManager.default
+    let keys: [URLResourceKey] = [.contentModificationDateKey, .isDirectoryKey, .isSymbolicLinkKey]
+    guard let accounts = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: keys,
+      options: [.skipsHiddenFiles]) else { return "" }
+    var parts: [String] = []
+    for account in accounts.sorted(by: { $0.path < $1.path }) {
+      guard let folders = try? manager.contentsOfDirectory(at: account, includingPropertiesForKeys: keys,
+        options: [.skipsHiddenFiles]) else { continue }
+      for folder in folders.sorted(by: { $0.path < $1.path }) {
+        let values = try? folder.resourceValues(forKeys: Set(keys))
+        guard values?.isDirectory == true, values?.isSymbolicLink != true else { continue }
+        let stamp = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+        parts.append("\(account.lastPathComponent)/\(folder.lastPathComponent):\(stamp)")
+      }
+    }
+    return parts.joined(separator: "|")
+  }
+
+  // Claude saves a chat by renaming a temp file into place, which changes its
+  // folder's time. A five-minute pass catches anything else.
+  private func checkFolders() {
+    let now = Date()
+    guard sessionsURL != nil, now.timeIntervalSince(lastFolderCheck) >= 5 else { return }
+    lastFolderCheck = now
+    let signature = currentFolderSignature()
+    let changed = signature != folderSignature
+    folderSignature = signature
+    if changed || now.timeIntervalSince(lastFallbackRun) >= 300 {
+      lastFallbackRun = now
+      startAutoIfNeeded()
+    }
+  }
+
+  private func checkAccount() {
+    guard !restartRequested else { return }
     guard let hash = readAccountHash() else {
       candidateHash = nil
       candidateSince = nil
-      resetPreflight()
       return
     }
     guard let previous = accountHash else {
@@ -233,41 +262,49 @@ private final class SessionSyncWatcher: NSObject {
     guard hash != previous else {
       candidateHash = nil
       candidateSince = nil
-      resetPreflight()
       return
     }
     if candidateHash != hash {
-      guard resetPreflight() else { return }
       candidateHash = hash
       candidateSince = Date()
       return
     }
     guard let since = candidateSince, Date().timeIntervalSince(since) >= 3 else { return }
-    if let retryAt = preflightRetryAt, Date() < retryAt { return }
-    guard preflightAttempts < 3 else {
-      restartFailed("The process check used all three attempts. Claude was left open. Quit Claude to retry sync.",
-        reason: "process-inspection-timeout")
+    // A new login only needs a sync. The other account's chats were kept up to
+    // date while Claude was open, so there is nothing to quit for.
+    accountHash = hash
+    candidateHash = nil
+    candidateSince = nil
+    restartSuggested = 0
+    if restartPhase != "needs-attention" { restartPhase = "ready" }
+    do { try saveRestartState() } catch {
+      restartFailed("Could not save account-switch status.")
       return
     }
-    // Request a normal quit only for the configured executable, never force-kill.
-    preflightPending = true
+    showStatus("Account changed. Syncing chats.")
+    startAutoIfNeeded()
+  }
+
+  @objc private func restartClicked(_ sender: Any?) {
+    queue.async { [weak self] in self?.beginRestart() }
+  }
+
+  // Quit Claude once, sync everything, and reopen it. Only on request.
+  private func beginRestart() {
+    guard !restartRequested, profile != nil else { return }
+    if running {
+      showStatus("Sync is busy. Try the restart again in a moment.", banner: true)
+      return
+    }
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       let applications = NSWorkspace.shared.runningApplications.filter {
         $0.executableURL?.standardizedFileURL.path == self.claudeExecutable
       }
       self.queue.async {
-        self.preflightPending = false
-        guard !self.running, !self.restartRequested, self.restartPhase != "needs-attention",
-          self.accountHash != hash, self.readAccountHash() == hash,
-          !applications.isEmpty else { return }
-        // Consume the attempt durably before the read. A crash during the probe
-        // must not give a replacement helper a fresh account-switch budget.
-        self.preflightAttempts += 1
-        self.restartPhase = "checking"
-        self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightAttempts * 2))
-        do { try self.saveRestartState() } catch {
-          self.restartFailed("Could not save the account-check budget. Claude was left open.")
+        guard !self.running, !self.restartRequested else { return }
+        guard !applications.isEmpty else {
+          self.showStatus("Claude is not open. It will show every chat when it starts.", banner: true)
           return
         }
         let approvedPIDs: Set<pid_t>
@@ -275,27 +312,17 @@ private final class SessionSyncWatcher: NSObject {
         case .ready(let pids):
           approvedPIDs = pids
         case .retryable:
-          guard self.preflightAttempts < 3 else {
-            self.restartFailed("The process check timed out three times. Claude was left open. Quit Claude to retry sync.",
-              reason: "process-inspection-timeout")
-            return
-          }
-          // Keep the old account hash and this candidate's remaining budget.
-          self.preflightRetryAt = Date().addingTimeInterval(Double(self.preflightAttempts * 2))
-          do { try self.saveRestartState() } catch {
-            self.restartFailed("Could not save the account-check retry. Claude was left open.")
-            return
-          }
-          self.writeStatus(exitStatus: 0, output: Data("{\"progress\":\"checking-account\",\"reason\":\"process-inspection-timeout\"}".utf8), launchFailed: false)
-          self.showStatus("Mac is busy. Retrying the account check automatically.", banner: self.preflightAttempts == 1)
+          self.showStatus("Mac is busy. Try the restart again in a moment.", banner: true)
           return
         case .blocked:
           self.restartFailed("Could not confirm the default Claude profile. Claude was left open.")
           return
         }
         let targets = applications.filter { approvedPIDs.contains($0.processIdentifier) }
-        guard !targets.isEmpty, self.readAccountHash() == hash else { return }
-        self.accountHash = hash
+        guard !targets.isEmpty else {
+          self.restartFailed("Could not confirm the default Claude profile. Claude was left open.")
+          return
+        }
         self.restartPhase = "quitting"
         do { try self.saveRestartState() } catch {
           self.restartFailed("Could not save the restart guard. Claude was left open.")
@@ -306,13 +333,14 @@ private final class SessionSyncWatcher: NSObject {
         self.restartAttempt = attempt
         self.quittingPIDs = Set(targets.map { $0.processIdentifier })
         self.writeStatus(exitStatus: 0, output: Data("{\"progress\":\"quitting-Claude\"}".utf8), launchFailed: false)
-        self.notify("Account changed. Closing Claude once to sync, then reopening.")
+        self.notify("Restarting Claude to load new chats.")
+        // Request a normal quit only for the configured executable, never force-kill.
         DispatchQueue.main.async {
           for application in targets { _ = application.terminate() }
         }
         self.queue.asyncAfter(deadline: .now() + 30) {
           if self.restartRequested && self.restartPhase == "quitting" && self.restartAttempt == attempt {
-            self.restartFailed("Claude did not close. Finish any quit prompt, then quit Claude to sync.")
+            self.restartFailed("Claude did not close. Finish any quit prompt, then try again.")
           }
         }
       }
@@ -357,10 +385,10 @@ private final class SessionSyncWatcher: NSObject {
       }
       task.arguments = Array(command.dropFirst()) + ["switch", profile, "--wait-for-exit", "30", "--json"]
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"syncing\"}".utf8), launchFailed: false)
+      showStatus("Syncing, then reopening Claude")
     } else {
       task.arguments = Array(command.dropFirst()) + ["auto", "--json"]
     }
-    showStatus(restarting ? "Syncing, then reopening Claude" : "Checking sync")
     task.standardInput = FileHandle.nullDevice
     task.standardOutput = output
     task.standardError = FileHandle.nullDevice
@@ -394,6 +422,8 @@ private final class SessionSyncWatcher: NSObject {
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
     let reason = result?["reason"] as? String
     let progress = result?["progress"] as? String
+    let suggested = result?["restart_suggested"] as? Int ?? 0
+    let hadSuggestion = restartSuggested > 0
     running = false
     if restarting { restartRequested = false }
     if restarting && (exitStatus != 0 || progress != "finished") {
@@ -402,10 +432,8 @@ private final class SessionSyncWatcher: NSObject {
       return
     }
     if exitStatus == 0 && progress == "finished" {
+      restartSuggested = restarting ? 0 : max(0, suggested)
       restartPhase = "finished"
-      resetPreflight()
-      candidateHash = nil
-      candidateSince = nil
       if let hash = readAccountHash() { accountHash = hash }
       do { try saveRestartState() } catch {
         restartFailed("Sync finished, but its account-switch receipt could not be saved.")
@@ -428,9 +456,16 @@ private final class SessionSyncWatcher: NSObject {
         return
       }
       writeStatus(exitStatus: 1, output: output, launchFailed: false)
-      notify("Sync is still waiting. Quit Claude completely, then run sync again.")
+      notify("Sync is still waiting. Run claude-session-sync status for details.")
     } else if exitStatus == 0 && progress == "finished" {
-      notify(restarting ? "Sync finished. Claude reopened." : "Sync finished. You can open Claude.")
+      if restarting {
+        notify("Sync finished. Claude reopened.")
+      } else if restartSuggested > 0 {
+        let chats = restartSuggested == 1 ? "1 new chat" : "\(restartSuggested) new chats"
+        showStatus("\(chats) will show after Claude restarts.", banner: !hadSuggestion)
+      } else {
+        showStatus("Sync finished")
+      }
     } else if exitStatus != 0 || progress == "needs-attention" || result == nil {
       notify("Sync needs attention. Run claude-session-sync doctor for details.")
     }
@@ -449,16 +484,26 @@ private final class SessionSyncWatcher: NSObject {
     if ProcessInfo.processInfo.environment["CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS"] == "1" {
       return
     }
+    let offerRestart = restartSuggested > 0 && profile != nil
+    if message == lastMessage && !banner { return }
+    lastMessage = message
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       if self.statusItem == nil {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
       }
-      self.statusItem?.button?.title = message.contains("attention") ? "Sync !" : message.contains("finished") ? "Sync ✓" : "Sync"
+      self.statusItem?.button?.title = message.contains("attention") ? "Sync !" :
+        offerRestart ? "Sync ↻" : message.contains("finished") ? "Sync ✓" : "Sync"
       self.statusItem?.button?.toolTip = message
       let menu = NSMenu()
       let item = NSMenuItem(title: message, action: nil, keyEquivalent: "")
       menu.addItem(item)
+      if offerRestart {
+        let restart = NSMenuItem(title: "Restart Claude now", action: #selector(SessionSyncWatcher.restartClicked(_:)),
+          keyEquivalent: "")
+        restart.target = self
+        menu.addItem(restart)
+      }
       self.statusItem?.menu = menu
       guard banner else { return }
       self.noticeGeneration += 1
@@ -470,7 +515,7 @@ private final class SessionSyncWatcher: NSObject {
       panel.level = .floating
       panel.hidesOnDeactivate = false
       panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-      let label = NSTextField(wrappingLabelWithString: message)
+      let label = NSTextField(wrappingLabelWithString: offerRestart ? message + " Use the Sync menu to restart." : message)
       label.frame = NSRect(x: 18, y: 12, width: 334, height: 60)
       label.font = .systemFont(ofSize: 14)
       panel.contentView?.addSubview(label)
@@ -500,7 +545,9 @@ private final class SessionSyncWatcher: NSObject {
       "output": outputText, "state": exitStatus == 0 ? "ok" : "failed",
       "timestamp": ISO8601DateFormatter().string(from: Date()),
       "restart_phase": restartPhase,
-      "automatic_restart": accountURL != nil,
+      "restart_suggested": restartSuggested,
+      "automatic_restart": false,
+      "live_sync": accountURL != nil,
     ]
     do {
       let directory = statusURL.deletingLastPathComponent()
@@ -533,6 +580,8 @@ private final class SessionSyncWatcher: NSObject {
       guard let self = self else { return }
       if executableMatches || knownBundle || self.quittingPIDs.contains(pid) {
         self.quittingPIDs.remove(pid)
+        // Claude reads every folder again at start, so a restart suggestion is spent.
+        if !self.restartRequested { self.restartSuggested = 0 }
         self.requestAuto(afterQuit: true)
       }
     }

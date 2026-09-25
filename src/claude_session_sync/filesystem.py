@@ -135,6 +135,18 @@ def commit_staged(staged: PathLike, destination: PathLike) -> None:
     fsync_directory(destination_path.parent)
 
 
+def commit_staged_new(staged: PathLike, destination: PathLike) -> None:
+    """Publish a staged file under a name that must not exist yet.
+
+    A hard link fails when the name is taken, so a file Claude wrote meanwhile
+    is never overwritten. The staged name is removed by the caller.
+    """
+
+    destination_path = Path(destination)
+    os.link(os.fspath(staged), str(destination_path))
+    fsync_directory(destination_path.parent)
+
+
 def atomic_copy(source: PathLike, destination: PathLike) -> None:
     destination_path = Path(destination)
     staged = stage_copy(source, destination_path)

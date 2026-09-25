@@ -1351,7 +1351,7 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(1, len(fake.calls))
             self.assertTrue(fake.calls[0][0])
             desired = json.loads(fake.calls[0][1])
-            self.assertEqual("all-configured-profiles", desired["target_policy"])
+            self.assertEqual("logins", desired["target_policy"])
             self.assertTrue(desired["profiles"][1]["enabled"])
             self.assertTrue(desired["sync_sidebar_layout"])
             self.assertTrue(desired["sync_code_routines"])
@@ -1426,7 +1426,7 @@ class CliConfigureTests(unittest.TestCase):
                 ),
             )
             updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("all-configured-profiles", updated["target_policy"])
+            self.assertEqual("logins", updated["target_policy"])
             self.assertTrue(updated["acknowledge_cross_account_copy"])
             self.assertTrue(updated["acknowledge_cross_profile_copy"])
             self.assertTrue(updated["profiles"][1]["enabled"])

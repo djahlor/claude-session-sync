@@ -148,8 +148,10 @@ def _apply_config_options(
     changes = 0
 
     if automatic_targets:
+        # Sync every folder a real login uses, and let a new login join once
+        # Claude writes a chat there. Leftover folders are ignored.
         desired = {
-            "target_policy": "all-configured-profiles",
+            "target_policy": "logins",
             "acknowledge_cross_account_copy": True,
         }
         for key, value in desired.items():
@@ -218,7 +220,7 @@ def _config_summary(document: dict, changes: int) -> dict:
                 )
             ),
             "automatic_targets": int(
-                document.get("target_policy") == "all-configured-profiles"
+                document.get("target_policy") in ("all-configured-profiles", "logins")
             ),
             "layout_sync": int(document.get("sync_sidebar_layout") is True),
             "routine_sync": int(document.get("sync_code_routines") is True),

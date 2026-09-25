@@ -122,38 +122,27 @@ class WatcherTests(unittest.TestCase):
                 )
                 self.assertEqual("needs-attention", result["restart_phase"])
 
-    def test_account_change_quits_syncs_and_reopens_once(self):
-        """Exercise the real watcher and macOS quit event, not a mocked timer."""
-        self.account_change_scenario()
+    def test_account_change_syncs_without_quitting_claude(self):
+        """Exercise the real watcher: a switch triggers a sync, never a quit."""
+        self.live_scenario(change_account=True)
 
-    def test_failed_sync_does_not_reopen_or_repeat_after_helper_restart(self):
-        self.account_change_scenario(fail_sync=True)
+    def test_a_changed_sidebar_folder_triggers_a_sync(self):
+        self.live_scenario(touch_folder=True)
 
-    def test_transient_restart_check_retries_without_another_account_change(self):
-        self.account_change_scenario(fail_preflight_once=True)
+    def test_restart_suggestion_is_recorded_without_quitting(self):
+        self.live_scenario(suggest_restart=True)
 
-    def test_repeated_preflight_timeouts_stop_without_quitting_or_looping(self):
-        self.account_change_scenario(fail_preflight_always=True)
+    def test_restart_request_quits_syncs_and_reopens_once(self):
+        self.live_scenario(request_restart=True)
 
-    def test_preflight_budget_survives_replacement_between_failed_checks(self):
-        self.account_change_scenario(fail_preflight_always=True, restart_between_preflights=True)
+    def test_failed_restart_sync_does_not_reopen_or_repeat(self):
+        self.live_scenario(request_restart=True, fail_sync=True)
 
-    def test_last_preflight_is_consumed_before_a_crash_during_the_probe(self):
-        self.account_change_scenario(fail_preflight_always=True, restart_during_third_preflight=True)
+    def test_blocked_restart_check_leaves_claude_open(self):
+        self.live_scenario(request_restart=True, block_preflight=True)
 
-    def test_unsavable_preflight_budget_never_probes_or_quits(self):
-        self.account_change_scenario(fail_receipt_save=True)
-
-    def test_different_candidate_gets_its_own_budget_after_helper_replacement(self):
-        self.account_change_scenario(fail_preflight_always=True, replace_candidate_after_first=True)
-
-    def test_invalid_preflight_never_quits_or_retries(self):
-        self.account_change_scenario(block_preflight=True)
-
-    def account_change_scenario(self, fail_sync=False, fail_preflight_once=False,
-                                fail_preflight_always=False, block_preflight=False,
-                                restart_between_preflights=False, restart_during_third_preflight=False,
-                                fail_receipt_save=False, replace_candidate_after_first=False):
+    def live_scenario(self, change_account=False, touch_folder=False, suggest_restart=False,
+                      request_restart=False, fail_sync=False, block_preflight=False):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app = root / "SyncTest.app"
@@ -168,21 +157,15 @@ class WatcherTests(unittest.TestCase):
             }))
             account = root / "config.json"
             account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            folder = root / "claude-code-sessions" / "account" / "workspace"
+            folder.mkdir(parents=True)
             calls = root / "calls.jsonl"
             child = root / "child.py"
             child.write_text(
-                "import json, pathlib, subprocess, sys, time\n"
+                "import json, pathlib, subprocess, sys\n"
                 f"calls = pathlib.Path({str(calls)!r})\n"
                 "if sys.argv[1] == 'restart-check':\n"
-                " failure = calls.with_suffix('.preflight-failed')\n"
-                " checks = calls.with_suffix('.checks')\n"
-                " checks.write_text(str(int(checks.read_text()) + 1 if checks.exists() else 1))\n"
-                f" if {restart_during_third_preflight!r} and int(checks.read_text()) == 3:\n"
-                "  while not calls.with_suffix('.probe-release').exists(): time.sleep(0.05)\n"
                 f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
-                f" if {fail_preflight_always!r} or ({fail_preflight_once!r} and not failure.exists()):\n"
-                "  failure.touch()\n"
-                "  print(json.dumps({'state': 'failed', 'error_type': 'process-timeout', 'reason': 'process-inspection-timeout', 'next_action': 'retry-sync'})); raise SystemExit(1)\n"
                 f" result = subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], text=True, capture_output=True)\n"
                 " print(json.dumps({'state': 'ready', 'pids': [int(pid) for pid in result.stdout.split()]})); raise SystemExit(0)\n"
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -191,7 +174,7 @@ class WatcherTests(unittest.TestCase):
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention'}})); raise SystemExit(1)\n"
                 f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished'}))\n"
-                "else: print(json.dumps({'state': 'skipped', 'reason': 'app-running', 'progress': 'waiting-for-Claude'}))\n"
+                f"else: print(json.dumps({{'state': 'noop', 'progress': 'finished', 'restart_suggested': 2 if {suggest_restart!r} else 0}}))\n"
             )
             subprocess.run(["/usr/bin/open", str(app)], check=True)
             status = root / "watcher-status.json"
@@ -202,88 +185,61 @@ class WatcherTests(unittest.TestCase):
                 sys.executable, str(child),
             ]
             process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                deadline = time.monotonic() + 10
-                while not status.exists() and process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                self.assertIsNone(process.poll(), "watcher must support account-change detection")
-                self.assertTrue(status.exists())
-                receipt = root / "account-restart.json"
-                if fail_receipt_save:
-                    backup = root / "original-receipt.json"
-                    receipt.rename(backup)
-                    receipt.symlink_to(backup)
-                account.write_text('{"lastKnownAccountUuid":null,"secret":"must-not-be-copied"}')
-                time.sleep(2)
-                self.assertEqual(1, len(calls.read_text().splitlines()), "logout alone must not restart")
-                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
-                deadline = time.monotonic() + 30
-                replacements = 0
+
+            def entries():
+                return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+            def wait_for(condition, seconds):
+                deadline = time.monotonic() + seconds
                 while time.monotonic() < deadline:
-                    entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                    checks = calls.with_suffix('.checks')
-                    between_failures = (restart_between_preflights and replacements < 2 and checks.exists()
-                            and int(checks.read_text()) == replacements + 1
-                            and json.loads(status.read_text()).get("restart_phase") == "checking")
-                    during_probe = (restart_during_third_preflight and replacements == 0 and checks.exists()
-                                    and int(checks.read_text()) == 3)
-                    new_candidate = (replace_candidate_after_first and replacements == 0 and checks.exists()
-                                     and int(checks.read_text()) == 1
-                                     and json.loads(status.read_text()).get("restart_phase") == "checking")
-                    if between_failures or during_probe or new_candidate:
-                        state = json.loads(receipt.read_text())
-                        self.assertEqual({"account_hash", "phase", "candidate_hash", "preflight_attempts", "retry_not_before"}, set(state))
-                        self.assertEqual("checking", state["phase"])
-                        self.assertEqual(int(checks.read_text()), state["preflight_attempts"])
-                        self.assertRegex(state["candidate_hash"], r"^[0-9a-f]{64}$")
-                        self.assertNotEqual(state["account_hash"], state["candidate_hash"])
-                        self.assertLessEqual(state["retry_not_before"], time.time() + 6)
-                        self.assertGreater(state["retry_not_before"], 0)
-                        self.assertNotIn(json.loads(account.read_text())["lastKnownAccountUuid"], receipt.read_text())
-                        process.terminate()
-                        process.communicate(timeout=5)
-                        if new_candidate:
-                            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
-                        if during_probe:
-                            calls.with_suffix('.probe-release').touch()
-                        process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                        replacements += 1
-                    if any(item[0] == "switch" for item in entries) or json.loads(status.read_text()).get("restart_phase") == "needs-attention":
-                        break
+                    if condition():
+                        return True
                     time.sleep(0.1)
-                if restart_between_preflights:
-                    self.assertEqual(2, replacements, "replace the helper after each of its first two failed checks")
-                if restart_during_third_preflight:
-                    self.assertEqual(1, replacements, "replace the helper while its last check is still running")
-                if replace_candidate_after_first:
-                    self.assertEqual(1, replacements, "a different candidate must be present when the helper restarts")
-                detail = (status.read_text(), receipt.read_text() if receipt.exists() else "no restart receipt", entries)
-                expected_switches = 0 if fail_preflight_always or block_preflight or fail_receipt_save else 1
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "account change must quit and hand off to sync-and-launch: " + repr(detail))
-                if not expected_switches:
-                    self.assertEqual(0, subprocess.run(['/usr/bin/pgrep', '-f', str(executable)], stdout=subprocess.DEVNULL).returncode, "failed preflight must leave the app running")
-                time.sleep(4)
-                entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "reopen must not create a restart loop")
-                phase = "needs-attention" if fail_sync or not expected_switches else "finished"
-                self.assertEqual(phase, json.loads(status.read_text())["restart_phase"])
-                state = json.loads(receipt.read_text())
-                self.assertEqual({"account_hash", "phase"}, set(state))
-                self.assertNotIn("must-not-be-copied", receipt.read_text())
-                process.terminate()
-                process.communicate(timeout=5)
-                process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                time.sleep(5)
-                entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "helper restart must preserve the once-only guard")
-                self.assertEqual("ready" if fail_receipt_save else phase, json.loads(receipt.read_text())["phase"])
-                expected_checks = 0 if fail_receipt_save else 3 if fail_preflight_always else 2 if fail_preflight_once else 1
-                if replace_candidate_after_first:
-                    expected_checks += 1
-                actual_checks = int(checks.read_text()) if checks.exists() else 0
-                self.assertEqual(expected_checks, actual_checks, "preflight retries must be bounded across helper restarts")
+                return False
+
+            def app_running():
+                return subprocess.run(['/usr/bin/pgrep', '-f', str(executable)], stdout=subprocess.DEVNULL).returncode == 0
+
+            try:
+                self.assertTrue(wait_for(lambda: status.exists() and len(entries()) >= 1, 10), "startup sync")
+                self.assertIsNone(process.poll())
+                self.assertEqual(["auto", "--json"], entries()[0])
+                if change_account:
+                    account.write_text('{"lastKnownAccountUuid":null,"secret":"must-not-be-copied"}')
+                    time.sleep(2)
+                    self.assertEqual(1, len(entries()), "logout alone must not sync")
+                    account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 10), "a switch must trigger a sync")
+                    self.assertTrue(app_running(), "a switch must never quit Claude")
+                    self.assertNotIn("must-not-be-copied", (root / "account-restart.json").read_text())
+                if touch_folder:
+                    time.sleep(1)
+                    (folder / "local_new.json").write_text("{}")
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a folder change must trigger a sync")
+                if suggest_restart:
+                    self.assertTrue(wait_for(lambda: json.loads(status.read_text()).get("restart_suggested") == 2, 5))
+                    time.sleep(2)
+                    self.assertTrue(app_running(), "a suggestion must never quit Claude")
+                if request_restart:
+                    (root / "restart-request").touch()
+                    finished = wait_for(
+                        lambda: any(item[0] == "switch" for item in entries())
+                        or json.loads(status.read_text()).get("restart_phase") == "needs-attention",
+                        30,
+                    )
+                    self.assertTrue(finished, "the restart request must be handled")
+                    expected = 0 if block_preflight else 1
+                    time.sleep(4)
+                    self.assertEqual(expected, sum(item[0] == "switch" for item in entries()))
+                    self.assertFalse((root / "restart-request").exists())
+                    phase = json.loads(status.read_text())["restart_phase"]
+                    self.assertEqual("needs-attention" if fail_sync or block_preflight else "finished", phase)
+                    if block_preflight:
+                        self.assertTrue(app_running(), "a blocked check must leave Claude open")
+                    elif not fail_sync:
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen after the sync")
+                self.assertTrue(all(item[0] != "switch" for item in entries()) or request_restart)
             finally:
-                calls.with_suffix('.probe-release').touch()
                 if process.poll() is None:
                     process.terminate()
                 process.communicate(timeout=5)

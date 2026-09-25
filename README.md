@@ -31,28 +31,36 @@ Tools, Apple's build tools.
 
 The installer adds a background helper and a small **Sync** menu-bar item.
 It does not replace the Claude app.
-New accounts you sign into on this Mac join the sync automatically.
+A new account joins the sync once you start a chat in it.
 
 ## Switch accounts
 
 1. Sign out of Claude.
 2. Sign in to the other account.
-3. Wait. In automatic mode, the helper detects the new account, quits Claude
-   once, syncs, and reopens it. Do not start a new task during that short restart.
+3. Keep working. Chats sync in the background while Claude is open, so the
+   other account's sidebar is already up to date.
+
+If chats arrive after Claude loaded the new account, the **Sync** menu says how
+many and offers **Restart Claude now**. Claude never restarts on its own.
 
 A small status window shows what is happening, even if macOS hides notifications.
-The **Sync** menu keeps the latest status. Larger histories take longer.
+The **Sync** menu keeps the latest status.
 
-Safe mode still needs a manual quit. If automatic restart needs attention,
-quit Claude, wait for **Sync finished**, then reopen it. The helper never
-force-kills Claude or keeps retrying a failed restart.
-Temporary account-check timeouts retry automatically, up to three checks, before
-Claude is closed. If they all fail, Claude stays open and the status explains why.
+## How it picks the right copy
+
+- The copy that changed since the last sync wins. A click never counts.
+- If both changed, the one with the latest real activity wins.
+- If that is a tie, the chat is left alone and the status says so.
+- Deleted chats stay deleted.
+- Only folders of accounts you really use take part. Leftover folders from an
+  old Mac are ignored.
+
+Pins, groups, and routines still sync when Claude quits.
 
 ## Update
 
 Quit Claude, download a fresh ZIP, and run the installer again. Choose **1**
-to enable automatic account-switch restart. No separate Claude app is needed.
+for automatic sync. No separate Claude app is needed.
 
 ## If something goes wrong
 

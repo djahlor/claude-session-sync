@@ -118,7 +118,10 @@ def run_adapters(
             continue
         try:
             if running():
-                result = {"state": "skipped", "reason": "app-running"}
+                # Claude locks these stores while it runs. They sync when it
+                # quits; the last real status stays on disk until then.
+                results[name] = {"state": "deferred", "reason": "app-running"}
+                continue
             else:
                 adapter = getattr(dependencies, factory)(config)
                 if probe_only:
@@ -168,6 +171,6 @@ def adapter_failure(config, name: str) -> int:
         if name == key and getattr(config, flag):
             return int(
                 read_status(config.state_dir, filename).get("state")
-                not in ("synced", "noop")
+                not in ("synced", "noop", "unknown")
             )
     return 0

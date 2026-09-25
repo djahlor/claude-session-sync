@@ -2,13 +2,27 @@
 
 import hashlib
 import os
+import re
+import stat
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from .config import Config
-from . import strict_json as json
+from .fingerprint import fingerprint, normalisation
 from .hash_cache import HashCache
-from .model import Discovery, InvalidReplica, Replica, Target
+from .model import Discovery, InvalidReplica, Marker, Replica, Target, TmpFile
+
+
+# Claude's own filters: local_<id>.json records, their .tmp saves, deleted_<id> markers.
+SESSION_ID = r"[A-Za-z0-9_-]+"
+RECORD_NAME = re.compile(r"^local_(%s)\.json$" % SESSION_ID)
+TMP_NAME = re.compile(r"^local_(%s)\.json\.tmp$" % SESSION_ID)
+MARKER_NAME = re.compile(r"^deleted_(%s)$" % SESSION_ID)
+# Two saves inside one timestamp tick can share metadata, so a file this fresh
+# is never trusted to match its cache entry.
+RACY_WINDOW_NS = 2_000_000_000
+MAX_MARKER_BYTES = 64
 
 
 def _stat_signature(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
@@ -21,19 +35,45 @@ def _stat_signature(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
 
 
 class SessionStore:
-    def __init__(self, hash_cache: Optional[HashCache] = None) -> None:
+    def __init__(
+        self,
+        hash_cache: Optional[HashCache] = None,
+        clock_ns: Callable[[], int] = time.time_ns,
+    ) -> None:
         self._hash_cache = hash_cache
+        self._clock_ns = clock_ns
 
     def discover(self, config: Config) -> Discovery:
         discovery = self.discover_targets(config)
-        replicas: List[Replica] = []
-        invalid = list(discovery.invalid_replicas)
-        for target in discovery.targets:
-            self._discover_target(target, replicas, invalid)
+        scanned = self.scan_targets(discovery.targets)
         return Discovery(
             discovery.targets,
+            scanned.replicas,
+            tuple(
+                sorted(
+                    discovery.invalid_replicas + scanned.invalid_replicas,
+                    key=lambda item: str(item.path),
+                )
+            ),
+            scanned.markers,
+            scanned.tmps,
+        )
+
+    def scan_targets(self, targets: Sequence[Target]) -> Discovery:
+        """Read records, delete markers and temp saves in the given folders only."""
+
+        replicas: List[Replica] = []
+        markers: List[Marker] = []
+        tmps: List[TmpFile] = []
+        invalid: List[InvalidReplica] = []
+        for target in targets:
+            self._discover_target(target, replicas, markers, tmps, invalid)
+        return Discovery(
+            tuple(sorted(targets, key=_target_key)),
             tuple(sorted(replicas, key=_replica_key)),
             tuple(sorted(invalid, key=lambda item: str(item.path))),
+            tuple(sorted(markers, key=_replica_key)),
+            tuple(sorted(tmps, key=_replica_key)),
         )
 
     def discover_targets(self, config: Config) -> Discovery:
@@ -123,6 +163,8 @@ class SessionStore:
         self,
         target: Target,
         replicas: List[Replica],
+        markers: List[Marker],
+        tmps: List[TmpFile],
         invalid: List[InvalidReplica],
     ) -> None:
         try:
@@ -132,93 +174,148 @@ class SessionStore:
                 InvalidReplica(target.path, "cannot scan target: {}".format(error))
             )
             return
+        started_ns = self._clock_ns()
         for entry in entries:
             path = Path(entry.path)
+            record = RECORD_NAME.match(entry.name)
+            tmp = TMP_NAME.match(entry.name)
+            marker = MARKER_NAME.match(entry.name)
+            if not (record or tmp or marker):
+                continue
             if entry.is_symlink():
                 invalid.append(InvalidReplica(path, "symlink is not allowed"))
                 continue
-            if not entry.name.startswith("local_") or not entry.name.endswith(".json"):
+            try:
+                before = path.lstat()
+            except FileNotFoundError:
+                continue  # Claude renamed or removed it under the scan
+            except OSError as error:
+                invalid.append(InvalidReplica(path, "cannot inspect: {}".format(error)))
                 continue
-            if not entry.is_file(follow_symlinks=False):
+            if not stat.S_ISREG(before.st_mode):
                 invalid.append(InvalidReplica(path, "replica is not a regular file"))
                 continue
-            session_id = entry.name[len("local_") : -len(".json")]
-            if not session_id:
-                invalid.append(
-                    InvalidReplica(path, "replica filename has no session id")
+            if record:
+                replica = self._read_replica(
+                    path, target, record.group(1), before, started_ns
                 )
-                continue
-            replica = self._read_replica(path, target, session_id, invalid)
-            if replica is not None:
-                replicas.append(replica)
+                if replica is not None:
+                    replicas.append(replica)
+            elif tmp:
+                read = _read_small(path, before, limit=None)
+                if read is not None:
+                    raw, after = read
+                    tmps.append(
+                        TmpFile(
+                            tmp.group(1),
+                            target,
+                            path,
+                            after.st_size,
+                            after.st_mtime_ns,
+                            hashlib.sha256(raw).hexdigest(),
+                        )
+                    )
+            else:
+                read = _read_small(path, before, limit=MAX_MARKER_BYTES)
+                if read is None:
+                    continue
+                raw, after = read
+                deleted_at = self._delete_time(raw, after)
+                markers.append(
+                    Marker(
+                        marker.group(1),
+                        target,
+                        path,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        hashlib.sha256(raw).hexdigest(),
+                        deleted_at,
+                    )
+                )
+
+    def _delete_time(self, raw: bytes, metadata: os.stat_result) -> int:
+        """The marker's content, unless unusable or in the future; then the file's own time."""
+
+        now_ms = self._clock_ns() // 1_000_000
+        try:
+            claimed = int(raw.decode("ascii").strip())
+        except (UnicodeError, ValueError):
+            claimed = -1
+        if 0 <= claimed <= now_ms:
+            return claimed
+        return min(metadata.st_mtime_ns // 1_000_000, now_ms)
 
     def _read_replica(
         self,
         path: Path,
         target: Target,
         session_id: str,
-        invalid: List[InvalidReplica],
+        before: os.stat_result,
+        started_ns: int,
     ) -> Optional[Replica]:
-        try:
-            before = path.lstat()
-            if self._hash_cache is not None:
-                cached_digest = self._hash_cache.lookup_validated(
-                    path, before, session_id
+        """None means the file is gone. A file that cannot be read is unreadable, never absent."""
+
+        name = normalisation()
+        settled = started_ns - before.st_mtime_ns >= RACY_WINDOW_NS
+        if self._hash_cache is not None and settled:
+            cached = self._hash_cache.lookup_record(path, before, session_id, name)
+            if cached is not None:
+                digest, state_hash, activity = cached
+                return self._replica(
+                    session_id, target, path, before, digest, state_hash, activity
                 )
-                if cached_digest is not None:
-                    after_lookup = path.lstat()
-                    if _stat_signature(before) != _stat_signature(after_lookup):
-                        invalid.append(
-                            InvalidReplica(path, "replica changed during discovery")
-                        )
-                        return None
-                    return Replica(
-                        session_id,
-                        target,
-                        path,
-                        after_lookup.st_size,
-                        after_lookup.st_mtime_ns,
-                        cached_digest,
-                    )
+        try:
             raw = path.read_bytes()
             after = path.lstat()
-        except OSError as error:
-            invalid.append(
-                InvalidReplica(path, "cannot read replica: {}".format(error))
-            )
+        except FileNotFoundError:
             return None
-        if (
-            _stat_signature(before) != _stat_signature(after)
-            or len(raw) != after.st_size
-        ):
-            invalid.append(InvalidReplica(path, "replica changed during discovery"))
-            return None
-        try:
-            document = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            invalid.append(InvalidReplica(path, "malformed JSON: {}".format(error)))
-            return None
-        if not isinstance(document, dict) or not document:
-            invalid.append(
-                InvalidReplica(path, "session JSON must be a non-empty object")
-            )
-            return None
-        document_session_id = document.get("sessionId")
-        if not isinstance(document_session_id, str) or not document_session_id:
-            invalid.append(InvalidReplica(path, "sessionId must be a non-empty string"))
-            return None
-        try:
-            digest = hashlib.sha256(raw).hexdigest()
-            if self._hash_cache is not None:
-                self._hash_cache.store_validated(path, after, session_id, digest)
-        except OSError as error:
-            invalid.append(
-                InvalidReplica(path, "cannot hash replica: {}".format(error))
-            )
-            return None
-        return Replica(
-            session_id, target, path, after.st_size, after.st_mtime_ns, digest
+        except OSError:
+            return Replica(session_id, target, path, before.st_size, before.st_mtime_ns, "")
+        if _stat_signature(before) != _stat_signature(after) or len(raw) != after.st_size:
+            # Claude saved it while it was read. Judge it next run, not now.
+            return Replica(session_id, target, path, after.st_size, after.st_mtime_ns, "")
+        copy = fingerprint(session_id, raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        if copy.readable and self._hash_cache is not None:
+            try:
+                self._hash_cache.store_record(
+                    path, after, session_id, digest, copy.state_hash,
+                    copy.last_activity_at, name,
+                )
+            except OSError:
+                pass  # the cache is disposable; the verdict above still stands
+        return self._replica(
+            session_id, target, path, after, digest, copy.state_hash, copy.last_activity_at
         )
+
+    def _replica(self, session_id, target, path, metadata, digest, state_hash, activity):
+        # Read the clock after the file: Claude stamps a busy session with the
+        # current time, so a save during the scan must not look like the future.
+        future = state_hash is not None and activity > self._clock_ns() // 1_000_000
+        return Replica(
+            session_id,
+            target,
+            path,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            digest,
+            state_hash,
+            activity,
+            future,
+        )
+
+
+def _read_small(path: Path, before: os.stat_result, limit: Optional[int]):
+    if limit is not None and before.st_size > limit:
+        return None
+    try:
+        raw = path.read_bytes()
+        after = path.lstat()
+    except OSError:
+        return None
+    if _stat_signature(before) != _stat_signature(after) or len(raw) != after.st_size:
+        return None
+    return raw, after
 
 
 def _target_key(target: Target) -> Tuple[str, str, str]:

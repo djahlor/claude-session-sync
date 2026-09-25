@@ -37,7 +37,7 @@ class StoreTests(unittest.TestCase):
         directory = data_root / "claude-code-sessions" / account / workspace
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "local_{}.json".format(session_id)
-        payload = {"sessionId": session_id}
+        payload = {"sessionId": "local_" + session_id}
         if isinstance(extra, dict):
             payload.update(extra)
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -70,7 +70,7 @@ class StoreTests(unittest.TestCase):
                 ],
             )
 
-    def test_malformed_nonobject_mismatched_and_symlink_replicas_are_invalid(
+    def test_unreadable_records_are_left_alone_and_symlinks_block(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -99,29 +99,22 @@ class StoreTests(unittest.TestCase):
 
             discovery = SessionStore().discover(config)
 
+            # A record Claude would not accept freezes only its own chat.
+            readable = {
+                replica.session_id: replica.state_hash is not None
+                for replica in discovery.replicas
+            }
             self.assertEqual(
-                ["valid"], [replica.session_id for replica in discovery.replicas]
+                {"array": False, "bad-json": False, "valid": True, "wrong": False},
+                readable,
             )
             self.assertEqual(
-                [
-                    "local_array.json",
-                    "local_bad-json.json",
-                    "local_link.json",
-                    "local_wrong.json",
-                ],
+                ["local_link.json"],
                 [invalid.path.name for invalid in discovery.invalid_replicas],
             )
-            self.assertTrue(
-                any("symlink" in item.reason for item in discovery.invalid_replicas)
-            )
-            self.assertTrue(
-                any(
-                    "non-empty string" in item.reason
-                    for item in discovery.invalid_replicas
-                )
-            )
+            self.assertIn("symlink", discovery.invalid_replicas[0].reason)
 
-    def test_filename_registry_id_may_differ_from_json_session_id(self) -> None:
+    def test_a_record_naming_another_session_is_left_alone(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
@@ -144,6 +137,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(
                 ["registry-id"], [item.session_id for item in discovery.replicas]
             )
+            self.assertIsNone(discovery.replicas[0].state_hash)
             self.assertEqual((), discovery.invalid_replicas)
 
 
@@ -163,9 +157,11 @@ class HashCacheTests(unittest.TestCase):
             root = Path(directory)
             store_tests = StoreTests()
             config = store_tests.config(root)
-            store_tests.write_session(
+            written = store_tests.write_session(
                 root / "standard", "account", "workspace", "cached"
             )
+            # A file saved in the last two seconds is always read again.
+            os.utime(written, ns=(1_000_000_000, 1_000_000_000))
             cache = HashCache(root / "state" / "hashes.sqlite3")
             store = SessionStore(cache)
             first = store.discover(config)

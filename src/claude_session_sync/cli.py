@@ -98,6 +98,15 @@ class CliDependencies:
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
     launch_confirmation_timeout: float = LAUNCH_CONFIRMATION_TIMEOUT_SECONDS
+    # Live sync needs the built-in planner, which knows the chat state and
+    # which folders a running Claude holds. None means: use it when it is built in.
+    live_sync: Optional[bool] = None
+
+
+def _live_sync(deps: "CliDependencies") -> bool:
+    if deps.live_sync is not None:
+        return deps.live_sync
+    return deps.planner_factory is _default_planner_factory
 
 
 def _nonnegative_seconds(value: str) -> float:
@@ -128,8 +137,19 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     plan = commands.add_parser("plan", help="inspect the next synchronization")
     plan.add_argument("--json", action="store_true", dest="as_json")
+    plan.add_argument(
+        "--report",
+        action="store_true",
+        help="write every planned action to plan-report.json in the private state folder",
+    )
     sync = commands.add_parser("sync", help="apply the next synchronization")
     sync.add_argument("--json", action="store_true", dest="as_json")
+    sync.add_argument(
+        "--prefer",
+        metavar="FOLDER",
+        help="settle tied chats in favour of one sidebar folder (ACCOUNT/WORKSPACE)",
+    )
+    sync.add_argument("--session", metavar="ID", help="limit --prefer to one chat")
     sidebar_mode = sync.add_mutually_exclusive_group()
     sidebar_mode.add_argument(
         "--prefer-current-sidebar", action="store_true",
@@ -160,6 +180,23 @@ def _parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="wait up to SECONDS for a managed Claude process to exit",
     )
+    seed = commands.add_parser(
+        "seed-state",
+        help="start from the last synced version held in folders outside sync",
+    )
+    seed.add_argument("--from-unenrolled", action="store_true", required=True)
+    seed_mode = seed.add_mutually_exclusive_group(required=True)
+    seed_mode.add_argument("--dry-run", action="store_true")
+    seed_mode.add_argument("--apply", action="store_true")
+    commands.add_parser(
+        "restart-claude",
+        help="ask the Sync helper to quit, sync, and reopen Claude once",
+    )
+    forget = commands.add_parser(
+        "forget-lost",
+        help="let the next sync put back one chat reported as lost",
+    )
+    forget.add_argument("session_id")
     rollback = commands.add_parser("rollback", help="restore an earlier run")
     rollback.add_argument("run_id")
     rollback.add_argument("--json", action="store_true", dest="as_json")
@@ -523,6 +560,17 @@ def _clear_launch_guard_command(
 def _switch_chat_result(
     config: Config, dependencies: CliDependencies, started: float
 ) -> dict:
+    if _live_sync(dependencies):
+        writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
+        while True:
+            try:
+                return _live_chat_payload(None, config, dependencies)
+            except Exception as error:
+                remaining = writer_deadline - dependencies.monotonic()
+                if _busy_reason(error) == "busy" and remaining > 0:
+                    dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
+                    continue
+                return _chat_failure(error)
     try:
         planner = dependencies.planner_factory(config)
         engine = dependencies.engine_factory(config)
@@ -704,9 +752,134 @@ def _chat_failure(error: Exception) -> dict:
     }
 
 
+def _chat_run_summary(run: Any, duration_ms: int) -> dict:
+    plan = run.plan
+    if plan.invalid_replicas or run.receipt is None:
+        return _chat_plan_summary(run, duration_ms)
+    receipt = run.receipt
+    counts = {
+        "operations": receipt.operation_count,
+        "planned": len(plan.operations),
+        "skipped": receipt.skipped_count,
+    }
+    counts.update(_problem_counts(run))
+    payload = {
+        "bytes": receipt.bytes_copied,
+        "counts": counts,
+        "duration_ms": duration_ms,
+        "plan_id": receipt.plan_id,
+        "run_id": receipt.run_id,
+        "state": receipt.status,
+    }
+    if run.restart_suggested:
+        payload["restart_suggested"] = run.restart_suggested
+    if any(run.problems.get(kind) for kind in ("tied", "lost", "unreadable", "future")):
+        payload["next_action"] = "run-plan-report"
+    return payload
+
+
+def _chat_plan_summary(run: Any, duration_ms: int) -> dict:
+    plan = run.plan
+    payload = _plan_summary(plan, duration_ms)
+    counts = payload["counts"]
+    for kind in ("create", "replace", "retire"):
+        counts[kind + "s"] = sum(1 for operation in plan.operations if operation.kind == kind)
+    counts.update(_problem_counts(run))
+    if run.restart_suggested:
+        payload["restart_suggested"] = run.restart_suggested
+    return payload
+
+
+def _problem_counts(run: Any) -> dict:
+    counts = {
+        kind: run.problems[kind]
+        for kind in ("live", "tied", "lost", "unreadable", "future")
+        if run.problems.get(kind)
+    }
+    if run.plan.ignored_targets:
+        counts["ignored_folders"] = run.plan.ignored_targets
+    if run.newly_enrolled:
+        counts["new_folders"] = run.newly_enrolled
+    return counts
+
+
+def _folder_label(path: Path) -> str:
+    return "{}/{}".format(path.parent.name[:8], path.name[:8])
+
+
+def _write_plan_report(config: Config, run: Any) -> None:
+    """Every planned action and every chat left alone, for a human to review.
+
+    Session ids and short folder labels only: no titles, paths or contents.
+    """
+
+    from datetime import datetime, timezone
+
+    from .adapters import save_status
+
+    plan = run.plan
+    context = plan.context
+    labels = {}
+    if context is not None:
+        labels = {key: _folder_label(target.path) for key, target in context.targets.items()}
+    save_status(
+        config.state_dir,
+        "plan-report.json",
+        {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actions": [
+                {
+                    "kind": operation.kind,
+                    "artifact": operation.artifact,
+                    "session": operation.session_id,
+                    "from": _folder_label(Path(operation.source).parent),
+                    "to": _folder_label(Path(operation.destination).parent),
+                }
+                for operation in plan.operations
+            ],
+            "left_alone": [
+                {
+                    "kind": problem.kind,
+                    "session": problem.session_id,
+                    "folder": labels.get(problem.partition, "?"),
+                }
+                for problem in plan.problems
+            ],
+            "live_folders": sorted(labels.get(key, "?") for key in plan.live_targets),
+            "ignored_folders": plan.ignored_targets,
+        },
+    )
+
+
+def _live_chat_payload(arguments: Any, config: Config, deps: CliDependencies) -> dict:
+    from .chat_sync import ChatStateError, run_chat_sync
+
+    started = deps.clock()
+    try:
+        chat_run = run_chat_sync(
+            config,
+            deps.planner_factory(config),
+            deps.engine_factory(config),
+            prefer=getattr(arguments, "prefer", None),
+            prefer_session=getattr(arguments, "session", None),
+            running_processes=lambda loaded: _running_processes(loaded, deps),
+        )
+    except ChatStateError:
+        return {
+            "state": "failed",
+            "reason": "state-unusable",
+            "next_action": "run-doctor",
+            "error_type": "chat-state-error",
+        }
+    return _chat_run_summary(chat_run, round((deps.clock() - started) * 1000))
+
+
 def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) -> int:
     from .locking import ExclusiveFileLock, LockUnavailableError
 
+    live = _live_sync(deps)
+    if not live and getattr(arguments, "prefer", None) is not None:
+        raise ValueError("--prefer needs the built-in planner")
     handoff = ExclusiveFileLock(
         config.state_dir / "switch-handoff.lock", mode="auto", timeout=0
     )
@@ -737,7 +910,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         except subprocess.TimeoutExpired as error:
             _write(_chat_failure(error), as_json=arguments.as_json, stream=output)
             return 1
-        if running:
+        if running and not live:
             record_progress(config, "waiting-for-Claude")
             _write(
                 {
@@ -752,16 +925,19 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         record_progress(config, "syncing")
         started = deps.clock()
         try:
-            plan = deps.planner_factory(config).plan(SyncRequest(config))
-            if arguments.command == "sync":
-                deps.clock()
-            if _plan_state(plan).startswith("blocked_"):
-                payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
+            if live:
+                payload = _live_chat_payload(arguments, config, deps)
             else:
-                receipt = deps.engine_factory(config).apply(plan)
-                payload = _receipt_summary(
-                    receipt, round((deps.clock() - started) * 1000)
-                )
+                plan = deps.planner_factory(config).plan(SyncRequest(config))
+                if arguments.command == "sync":
+                    deps.clock()
+                if _plan_state(plan).startswith("blocked_"):
+                    payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
+                else:
+                    receipt = deps.engine_factory(config).apply(plan)
+                    payload = _receipt_summary(
+                        receipt, round((deps.clock() - started) * 1000)
+                    )
         except Exception as error:
             reason = _busy_reason(error)
             if reason is not None:
@@ -905,7 +1081,10 @@ def run(
             )
         if arguments.command == "restart-check":
             profile = _find_profile(config, arguments.profile)
-            if not profile.is_default or config.target_policy != "all-configured-profiles":
+            if not profile.is_default or config.target_policy not in (
+                "all-configured-profiles",
+                "logins",
+            ):
                 raise ValueError("automatic restart is enabled only for the default profile in automatic mode")
             try:
                 processes = _running_processes(config, deps)
@@ -919,14 +1098,53 @@ def run(
             return 0
         if arguments.command == "plan":
             started = deps.clock()
-            plan = deps.planner_factory(config).plan(SyncRequest(config))
-            duration_ms = round((deps.clock() - started) * 1000)
+            if _live_sync(deps):
+                from .chat_sync import plan_chat_sync
+
+                chat_run = plan_chat_sync(
+                    config,
+                    deps.planner_factory(config),
+                    running_processes=lambda loaded: _running_processes(loaded, deps),
+                )
+                plan = chat_run.plan
+                if arguments.report:
+                    _write_plan_report(config, chat_run)
+                payload = _chat_plan_summary(
+                    chat_run, round((deps.clock() - started) * 1000)
+                )
+            else:
+                plan = deps.planner_factory(config).plan(SyncRequest(config))
+                payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
+            _write(payload, as_json=arguments.as_json, stream=output)
+            return 0 if _plan_state(plan) in ("planned", "noop") else 1
+        if arguments.command == "seed-state":
+            from .seeding import seed_from_unenrolled
+
             _write(
-                _plan_summary(plan, duration_ms),
-                as_json=arguments.as_json,
+                seed_from_unenrolled(config, apply=arguments.apply),
+                as_json=False,
                 stream=output,
             )
-            return 0 if _plan_state(plan) in ("planned", "noop") else 1
+            return 0
+        if arguments.command == "restart-claude":
+            from .filesystem import atomic_write_bytes, ensure_private_directory
+
+            ensure_private_directory(config.state_dir)
+            request = config.state_dir / "restart-request"
+            atomic_write_bytes(request, b"restart\n")
+            os.chmod(str(request), 0o600)
+            _write({"state": "requested"}, as_json=False, stream=output)
+            return 0
+        if arguments.command == "forget-lost":
+            from .chat_sync import forget_seen
+
+            folders = forget_seen(config, arguments.session_id)
+            _write(
+                {"state": "forgotten" if folders else "noop", "counts": {"folders": folders}},
+                as_json=False,
+                stream=output,
+            )
+            return 0
         if arguments.command in ("sync", "auto"):
             return _run_sync(arguments, config, deps, output)
         if arguments.command == "switch":
@@ -959,6 +1177,7 @@ def run(
             progress = current_progress(
                 config,
                 app_running=bool(running),
+                live=_live_sync(deps),
                 failures=watcher_error
                 + launch_guard_failure
                 + layout_failure

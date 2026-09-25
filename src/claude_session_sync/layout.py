@@ -1194,19 +1194,11 @@ class LayoutSynchronizer:
         discovery = SessionStore().discover_targets(self.config)
         if discovery.invalid_replicas:
             raise LayoutError("Claude session storage has an unknown layout")
-        approved = {
-            (target.account_id, target.workspace_id)
-            for target in self.config.approved_targets
-            if target.profile_name == profile_name
-        }
+        from .enrollment import selected_targets
+
         targets = {}
-        for target in discovery.targets:
+        for target in selected_targets(self.config, discovery.targets):
             if target.profile_name != profile_name:
-                continue
-            if (
-                self.config.target_policy == "approved-only"
-                and (target.account_id, target.workspace_id) not in approved
-            ):
                 continue
             sessions = set()
             for replica in target.path.iterdir():
