@@ -20,6 +20,8 @@ from claude_session_sync.layout import (
     LayoutRecoveryError,
     LayoutSnapshot,
     LayoutSynchronizer,
+    _decode_record,
+    _encode_record,
     same_recovery_payload,
     transform_layout_records,
 )
@@ -79,6 +81,218 @@ def records(scopes, *, active=None, pins=None, extra=None):
 
 
 class LayoutTransformTests(unittest.TestCase):
+    def test_chromium_string_encodings_round_trip_emoji_and_latin_one(self):
+        document = {"groups": ["Focus 🚀", "Café"]}
+        utf16 = b"\x00" + json.dumps(
+            document, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-16-le")
+        latin1 = b"\x01" + json.dumps(
+            {"group": "Café"}, ensure_ascii=False, separators=(",", ":")
+        ).encode("latin-1")
+
+        self.assertEqual(document, _decode_record(utf16, "utf16"))
+        self.assertEqual({"group": "Café"}, _decode_record(latin1, "latin1"))
+        encoded_document = _encode_record(document)
+        self.assertEqual(b"\x01", encoded_document[:1])
+        self.assertTrue(all(byte < 128 for byte in encoded_document[1:]))
+        self.assertEqual(document, _decode_record(encoded_document, "round trip"))
+
+    def test_chromium_string_decoder_rejects_malformed_values(self):
+        malformed = (
+            b"",
+            b"\x02{}",
+            b"\x00{",
+            b"\x00" + b"{\x00",
+            b"\x01not-json",
+        )
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(LayoutError):
+                _decode_record(value, "record")
+
+    def test_stale_order_entries_are_filtered_without_changing_assignments(self):
+        current_scope = scope(
+            "Focus",
+            "Backlog",
+            assignments={
+                "code:keep-one": "id-focus",
+                "code:keep-two": "id-focus",
+                "code:moved": "id-backlog",
+                "code:backlog": "id-backlog",
+            },
+        )
+        current_scope["order"] = {
+            "id-focus": [
+                "code:keep-two",
+                "code:moved",
+                "code:missing",
+                "code:keep-one",
+            ],
+            "id-backlog": ["code:backlog"],
+        }
+        result = transform_layout_records(
+            records({"a/w": current_scope}, active="a/w"),
+            {"a/w": set(current_scope["assignments"])},
+            timestamp_ms=10,
+        )
+        transformed = decoded(result.records[DFRAME_STORE_KEY])["state"][
+            "customGroupsByScope"
+        ]["a/w"]
+
+        self.assertEqual(current_scope["assignments"], transformed["assignments"])
+        self.assertEqual(
+            ["code:keep-two", "code:keep-one"], transformed["order"]["id-focus"]
+        )
+        self.assertEqual(
+            ["code:backlog", "code:moved"],
+            transformed["order"]["id-backlog"],
+        )
+
+    def test_adopt_current_sidebar_preserves_source_and_seeds_future_scopes(self):
+        source = scope(
+            "Focus 🚀",
+            "Backlog",
+            assignments={
+                "code:keep": "id-focus 🚀",
+                "code:moved": "id-backlog",
+                "code:dangling": "id-focus 🚀",
+            },
+        )
+        source["groups"][0]["color"] = "violet"
+        source["scopeStatus"] = {"attention": "keep"}
+        source["order"] = {
+            "id-focus 🚀": ["code:keep", "code:moved", "code:dangling"],
+            "id-backlog": ["code:moved"],
+        }
+        old_target = scope("Old")
+        old_target["targetStatus"] = "keep"
+        historical = scope("Stale")
+        current = records(
+            {"a/w": source, "b/w": old_target, "history/w": historical},
+            active="a/w",
+            pins=["code:keep"],
+            extra={"attention": "preserve"},
+        )
+        targets = {
+            "a/w": {"code:keep", "code:moved"},
+            "b/w": {"code:keep", "code:moved"},
+        }
+
+        adopted = transform_layout_records(
+            current,
+            targets,
+            adopt_current_sidebar=True,
+            timestamp_ms=10,
+        )
+        adopted_state = decoded(adopted.records[DFRAME_STORE_KEY])["state"]
+        self.assertEqual(source, adopted_state["customGroupsByScope"]["a/w"])
+        self.assertEqual(historical, adopted_state["customGroupsByScope"]["history/w"])
+        self.assertEqual({"attention": "preserve"}, adopted_state["unrelated"])
+        copied = adopted_state["customGroupsByScope"]["b/w"]
+        self.assertEqual("keep", copied["targetStatus"])
+        self.assertEqual(source["groups"], copied["groups"])
+        self.assertEqual(source["assignments"], copied["assignments"])
+        self.assertEqual(
+            ["code:keep", "code:dangling"], copied["order"]["id-focus 🚀"]
+        )
+        self.assertEqual(
+            {"Focus 🚀": ("code:keep", "code:dangling"), "Backlog": ("code:moved",)},
+            adopted.snapshot.group_order,
+        )
+
+        next_targets = dict(targets, **{"c/w": {"code:keep", "code:moved"}})
+        repeated = transform_layout_records(
+            adopted.records,
+            next_targets,
+            snapshot=adopted.snapshot,
+            timestamp_ms=20,
+        )
+        repeated_state = decoded(repeated.records[DFRAME_STORE_KEY])["state"]
+        self.assertEqual(source, repeated_state["customGroupsByScope"]["a/w"])
+        new_scope = repeated_state["customGroupsByScope"]["c/w"]
+        self.assertEqual(["Focus 🚀", "Backlog"], [g["name"] for g in new_scope["groups"]])
+        self.assertEqual("violet", new_scope["groups"][0]["color"])
+        self.assertEqual(
+            ["code:keep"], new_scope["order"]["id-focus 🚀"]
+        )
+        self.assertEqual(["code:moved"], new_scope["order"]["id-backlog"])
+
+    def test_adopted_snapshot_fails_closed_on_a_divergent_account_scope(self):
+        source = scope(
+            "Focus", assignments={"code:keep": "id-focus"}
+        )
+        adopted = transform_layout_records(
+            records(
+                {"a/w": source, "b/w": scope("Old")},
+                active="a/w",
+            ),
+            {"a/w": {"code:keep"}, "b/w": {"code:keep"}},
+            adopt_current_sidebar=True,
+            timestamp_ms=10,
+        )
+        switched = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
+        switched["state"]["lastSidebarScopeKey"] = "b/w"
+        switched["state"]["customGroupsByScope"]["b/w"] = scope("Old")
+        current = dict(adopted.records)
+        current[DFRAME_STORE_KEY] = _encode_record(switched)
+
+        with self.assertRaisesRegex(LayoutError, "differs from the adopted"):
+            transform_layout_records(
+                current,
+                {"a/w": {"code:keep"}, "b/w": {"code:keep"}},
+                snapshot=adopted.snapshot,
+                timestamp_ms=20,
+            )
+
+    def test_adopted_snapshot_bootstraps_an_explicitly_empty_active_scope(self):
+        source = scope("Focus", assignments={"code:keep": "id-focus"})
+        source["groups"][0]["color"] = "violet"
+        adopted = transform_layout_records(
+            records({"a/w": source}, active="a/w"),
+            {"a/w": {"code:keep"}},
+            adopt_current_sidebar=True,
+            timestamp_ms=10,
+        )
+        current = {}
+        for key, value in adopted.records.items():
+            document = _decode_record(value, "record")
+            if key == DFRAME_STORE_KEY:
+                document["state"]["lastSidebarScopeKey"] = "c/w"
+                document["state"]["customGroupsByScope"]["c/w"] = scope()
+            elif key == GROUP_SCOPES_KEY:
+                document["value"]["c/w"] = scope()
+            current[key] = _encode_record(document)
+
+        restored = transform_layout_records(
+            current,
+            {"a/w": {"code:keep"}, "c/w": {"code:keep"}},
+            snapshot=adopted.snapshot,
+            timestamp_ms=20,
+        )
+        active = decoded(restored.records[DFRAME_STORE_KEY])["state"][
+            "customGroupsByScope"
+        ]["c/w"]
+        self.assertEqual(source["groups"], active["groups"])
+        self.assertEqual(source["assignments"], active["assignments"])
+
+    def test_explicit_source_scope_restores_the_hydrated_active_target(self):
+        source = scope(
+            "Focus", assignments={"code:keep": "id-focus"}
+        )
+        source["groups"][0]["icon"] = "star"
+        target = scope("Old", assignments={"code:keep": "id-old"})
+        current = records({"source/w": source, "target/w": target}, active="target/w")
+
+        restored = transform_layout_records(
+            current,
+            {"source/w": {"code:keep"}, "target/w": {"code:keep"}},
+            adopt_source_scope="source/w",
+            timestamp_ms=10,
+        )
+        state = decoded(restored.records[DFRAME_STORE_KEY])["state"]
+        self.assertEqual(source, state["customGroupsByScope"]["source/w"])
+        self.assertEqual(source, state["customGroupsByScope"]["target/w"])
+        self.assertEqual("target/w", restored.canonical_upload_scope)
+
     def test_stale_non_target_scope_cannot_override_a_valid_placement(self):
         snapshot = LayoutSnapshot(
             groups=("Focus", "Backlog"),
@@ -102,7 +316,10 @@ class LayoutTransformTests(unittest.TestCase):
                     target = scopes[key]
                     names = {group["id"]: group["name"] for group in target["groups"]}
                     self.assertEqual("Focus", names[target["assignments"]["code:local_one"]])
-                    self.assertIn("Backlog", names.values())
+                    if baseline is None:
+                        self.assertNotIn("Backlog", names.values())
+                    else:
+                        self.assertIn("Backlog", names.values())
 
     def test_stale_chat_in_a_target_scope_cannot_override_a_valid_placement(self):
         snapshot = LayoutSnapshot(
@@ -132,7 +349,7 @@ class LayoutTransformTests(unittest.TestCase):
                 scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
                 for key, sessions in targets.items():
                     target = scopes[key]
-                    self.assertEqual(sessions, set(target["assignments"]))
+                    self.assertTrue(sessions.issubset(set(target["assignments"])))
                     names = {group["id"]: group["name"] for group in target["groups"]}
                     for session in sessions:
                         self.assertEqual(
@@ -656,6 +873,18 @@ class LayoutRecoveryTests(unittest.TestCase):
                     result = synchronizer._group_upload_marker(database, before, after, {"a/w": set()})
                     self.assertEqual((pending, pending or b"\x01a/w|migrate"), result)
                     self.assertEqual(None, synchronizer._group_upload_marker(database, after, after, {"a/w": set()}))
+            values.clear()
+            values.update(baseline)
+            self.assertEqual(
+                (None, b"\x01a/w"),
+                synchronizer._group_upload_marker(
+                    database,
+                    before,
+                    after,
+                    {"a/w": set()},
+                    canonical_upload_scope="a/w",
+                ),
+            )
             for changed in (
                 {layout_module.GROUP_UPLOAD_KEY: b"\x01a/w"},
                 {layout_module.SYNC_OWNER_KEY: b"\x01other"},

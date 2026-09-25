@@ -100,7 +100,16 @@ def _failure(name, error) -> dict:
     return {"state": "skipped", "reason": singular + "-error"}
 
 
-def run_adapters(config, dependencies, running, *, probe_only=False, prefer_current_sidebar=False) -> dict:
+def run_adapters(
+    config,
+    dependencies,
+    running,
+    *,
+    probe_only=False,
+    prefer_current_sidebar=False,
+    adopt_current_sidebar=False,
+    adopt_source_scope=None,
+) -> dict:
     """A failed adapter cannot prevent the other enabled adapter from running."""
     results = {}
     probes = {}
@@ -117,7 +126,11 @@ def run_adapters(config, dependencies, running, *, probe_only=False, prefer_curr
                 else:
                     # sync validates after guarded recovery. A probe before recovery
                     # could reject the interrupted state that recovery must repair.
-                    if name == "layout" and prefer_current_sidebar:
+                    if name == "layout" and adopt_source_scope is not None:
+                        receipt = adapter.sync(adopt_source_scope=adopt_source_scope)
+                    elif name == "layout" and adopt_current_sidebar:
+                        receipt = adapter.sync(adopt_current_sidebar=True)
+                    elif name == "layout" and prefer_current_sidebar:
                         receipt = adapter.sync(prefer_current_sidebar=True)
                     else:
                         receipt = adapter.sync()

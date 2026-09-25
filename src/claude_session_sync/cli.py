@@ -130,9 +130,20 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", dest="as_json")
     sync = commands.add_parser("sync", help="apply the next synchronization")
     sync.add_argument("--json", action="store_true", dest="as_json")
-    sync.add_argument(
+    sidebar_mode = sync.add_mutually_exclusive_group()
+    sidebar_mode.add_argument(
         "--prefer-current-sidebar", action="store_true",
         help="resolve conflicting chat folders using the current sidebar (one profile only)",
+    )
+    sidebar_mode.add_argument(
+        "--adopt-current-sidebar",
+        action="store_true",
+        help="bootstrap every approved scope from the current sidebar (single default profile only)",
+    )
+    sidebar_mode.add_argument(
+        "--adopt-source-scope",
+        metavar="ACCOUNT/WORKSPACE",
+        help="one-time restore from a verified inactive sidebar scope",
     )
     auto = commands.add_parser("auto", help="sync after Claude terminates")
     auto.add_argument("--json", action="store_true", dest="as_json")
@@ -771,6 +782,8 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
             run_adapters(
                 config, deps, lambda: bool(_running_processes(config, deps)),
                 prefer_current_sidebar=getattr(arguments, "prefer_current_sidebar", False),
+                adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
+                adopt_source_scope=getattr(arguments, "adopt_source_scope", None),
             )
         )
         payload["progress"] = finish_progress(config, payload)
@@ -874,6 +887,22 @@ def run(
             not config.sync_sidebar_layout or len(config.profiles) != 1
         ):
             raise ValueError("--prefer-current-sidebar requires sidebar sync and exactly one profile")
+        if getattr(arguments, "adopt_current_sidebar", False) and (
+            not config.sync_sidebar_layout
+            or len(config.profiles) != 1
+            or not config.profiles[0].is_default
+        ):
+            raise ValueError(
+                "--adopt-current-sidebar requires sidebar sync and exactly one default profile"
+            )
+        if getattr(arguments, "adopt_source_scope", None) is not None and (
+            not config.sync_sidebar_layout
+            or len(config.profiles) != 1
+            or not config.profiles[0].is_default
+        ):
+            raise ValueError(
+                "--adopt-source-scope requires sidebar sync and exactly one default profile"
+            )
         if arguments.command == "restart-check":
             profile = _find_profile(config, arguments.profile)
             if not profile.is_default or config.target_policy != "all-configured-profiles":
