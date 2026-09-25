@@ -9,11 +9,13 @@ journaled transaction engine.
 import inspect
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
+from .filesystem import sweep_stale_stages
 from .liveness import last_known_account
 from .model import Plan, RunReceipt, SyncRequest
 
@@ -77,6 +79,7 @@ def run_chat_sync(
         save_state(path, state)
         on_disk = encode_state(state)
 
+    sweep_stale_stages((target.path for target in context.targets.values()), time.time())
     receipt = engine.apply(plan, live_guard=context.is_live_path)
     _remember_placements(state, context, receipt)
 
@@ -93,16 +96,33 @@ def run_chat_sync(
 def forget_seen(config, session_id: str) -> int:
     """Let the next run put back one chat reported as lost. Returns folders changed."""
 
-    path = state_path(config.state_dir)
-    state = _load(config)
-    changed = 0
-    for ids in state.sync.seen.values():
-        if session_id in ids:
-            ids.discard(session_id)
-            changed += 1
-    if changed:
-        save_state(path, state)
-    return changed
+    with state_writer(config):
+        path = state_path(config.state_dir)
+        state = _load(config)
+        changed = 0
+        for ids in state.sync.seen.values():
+            if session_id in ids:
+                ids.discard(session_id)
+                changed += 1
+        if changed:
+            save_state(path, state)
+        return changed
+
+
+@contextmanager
+def state_writer(config, timeout: float = 30.0):
+    """Hold the sync handoff lock, so no sync run saves over this change."""
+
+    from .locking import ExclusiveFileLock
+
+    lock = ExclusiveFileLock(
+        config.state_dir / "switch-handoff.lock", mode="auto", timeout=timeout
+    )
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _load(config):
@@ -189,7 +209,8 @@ def _remember_placements(state, context, receipt: RunReceipt) -> None:
         if key is None:
             continue
         if operation.source_state_hash is not None:
-            state.sync.placed.setdefault(key, {})[operation.session_id] = operation.source_state_hash
+            # What sync placed is this folder's version in step with the others.
+            state.sync.synced.setdefault(key, {})[operation.session_id] = operation.source_state_hash
         if operation.kind != "create":
             continue
         state.sync.seen.setdefault(key, set()).add(operation.session_id)

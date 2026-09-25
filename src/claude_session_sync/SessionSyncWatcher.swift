@@ -51,6 +51,8 @@ private final class SessionSyncWatcher: NSObject {
   private var quittingPIDs = Set<pid_t>()
   private var restartPhase = "ready"
   private var restartSuggested = 0
+  private var restartPending = false
+  private var lastFailureKey: String?
   private var folderSignature: String?
   private var lastFolderCheck = Date.distantPast
   private var lastFallbackRun = Date()
@@ -205,7 +207,7 @@ private final class SessionSyncWatcher: NSObject {
     }
     if FileManager.default.fileExists(atPath: restartRequestURL.path) {
       try? FileManager.default.removeItem(at: restartRequestURL)
-      beginRestart()
+      requestRestart()
       return
     }
     checkFolders()
@@ -286,14 +288,26 @@ private final class SessionSyncWatcher: NSObject {
   }
 
   @objc private func restartClicked(_ sender: Any?) {
-    queue.async { [weak self] in self?.beginRestart() }
+    queue.async { [weak self] in self?.requestRestart() }
+  }
+
+  // A request made while a sync runs waits for it instead of being dropped.
+  private func requestRestart() {
+    guard !restartRequested, profile != nil else { return }
+    if running {
+      restartPending = true
+      showStatus("Restart queued. It starts when the current sync finishes.")
+      return
+    }
+    beginRestart()
   }
 
   // Quit Claude once, sync everything, and reopen it. Only on request.
-  private func beginRestart() {
+  // A busy moment is retried a few times instead of dropping the request.
+  private func beginRestart(attempt: Int = 1) {
     guard !restartRequested, profile != nil else { return }
     if running {
-      showStatus("Sync is busy. Try the restart again in a moment.", banner: true)
+      restartPending = true
       return
     }
     DispatchQueue.main.async { [weak self] in
@@ -302,8 +316,19 @@ private final class SessionSyncWatcher: NSObject {
         $0.executableURL?.standardizedFileURL.path == self.claudeExecutable
       }
       self.queue.async {
-        guard !self.running, !self.restartRequested else { return }
+        guard !self.restartRequested else { return }
+        if self.running {
+          self.restartPending = true
+          return
+        }
         guard !applications.isEmpty else {
+          if attempt < 3 {
+            self.queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+              self?.beginRestart(attempt: attempt + 1)
+            }
+            return
+          }
+          self.noteRestartSkipped("claude-not-open")
           self.showStatus("Claude is not open. It will show every chat when it starts.", banner: true)
           return
         }
@@ -312,6 +337,13 @@ private final class SessionSyncWatcher: NSObject {
         case .ready(let pids):
           approvedPIDs = pids
         case .retryable:
+          if attempt < 3 {
+            self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+              self?.beginRestart(attempt: attempt + 1)
+            }
+            return
+          }
+          self.noteRestartSkipped("process-check-busy")
           self.showStatus("Mac is busy. Try the restart again in a moment.", banner: true)
           return
         case .blocked:
@@ -345,6 +377,11 @@ private final class SessionSyncWatcher: NSObject {
         }
       }
     }
+  }
+
+  private func noteRestartSkipped(_ reason: String) {
+    let data = (try? JSONSerialization.data(withJSONObject: ["progress": "finished", "restart_skipped": reason])) ?? Data()
+    writeStatus(exitStatus: 0, output: data, launchFailed: false)
   }
 
   private func restartFailed(_ message: String, reason: String = "restart-failed") {
@@ -456,8 +493,9 @@ private final class SessionSyncWatcher: NSObject {
         return
       }
       writeStatus(exitStatus: 1, output: output, launchFailed: false)
-      notify("Sync is still waiting. Run claude-session-sync status for details.")
+      reportFailure("Sync is still waiting. Run claude-session-sync status for details.", key: "waiting")
     } else if exitStatus == 0 && progress == "finished" {
+      lastFailureKey = nil
       if restarting {
         notify("Sync finished. Claude reopened.")
       } else if restartSuggested > 0 {
@@ -467,13 +505,28 @@ private final class SessionSyncWatcher: NSObject {
         showStatus("Sync finished")
       }
     } else if exitStatus != 0 || progress == "needs-attention" || result == nil {
-      notify("Sync needs attention. Run claude-session-sync doctor for details.")
+      reportFailure("Sync needs attention. Run claude-session-sync doctor for details.",
+        key: "\(exitStatus)|\(reason ?? "")|\(result?["error_type"] as? String ?? "")")
     }
     retryDeadline = nil
     if exitStatus != 0 {
       NSLog("claude-session-sync auto failed with exit status %d", exitStatus)
     }
+    if restartPending && !restarting {
+      // The restart syncs everything itself, so a queued sync is not needed.
+      restartPending = false
+      pending = false
+      beginRestart()
+      return
+    }
     runPendingIfNeeded()
+  }
+
+  // Syncs run every few seconds; the same failure shows its banner only once.
+  private func reportFailure(_ message: String, key: String) {
+    let repeated = key == lastFailureKey
+    lastFailureKey = key
+    showStatus(message, banner: !repeated)
   }
 
   private func notify(_ message: String) {

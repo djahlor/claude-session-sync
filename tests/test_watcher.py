@@ -141,8 +141,12 @@ class WatcherTests(unittest.TestCase):
     def test_blocked_restart_check_leaves_claude_open(self):
         self.live_scenario(request_restart=True, block_preflight=True)
 
+    def test_a_restart_requested_during_a_sync_waits_for_it(self):
+        self.live_scenario(request_restart=True, request_during_sync=True)
+
     def live_scenario(self, change_account=False, touch_folder=False, suggest_restart=False,
-                      request_restart=False, fail_sync=False, block_preflight=False):
+                      request_restart=False, fail_sync=False, block_preflight=False,
+                      request_during_sync=False):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app = root / "SyncTest.app"
@@ -162,7 +166,7 @@ class WatcherTests(unittest.TestCase):
             calls = root / "calls.jsonl"
             child = root / "child.py"
             child.write_text(
-                "import json, pathlib, subprocess, sys\n"
+                "import json, pathlib, subprocess, sys, time\n"
                 f"calls = pathlib.Path({str(calls)!r})\n"
                 "if sys.argv[1] == 'restart-check':\n"
                 f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
@@ -174,7 +178,9 @@ class WatcherTests(unittest.TestCase):
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention'}})); raise SystemExit(1)\n"
                 f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished'}))\n"
-                f"else: print(json.dumps({{'state': 'noop', 'progress': 'finished', 'restart_suggested': 2 if {suggest_restart!r} else 0}}))\n"
+                "else:\n"
+                f" if {request_during_sync!r} and len(calls.read_text().splitlines()) > 1: time.sleep(3)\n"
+                f" print(json.dumps({{'state': 'noop', 'progress': 'finished', 'restart_suggested': 2 if {suggest_restart!r} else 0}}))\n"
             )
             subprocess.run(["/usr/bin/open", str(app)], check=True)
             status = root / "watcher-status.json"
@@ -220,6 +226,10 @@ class WatcherTests(unittest.TestCase):
                     self.assertTrue(wait_for(lambda: json.loads(status.read_text()).get("restart_suggested") == 2, 5))
                     time.sleep(2)
                     self.assertTrue(app_running(), "a suggestion must never quit Claude")
+                if request_during_sync:
+                    time.sleep(1)
+                    (folder / "local_new.json").write_text("{}")
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a sync must be running")
                 if request_restart:
                     (root / "restart-request").touch()
                     finished = wait_for(
@@ -227,7 +237,12 @@ class WatcherTests(unittest.TestCase):
                         or json.loads(status.read_text()).get("restart_phase") == "needs-attention",
                         30,
                     )
-                    self.assertTrue(finished, "the restart request must be handled")
+                    self.assertTrue(
+                        finished,
+                        "the restart request must be handled: {} {}".format(
+                            status.read_text(), entries()
+                        ),
+                    )
                     expected = 0 if block_preflight else 1
                     time.sleep(4)
                     self.assertEqual(expected, sum(item[0] == "switch" for item in entries()))

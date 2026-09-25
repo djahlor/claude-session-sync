@@ -75,6 +75,15 @@ class RecoveryPendingError(TransactionError):
     """Raised when apply must wait for an incomplete run to be recovered."""
 
 
+def _group(record: Mapping[str, Any]) -> Tuple[str, str]:
+    """One chat in one folder: its steps succeed or wait together."""
+
+    return (
+        record["session_id"],
+        os.path.dirname(os.path.abspath(record["destination"])),
+    )
+
+
 class TransactionEngine:
     """Apply immutable plans and roll committed runs back safely.
 
@@ -133,6 +142,8 @@ class TransactionEngine:
                 raise RecoveryPendingError(
                     "journal state is invalid; recovery is required before apply"
                 ) from error
+            if pending and live_guard is not None:
+                pending = self._finish_interrupted_live_runs(pending)
             if pending:
                 raise RecoveryPendingError(
                     "{} run(s) require recovery before apply".format(len(pending))
@@ -169,7 +180,7 @@ class TransactionEngine:
 
     def _apply_locked(self, plan: Any, live_guard: Optional[LiveGuard]) -> RunReceipt:
         lenient = live_guard is not None
-        records, skipped = self._revalidate(plan.operations, lenient=lenient)
+        records, skipped, blocked = self._revalidate(plan.operations, lenient=lenient)
         if not lenient:
             self._ensure_apps_stopped()
         if not records:
@@ -181,7 +192,7 @@ class TransactionEngine:
         applied: List[Dict[str, Any]] = []
         try:
             journal = RunJournal.create(
-                self.state_root, plan.plan_id, records, run_id=run_id
+                self.state_root, plan.plan_id, records, run_id=run_id, lenient=lenient
             )
             self._inject("JOURNALING", run_id)
 
@@ -202,6 +213,7 @@ class TransactionEngine:
                     staged.pop(record["index"])
                     staged_path.unlink()
                     record["skipped"] = "source-moved-on"
+                    blocked.add(_group(record))
                     skipped += 1
                     continue
                 staged_metadata = staged_path.stat()
@@ -224,12 +236,23 @@ class TransactionEngine:
                 destination = Path(record["destination"])
                 kind = record.get("kind", "copy")
                 if lenient:
-                    reason = self._lenient_blocker(record, destination, live_guard)
+                    # Steps for one chat in one folder go together: a marker is
+                    # never removed when the record meant to replace it was not
+                    # written, nor written when the record could not be removed.
+                    reason = (
+                        "partner-skipped"
+                        if _group(record) in blocked
+                        else self._lenient_blocker(record, destination, live_guard)
+                    )
                     if reason is not None:
                         record["skipped"] = reason
+                        blocked.add(_group(record))
                         skipped += 1
                         continue
                 if kind == "retire":
+                    # Written down first: a crash right after the removal must
+                    # still let recovery put the file back.
+                    journal.mark_retire_started(record["index"])
                     durable_unlink(destination)
                 elif kind == "create":
                     try:
@@ -238,6 +261,7 @@ class TransactionEngine:
                         if not lenient:
                             raise
                         record["skipped"] = "destination-appeared"
+                        blocked.add(_group(record))
                         skipped += 1
                         continue
                 else:
@@ -351,10 +375,11 @@ class TransactionEngine:
 
     def _revalidate(
         self, operations: Iterable[Any], *, lenient: bool = False
-    ) -> Tuple[List[Dict[str, Any]], int]:
+    ) -> Tuple[List[Dict[str, Any]], int, set]:
         records = []  # type: List[Dict[str, Any]]
         destinations = set()
         skipped = 0
+        blocked = set()
         for operation_index, operation in enumerate(operations):
             kind = getattr(operation, "kind", "copy")
             if kind not in WRITE_KINDS + ("retire",):
@@ -369,12 +394,17 @@ class TransactionEngine:
                     "plan contains duplicate destination: {}".format(destination)
                 )
             destinations.add(destination_key)
+            group = (operation.session_id, os.path.dirname(destination_key))
+            if lenient and group in blocked:
+                skipped += 1
+                continue
 
             try:
                 source_digest = digest_file(source)
                 source_size = regular_file_size(source)
             except (OSError, UnsafePathError) as error:
                 if lenient:
+                    blocked.add(group)
                     skipped += 1
                     continue
                 raise RevalidationError(
@@ -385,6 +415,7 @@ class TransactionEngine:
                 or source_size != operation.size
             ):
                 if lenient:
+                    blocked.add(group)
                     skipped += 1
                     continue
                 raise RevalidationError(
@@ -409,6 +440,7 @@ class TransactionEngine:
                 continue
             if destination_digest != planned_destination:
                 if lenient:
+                    blocked.add(group)
                     skipped += 1
                     continue
                 raise RevalidationError(
@@ -431,7 +463,37 @@ class TransactionEngine:
                     "session_id": operation.session_id,
                 }
             )
-        return records, skipped
+        return records, skipped, blocked
+
+    def _finish_interrupted_live_runs(self, pending: List[str]) -> List[str]:
+        """Close runs a crash left open in live mode, keeping what they wrote.
+
+        Every write in a live run is one atomic step toward a planned version,
+        and a partly applied run is the same as one whose other steps were
+        skipped: the next plan finishes the job. Removed files stay in the
+        journal. Runs made without live mode still need an explicit recovery.
+        """
+
+        remaining = []
+        for run_id in pending:
+            try:
+                journal = RunJournal.load(self.state_root, run_id)
+            except JournalError:
+                remaining.append(run_id)
+                continue
+            if not journal.manifest.get("lenient"):
+                remaining.append(run_id)
+                continue
+            journal.finish(
+                "COMMITTED",
+                {
+                    "kind": "apply",
+                    "run_id": run_id,
+                    "status": "recovered",
+                    "plan_id": journal.manifest.get("plan_id"),
+                },
+            )
+        return remaining
 
     def _verify_destinations_unchanged(
         self, records: Iterable[Mapping[str, Any]]
@@ -506,7 +568,7 @@ class TransactionEngine:
                     if self._digest_existing(destination) != record["destination_digest_before"]:
                         refuse("retired file came back changed: {}".format(destination))
                     continue
-                if not record["applied"]:
+                if not (record["applied"] or record.get("retire_started")):
                     refuse("retired file was removed by someone else: {}".format(destination))
                     continue
                 actions.append(("unretire", record))

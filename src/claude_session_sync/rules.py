@@ -6,7 +6,7 @@ records, R8 kept copies, R9 live partitions, R11 unreadable or future copies.
 Actions for one session are emitted in the order they must happen.
 """
 
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 from .chat_model import (
     CreateRecord,
@@ -60,14 +60,16 @@ def _plan_session(session_id, snapshots, state, live, prefer, result) -> None:
         if holders:
             _plan_record(
                 session_id, snapshots, holders, state, live, prefer, result,
-                absence_explained=False,
+                explained=set(),
             )
         return
 
     if holders and _used_after_delete(session_id, holders, entombed):
+        # Only a folder holding the marker has an explained absence. A folder
+        # that lost the chat without one is still reported as lost.
         chosen = _plan_record(
             session_id, snapshots, holders, state, live, prefer, result,
-            absence_explained=True,
+            explained={s.key for s in entombed},
         )
         # With the copies tied nothing can be put back, so the tombstone stays.
         # Without it, the deleting partition would read as having lost the record.
@@ -119,14 +121,21 @@ def _unless_live(snapshot, session_id, live, result, action) -> bool:
 
 
 def _plan_record(
-    session_id, snapshots, holders, state, live, prefer, result, absence_explained
+    session_id, snapshots, holders, state, live, prefer, result, explained
 ) -> bool:
     """Return whether a version was chosen."""
 
     untouched = [s for s in holders if _still_as_synced(s, session_id, state)]
-    winner = _one_sided_winner(session_id, holders, untouched) or _latest_activity_winner(
-        session_id, holders, prefer
-    )
+    if len({s.records[session_id].state_hash for s in holders}) == 1:
+        winner = holders[0]
+    elif all(_known(s, session_id, state) for s in holders):
+        winner = _one_sided_winner(session_id, holders, untouched) or _latest_activity_winner(
+            session_id, holders, prefer
+        )
+    else:
+        # A copy with no remembered version cannot be told apart from a stale
+        # one, so only activity decides, and a tie is left alone.
+        winner = _latest_activity_winner(session_id, holders, prefer)
     if winner is None:  # R4: a tie nobody settled
         result.problems.extend(
             Problem("tied", session_id, s.key) for s in _most_active(session_id, holders)
@@ -147,7 +156,7 @@ def _plan_record(
     for target in snapshots:
         if session_id in target.records:
             continue
-        if not absence_explained and session_id in state.seen.get(target.key, ()):  # R7
+        if target.key not in explained and session_id in state.seen.get(target.key, ()):  # R7
             result.problems.append(Problem("lost", session_id, target.key))
             continue
         result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
@@ -155,12 +164,14 @@ def _plan_record(
 
 
 def _still_as_synced(snapshot, session_id, state) -> bool:
-    """The copy is the agreed state, or a version sync placed there and Claude left alone."""
+    """The copy is still the version this folder last held in step with the others."""
 
-    held = snapshot.records[session_id].state_hash
-    return held == state.agreed.get(session_id) or held == state.placed.get(
-        snapshot.key, {}
-    ).get(session_id)
+    remembered = state.synced.get(snapshot.key, {}).get(session_id)
+    return remembered is not None and snapshot.records[session_id].state_hash == remembered
+
+
+def _known(snapshot, session_id, state) -> bool:
+    return session_id in state.synced.get(snapshot.key, {})
 
 
 def _one_sided_winner(session_id, holders, untouched) -> Optional[Snapshot]:
@@ -199,46 +210,40 @@ def _latest_activity_winner(session_id, holders, prefer) -> Optional[Snapshot]:
 
 
 def settle(state: SyncState, snapshots: List[Snapshot]) -> SyncState:
-    """Work out what to remember from what the partitions hold now.
+    """Work out what to remember from what the given folders hold now.
 
-    An id leaves ``seen`` only when no partition holds the record any more. A
-    record that was there and is gone again was removed by Claude, and R7 must
-    know it was there.
+    Folders outside this run keep what they had. An id leaves ``seen`` only when
+    none of these folders holds the record any more: a record that was there
+    and is gone again was removed by Claude, and R7 must know it was there.
+    Agreement needs at least two folders; one folder alone agrees with nothing.
     """
 
-    agreed = dict(state.agreed)
-    seen = {s.key: set(state.seen.get(s.key, ())) | set(s.records) for s in snapshots}
-
-    known_ids = set(agreed)
+    synced = {key: dict(entries) for key, entries in state.synced.items()}
+    seen = {key: set(ids) for key, ids in state.seen.items()}
+    keys = [s.key for s in snapshots]
     for snapshot in snapshots:
-        known_ids.update(snapshot.records, seen[snapshot.key])
+        seen.setdefault(snapshot.key, set()).update(snapshot.records)
+
+    known_ids = set()
+    for snapshot in snapshots:
+        known_ids.update(snapshot.records, seen[snapshot.key], synced.get(snapshot.key, {}))
 
     for session_id in known_ids:
         holders = [s for s in snapshots if session_id in s.records]
         if not holders:
-            agreed.pop(session_id, None)
-            for ids in seen.values():
-                ids.discard(session_id)
-        elif len(holders) == len(snapshots):
+            # Gone everywhere. Forgetting it keeps a later re-adoption from looking lost.
+            for key in keys:
+                seen[key].discard(session_id)
+                synced.get(key, {}).pop(session_id, None)
+        elif len(snapshots) >= 2 and len(holders) == len(snapshots):
+            # Agreement is about content alone, so a copy with an untrustworthy time still counts.
             hashes = {s.records[session_id].state_hash for s in holders}
             if len(hashes) == 1 and None not in hashes:
-                agreed[session_id] = hashes.pop()
+                agreed = hashes.pop()
+                for key in keys:
+                    synced.setdefault(key, {})[session_id] = agreed
 
-    return SyncState(agreed=agreed, seen=seen, placed=_still_in_place(state, snapshots, agreed))
-
-
-def _still_in_place(state, snapshots, agreed) -> Dict[str, Dict[str, str]]:
-    """A placement is worth remembering only while untouched and not yet agreed."""
-
-    kept = {}
-    for snapshot in snapshots:
-        entries = {
-            session_id: placed
-            for session_id, placed in state.placed.get(snapshot.key, {}).items()
-            if session_id in snapshot.records
-            and snapshot.records[session_id].state_hash == placed
-            and agreed.get(session_id) != placed
-        }
-        if entries:
-            kept[snapshot.key] = entries
-    return kept
+    return SyncState(
+        synced={key: entries for key, entries in synced.items() if entries},
+        seen=seen,
+    )

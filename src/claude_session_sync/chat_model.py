@@ -37,11 +37,16 @@ class Snapshot:
 
 @dataclass
 class SyncState:
-    """What sync remembers between runs."""
+    """What sync remembers between runs.
 
-    agreed: Dict[str, str] = field(default_factory=dict)
+    ``synced`` holds, per folder, the version of each chat that folder last held
+    in step with the others: at the last run where every folder agreed, or as
+    placed there by sync. A folder with no entry is unknown, so its copy can
+    never win just by looking changed.
+    """
+
+    synced: Dict[str, Dict[str, str]] = field(default_factory=dict)
     seen: Dict[str, Set[str]] = field(default_factory=dict)
-    placed: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

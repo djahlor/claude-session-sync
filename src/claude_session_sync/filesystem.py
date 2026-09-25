@@ -187,6 +187,33 @@ def atomic_write_bytes(destination: PathLike, content: bytes) -> None:
         raise
 
 
+def sweep_stale_stages(folders, now: float, max_age_seconds: int = 600) -> int:
+    """Remove staged copies a killed run left behind. Returns how many went.
+
+    Staged names start with a dot, which Claude ignores. Anything this old
+    belongs to no running sync.
+    """
+
+    removed = 0
+    for folder in folders:
+        try:
+            entries = list(os.scandir(os.fspath(folder)))
+        except OSError:
+            continue
+        for entry in entries:
+            if not (entry.name.startswith(".") and entry.name.endswith(".stage")):
+                continue
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or now - metadata.st_mtime <= max_age_seconds:
+                    continue
+                os.unlink(entry.path)
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 def durable_unlink(path: PathLike) -> None:
     file_path = Path(path)
     file_path.unlink()

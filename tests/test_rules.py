@@ -39,11 +39,17 @@ def snapshot(key, records=None, tombstones=None, orphan_tmps=()):
     )
 
 
-def state(agreed=None, seen=None, placed=None):
+def state(agreed=None, seen=None, placed=None, folders="ABC", synced=None):
+    """agreed: the version every listed folder last held in step. placed: per-folder overrides."""
+
+    remembered = {key: dict(agreed or {}) for key in folders}
+    for key, entries in (placed or {}).items():
+        remembered.setdefault(key, {}).update(entries)
+    for key, entries in (synced or {}).items():
+        remembered[key] = dict(entries)
     return SyncState(
-        agreed=dict(agreed or {}),
+        synced={key: entries for key, entries in remembered.items() if entries},
         seen={key: set(value) for key, value in (seen or {}).items()},
-        placed={key: dict(value) for key, value in (placed or {}).items()},
     )
 
 
@@ -474,60 +480,116 @@ class RecordWinsTests(unittest.TestCase):
         )
 
 
+class UnknownVersionTests(unittest.TestCase):
+    """A folder with no remembered version cannot win just by looking changed."""
+
+    def test_a_folder_that_joins_later_cannot_undo_a_rename(self):
+        result = planned(
+            [snapshot("A", {X: copy("renamed", 50)}), snapshot("B", {X: copy("t", 50)})],
+            state(synced={"A": {X: "renamed"}}, folders=""),
+        )
+
+        self.assertEqual(result.actions, [])
+        self.assertEqual({problem.kind for problem in result.problems}, {"tied"})
+
+    def test_with_an_unknown_copy_later_activity_still_wins(self):
+        result = planned(
+            [snapshot("A", {X: copy("renamed", 50)}), snapshot("B", {X: copy("t", 90)})],
+            state(synced={"A": {X: "renamed"}}, folders=""),
+        )
+
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
+
+    def test_a_chat_used_after_a_delete_is_not_recreated_where_it_was_lost(self):
+        result = planned(
+            [
+                snapshot("A", {X: copy("v2", DELETED_AT + 5)}),
+                snapshot("B", tombstones={X: DELETED_AT}),
+                snapshot("C"),
+            ],
+            state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}, "C": {X}}),
+        )
+
+        self.assertIn(CreateRecord(X, source="A", target="B"), result.actions)
+        self.assertNotIn(CreateRecord(X, source="A", target="C"), result.actions)
+        self.assertIn(Problem("lost", X, "C"), result.problems)
+
+
 class SettleTests(unittest.TestCase):
-    def test_identical_copies_everywhere_become_the_agreed_state(self):
+    def test_identical_copies_everywhere_become_each_folders_version(self):
         after = settle(state(), [snapshot("A", {X: copy("v2")}), snapshot("B", {X: copy("v2")})])
 
-        self.assertEqual(after.agreed, {X: "v2"})
+        self.assertEqual(after.synced, {"A": {X: "v2"}, "B": {X: "v2"}})
 
-    def test_differing_copies_leave_the_agreed_state_where_it_was(self):
+    def test_differing_copies_leave_the_remembered_versions_where_they_were(self):
         after = settle(
-            state(agreed={X: "v1"}),
+            state(agreed={X: "v1"}, folders="AB"),
             [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v2")})],
         )
 
-        self.assertEqual(after.agreed, {X: "v1"})
+        self.assertEqual(after.synced, {"A": {X: "v1"}, "B": {X: "v1"}})
 
-    def test_a_partition_without_the_record_means_no_agreement_yet(self):
+    def test_a_folder_without_the_record_means_no_agreement_yet(self):
         after = settle(state(), [snapshot("A", {X: copy("v1")}), snapshot("B")])
 
-        self.assertEqual(after.agreed, {})
+        self.assertEqual(after.synced, {})
+
+    def test_one_folder_alone_agrees_with_nothing(self):
+        after = settle(state(), [snapshot("A", {X: copy("v1")})])
+
+        self.assertEqual(after.synced, {})
+        self.assertEqual(after.seen, {"A": {X}})
+
+    def test_folders_outside_the_run_keep_what_they_had(self):
+        before = state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}, "C": {X}}, folders="ABC")
+
+        after = settle(before, [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})])
+
+        self.assertEqual(after.synced["C"], {X: "v1"})
+        self.assertEqual(after.seen["C"], {X})
+
+    def test_no_folders_change_nothing(self):
+        before = state(agreed={X: "v1"}, seen={"A": {X}}, folders="A")
+
+        after = settle(before, [])
+
+        self.assertEqual((after.synced, after.seen), (before.synced, before.seen))
 
     def test_an_unreadable_copy_means_no_agreement(self):
         after = settle(state(), [snapshot("A", {X: unreadable()}), snapshot("B", {X: unreadable()})])
 
-        self.assertEqual(after.agreed, {})
+        self.assertEqual(after.synced, {})
 
     def test_identical_copies_agree_even_when_their_time_cannot_be_trusted(self):
         ahead = Copy(state_hash="v2", last_activity_at=10**15, future_dated=True)
 
         after = settle(state(), [snapshot("A", {X: ahead}), snapshot("B", {X: ahead})])
 
-        self.assertEqual(after.agreed, {X: "v2"})
+        self.assertEqual(after.synced, {"A": {X: "v2"}, "B": {X: "v2"}})
 
     def test_the_given_state_is_not_modified(self):
-        before = state(agreed={X: "v1"})
+        before = state(agreed={X: "v1"}, folders="AB")
 
         settle(before, [snapshot("A", {X: copy("v2")}), snapshot("B", {X: copy("v2")})])
 
-        self.assertEqual(before.agreed, {X: "v1"})
+        self.assertEqual(before.synced, {"A": {X: "v1"}, "B": {X: "v1"}})
 
     def test_a_finished_delete_is_forgotten_so_a_later_re_adoption_is_not_lost(self):
         after = settle(
-            state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}),
+            state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}, folders="AB"),
             [snapshot("A", tombstones={X: NOW}), snapshot("B", tombstones={X: NOW})],
         )
 
-        self.assertEqual(after.agreed, {})
+        self.assertEqual(after.synced, {})
         self.assertEqual(after.seen, {"A": set(), "B": set()})
 
     def test_a_delete_still_on_its_way_keeps_what_is_known(self):
         after = settle(
-            state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}),
+            state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}, folders="AB"),
             [snapshot("A", {X: copy("v1")}), snapshot("B", tombstones={X: NOW})],
         )
 
-        self.assertEqual(after.agreed, {X: "v1"})
+        self.assertEqual(after.synced, {"A": {X: "v1"}, "B": {X: "v1"}})
         self.assertEqual(after.seen, {"A": {X}, "B": {X}})
 
     def test_a_placement_waiting_for_the_rest_to_catch_up_is_remembered(self):
@@ -540,24 +602,10 @@ class SettleTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(after.placed, {"B": {X: "v1"}})
+        self.assertEqual(after.synced["B"], {X: "v1"})
+        self.assertEqual(after.synced["C"], {X: "v0"})
 
-    def test_a_placement_is_forgotten_once_unneeded_or_untrue(self):
-        cases = {
-            "everyone agrees now": [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})],
-            "claude changed the copy": [
-                snapshot("A", {X: copy("v1")}),
-                snapshot("B", {X: copy("edited")}),
-            ],
-            "the copy is gone": [snapshot("A", {X: copy("v1")}), snapshot("B")],
-        }
-        for name, snapshots in cases.items():
-            with self.subTest(case=name):
-                after = settle(state(agreed={X: "v0"}, placed={"B": {X: "v1"}}), snapshots)
-
-                self.assertEqual(after.placed, {})
-
-    def test_observed_records_are_remembered_per_partition(self):
+    def test_observed_records_are_remembered_per_folder(self):
         after = settle(
             state(seen={"A": {X}}),
             [snapshot("A", {X: copy("v1"), Y: copy("v1")}), snapshot("B")],
@@ -565,12 +613,12 @@ class SettleTests(unittest.TestCase):
 
         self.assertEqual(after.seen, {"A": {X, Y}, "B": set()})
 
-    def test_a_record_missing_from_one_partition_stays_remembered_there(self):
+    def test_a_record_missing_from_one_folder_stays_remembered_there(self):
         after = settle(state(seen={"A": {X}, "B": {X}}), [snapshot("A", {X: copy("v1")}), snapshot("B")])
 
         self.assertEqual(after.seen["B"], {X})
 
-    def test_a_record_gone_from_every_partition_is_forgotten(self):
+    def test_a_record_gone_from_every_folder_is_forgotten(self):
         after = settle(state(seen={"A": {X}, "B": {X}}), [snapshot("A"), snapshot("B")])
 
         self.assertEqual(after.seen, {"A": set(), "B": set()})

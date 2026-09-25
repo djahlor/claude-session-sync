@@ -107,7 +107,7 @@ class LiveCliTests(unittest.TestCase):
         state_file.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "logins": {
                         str(self.data_root): [A_ACCOUNT, int(time.time() * 1000) - 600_000]
                     },
@@ -218,7 +218,7 @@ class LiveCliTests(unittest.TestCase):
 
         self.assertEqual(1, json.loads(out)["counts"]["ignored_folders"])
         self.assertIsNone(self.read(self.a, X))
-        self.assertEqual({}, load_state(state_path(self.config.state_dir)).sync.agreed)
+        self.assertEqual({}, load_state(state_path(self.config.state_dir)).sync.synced)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ class ChatStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state" / "chat-state.json"
             state = ChatState(
-                sync=SyncState(agreed={"x": "h"}, seen={"k": {"x"}}, placed={"k": {"x": "h"}}),
+                sync=SyncState(synced={"k": {"x": "h"}}, seen={"k": {"x"}}),
                 logins={"/root": (ACCOUNT, 5)},
                 enrolled=["Work/a/b"],
                 live_creates={"k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}},
@@ -61,7 +61,7 @@ class ChatStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = load_state(Path(directory) / "missing.json")
 
-            self.assertEqual({}, state.sync.agreed)
+            self.assertEqual({}, state.sync.synced)
 
     def test_a_corrupt_file_stops_sync_instead_of_forgetting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -75,25 +75,18 @@ class ChatStateTests(unittest.TestCase):
     def test_hashes_made_another_way_are_dropped_but_presence_is_kept(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chat-state.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "normalisation": "older rules",
-                        "agreed": {"x": "h"},
-                        "placed": {"k": {"x": "h"}},
-                        "seen": {"k": ["x"]},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            for document in (
+                {"version": 2, "normalisation": "older rules", "synced": {"k": {"x": "h"}}},
+                {"version": 1, "normalisation": normalisation(), "agreed": {"x": "h"}},
+            ):
+                with self.subTest(version=document["version"]):
+                    document["seen"] = {"k": ["x"]}
+                    path.write_text(json.dumps(document), encoding="utf-8")
 
-            state = load_state(path)
+                    state = load_state(path)
 
-            self.assertEqual({}, state.sync.agreed)
-            self.assertEqual({}, state.sync.placed)
-            self.assertEqual({"k": {"x"}}, state.sync.seen)
-            self.assertNotEqual("older rules", normalisation())
+                    self.assertEqual({}, state.sync.synced)
+                    self.assertEqual({"k": {"x"}}, state.sync.seen)
 
 
 class LivenessTests(unittest.TestCase):

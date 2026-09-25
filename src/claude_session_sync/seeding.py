@@ -19,9 +19,16 @@ from .store import RECORD_NAME, SessionStore
 
 
 def seed_from_unenrolled(config, *, apply: bool) -> dict:
+    from .chat_sync import state_writer
+
+    with state_writer(config):
+        return _seed(config, apply=apply)
+
+
+def _seed(config, *, apply: bool) -> dict:
     state = load_state(state_path(config.state_dir))
-    if state.sync.agreed:
-        raise ValueError("chat state already has agreed versions; seeding only starts a new state")
+    if state.sync.synced:
+        raise ValueError("chat state already has synced versions; seeding only starts a new state")
     found = SessionStore().discover_targets(config)
     selected, ignored = select_targets(config, found.targets, state.enrolled)
     if config.target_policy != "logins" or not ignored:
@@ -64,9 +71,14 @@ def seed_from_unenrolled(config, *, apply: bool) -> dict:
         1 for session_id, hashes in versions.items() if session_id not in seeded
     )
     if apply:
-        state.sync.agreed.update(seeded)
+        # Every synced folder took part in the old full sync, so each one's
+        # version in step with the others is the old copy.
         for key, ids in present.items():
             state.sync.seen.setdefault(key, set()).update(ids)
+            folder = state.sync.synced.setdefault(key, {})
+            for session_id, state_hash in seeded.items():
+                if session_id in ids:
+                    folder[session_id] = state_hash
         save_state(state_path(config.state_dir), state)
     return {
         "state": "seeded" if apply else "planned",

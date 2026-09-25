@@ -25,7 +25,7 @@ Y = "22222222-2222-4222-8222-222222222222"
 NOW_MS = int(time.time() * 1000)
 
 
-class ChatSyncTests(unittest.TestCase):
+class ChatSyncFixture(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -94,16 +94,17 @@ class ChatSyncTests(unittest.TestCase):
         body = {"sessionId": "local_" + session_id, "title": "t", "lastActivityAt": 100}
         body.update(fields)
         state = load_state(state_path(self.config.state_dir))
-        state.sync.agreed[session_id] = fingerprint(
-            session_id, json.dumps(body).encode()
-        ).state_hash
+        state_hash = fingerprint(session_id, json.dumps(body).encode()).state_hash
         for key in self.keys():
+            state.sync.synced.setdefault(key, {})[session_id] = state_hash
             state.sync.seen.setdefault(key, set()).add(session_id)
         save_state(state_path(self.config.state_dir), state)
 
     def keys(self):
         return ["Work/{}/{}".format(A_ACCOUNT, A_ORG), "Work/{}/{}".format(B_ACCOUNT, B_ORG)]
 
+
+class ChatSyncTests(ChatSyncFixture):
     def test_a_new_chat_is_copied_to_the_other_account(self):
         self.write(self.a, X)
 
@@ -183,7 +184,8 @@ class ChatSyncTests(unittest.TestCase):
         self.sync()
 
         state = load_state(state_path(self.config.state_dir))
-        self.assertIn(X, state.sync.agreed)
+        self.assertEqual({X}, set(state.sync.synced[self.keys()[0]]))
+        self.assertEqual({X}, set(state.sync.synced[self.keys()[1]]))
         self.assertEqual(state.sync.seen[self.keys()[1]], {X})
 
     def test_with_claude_open_the_signed_in_folder_only_gains_new_chats(self):
@@ -316,3 +318,80 @@ class ChatSyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoveryTests(ChatSyncFixture):
+    """Paired steps, crashes mid-run, and leftovers of killed runs."""
+
+    def test_a_marker_stays_when_the_record_meant_to_replace_it_waits(self):
+        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000)
+        marker = self.b / "deleted_{}".format(X)
+        marker.write_text(str(NOW_MS - 10_000), encoding="ascii")
+        plan = self.planner().plan(SimpleNamespace(config=self.config))
+        self.assertEqual(["create", "retire"], [op.kind for op in plan.operations])
+        # Claude saves the chat in A between planning and writing.
+        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000, title="saved again")
+        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: False)
+
+        receipt = engine.apply(plan, live_guard=plan.context.is_live_path)
+
+        self.assertEqual(2, receipt.skipped_count)
+        self.assertTrue(marker.exists(), "the marker must not go without the record")
+        self.assertIsNone(self.read(self.b, X))
+
+    def test_a_crash_right_after_a_removal_neither_blocks_sync_nor_loses_the_file(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X, lastActivityAt=100)
+        (self.b / "deleted_{}".format(X)).write_text(str(NOW_MS - 1_000), encoding="ascii")
+        self.agree(X)
+        real_unlink = transaction.durable_unlink
+
+        def unlink_then_die(path):
+            real_unlink(path)
+            raise KeyboardInterrupt("killed mid-run")
+
+        with patch.object(transaction, "durable_unlink", unlink_then_die):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        self.assertIsNone(self.read(self.a, X))
+        run_id = next((self.config.state_dir / "runs").iterdir()).name
+
+        # The removed record can still be put back from the journal.
+        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(run_id)
+        self.assertIsNotNone(self.read(self.a, X))
+
+        # And the next live run is not blocked by the crash.
+        self.write(self.a, Y)
+        run = self.sync()
+        self.assertIn(run.receipt.status, ("committed", "partial"))
+        self.assertIsNotNone(self.read(self.b, Y))
+
+    def test_an_interrupted_live_run_is_closed_and_the_next_run_goes_on(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X)
+        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+
+        run = self.sync()
+
+        self.assertEqual("committed", run.receipt.status)
+        self.assertIsNotNone(self.read(self.b, X))
+
+    def test_staged_copies_left_by_a_killed_run_are_swept(self):
+        leftover = self.b / ".local_{}.json.0123.stage".format(X)
+        leftover.write_text("{}", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(leftover, (old, old))
+        fresh = self.b / ".local_{}.json.4567.stage".format(Y)
+        fresh.write_text("{}", encoding="utf-8")
+        self.write(self.a, X)
+
+        self.sync()
+
+        self.assertFalse(leftover.exists())
+        self.assertTrue(fresh.exists(), "a staged copy this new may belong to a running sync")

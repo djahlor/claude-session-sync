@@ -12,7 +12,7 @@ from .fingerprint import normalisation
 
 
 STATE_FILENAME = "chat-state.json"
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_STATE_BYTES = 64 * 1024 * 1024
 
 PathLike = Union[str, os.PathLike]
@@ -59,14 +59,18 @@ def load_state(path: PathLike) -> ChatState:
 
 
 def _decode(document: Any) -> ChatState:
-    if not isinstance(document, dict) or document.get("version") != STATE_VERSION:
+    if not isinstance(document, dict) or document.get("version") not in (1, STATE_VERSION):
         raise ValueError("unsupported version")
-    same_hashes = document.get("normalisation") == normalisation()
-    agreed = _string_map(document.get("agreed", {})) if same_hashes else {}
-    placed = (
+    # Version 1 kept one agreed version for all folders, which cannot say which
+    # folders took part. Its hashes are dropped; what was seen is kept.
+    same_hashes = (
+        document.get("version") == STATE_VERSION
+        and document.get("normalisation") == normalisation()
+    )
+    synced = (
         {
             _string(key): _string_map(value)
-            for key, value in _mapping(document.get("placed", {})).items()
+            for key, value in _mapping(document.get("synced", {})).items()
         }
         if same_hashes
         else {}
@@ -92,7 +96,7 @@ def _decode(document: Any) -> ChatState:
             "ids": sorted({_string(item) for item in _list(entry["ids"])}),
         }
     return ChatState(
-        sync=SyncState(agreed=agreed, seen=seen, placed=placed),
+        sync=SyncState(synced=synced, seen=seen),
         logins=logins,
         enrolled=sorted(set(enrolled)),
         live_creates=live_creates,
@@ -104,13 +108,12 @@ def encode_state(state: ChatState) -> Dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "normalisation": normalisation(),
-        "agreed": dict(sorted(state.sync.agreed.items())),
-        "seen": {key: sorted(ids) for key, ids in sorted(state.sync.seen.items())},
-        "placed": {
+        "synced": {
             key: dict(sorted(entries.items()))
-            for key, entries in sorted(state.sync.placed.items())
+            for key, entries in sorted(state.sync.synced.items())
             if entries
         },
+        "seen": {key: sorted(ids) for key, ids in sorted(state.sync.seen.items())},
         "logins": {
             root: [account, changed]
             for root, (account, changed) in sorted(state.logins.items())
