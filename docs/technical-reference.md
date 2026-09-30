@@ -68,8 +68,8 @@ The standard setup launches Claude normally with no `--user-data-dir`.
 For the easiest install, download the repository, double-click
 `Install Claude Session Sync.command`, and choose option 1. It uses the normal
 Claude app, trusts future logins inside that app's existing data root, syncs
-chats while Claude is open, and syncs Code routines, pins, and groups after
-Claude quits. It uses the
+chats when the account changes or Claude quits, and syncs Code routines, pins,
+and groups after Claude quits. It uses the
 macOS system Python and does not install Python packages globally.
 
 The same setup can run from Terminal:
@@ -135,10 +135,11 @@ claude-session-sync plan --json
 
 ## Use
 
-In automatic mode, chats sync in the background while Claude is open:
+In automatic mode, chats sync when the account changes and when Claude quits,
+never on every save:
 
 1. Sign out and sign in to another account in Claude when needed.
-2. Keep working. The other account's sidebar was kept up to date, so it is ready.
+2. Keep working. The switch syncs the other account's chats.
 3. If chats arrived after Claude loaded the new account, the Sync menu shows how
    many and offers **Restart Claude now**. Claude never restarts on its own.
 
@@ -319,9 +320,9 @@ never overwrites a file Claude wrote meanwhile.
 
 The watcher reads only `lastKnownAccountUuid` from Claude's `config.json` and
 keeps a SHA-256 fingerprint of it. It never reads cookies, copies credentials,
-or writes Claude's account config. A switch triggers a sync. A sidebar folder
-change triggers one within about five seconds, and a five-minute pass catches
-the rest. Chats created in the signed-in folder appear only after Claude reloads
+or writes Claude's account config. A switch triggers a sync, and so does Claude
+quitting. Saving a chat does not: syncing on every save ran all session and
+showed failure banners mid-work. Chats created in the signed-in folder appear only after Claude reloads
 it; the watcher then offers a restart. A requested restart asks Claude to quit
 normally, runs `switch <profile> --json` with Claude closed, and reopens it. A
 failed restart check or sync leaves Claude open or closed and reports why. It

@@ -98,6 +98,174 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual("failed", result["state"])
         self.assertEqual(1, result["exit_status"])
 
+    def test_launch_failure_does_not_prevent_a_subsequent_auto_attempt(self):
+        with tempfile.TemporaryDirectory(prefix="watcher-launch-failure-test-") as directory:
+            root = Path(directory)
+            status = root / "watcher-status.json"
+            account = root / "config.json"
+            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--account-file", str(account),
+                    "--profile", "Work",
+                    "--", str(root / "missing-sync-command"),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            def receipt():
+                try:
+                    return json.loads(status.read_bytes())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    return None
+
+            try:
+                deadline = time.monotonic() + 5
+                first = None
+                while time.monotonic() < deadline:
+                    first = receipt()
+                    if first and first["launch_failed"]:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(first, "initial launch failure receipt")
+                self.assertTrue(first["launch_failed"])
+
+                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                deadline = time.monotonic() + 7
+                second = None
+                while time.monotonic() < deadline:
+                    second = receipt()
+                    if second and second["timestamp"] != first["timestamp"]:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(second, "subsequent launch failure receipt")
+                self.assertNotEqual(first["timestamp"], second["timestamp"])
+                self.assertTrue(second["launch_failed"])
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_repeated_fast_children_finish_after_their_output_is_drained(self):
+        """One watcher must finish every child before starting the next retry."""
+        with tempfile.TemporaryDirectory(prefix="watcher-fast-exit-test-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            child = root / "child.py"
+            child.write_text(
+                "import json, pathlib, sys\n"
+                f"calls = pathlib.Path({str(calls)!r})\n"
+                "sequence = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1\n"
+                "with calls.open('a') as out: out.write(str(sequence) + '\\n')\n"
+                "result = {'state': 'noop', 'sequence': sequence, 'padding': 'x' * 1024}\n"
+                "if sequence <= 15: result.update(reason='busy', progress='waiting-for-sync')\n"
+                "else: result['progress'] = 'finished'\n"
+                "text = json.dumps(result)\n"
+                "before, after = text.split('\\\"progress\\\"', 1)\n"
+                "sys.stdout.write(before); sys.stdout.flush()\n"
+                "sys.stdout.write('\\\"progress\\\"' + after)\n"
+            )
+            status = root / "watcher-status.json"
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--", sys.executable, str(child),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 25
+                output = None
+                while time.monotonic() < deadline:
+                    try:
+                        receipt = json.loads(status.read_bytes())
+                        output = json.loads(receipt["output"])
+                    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                        time.sleep(0.05)
+                        continue
+                    if output.get("sequence") == 16 and output.get("progress") == "finished":
+                        break
+                    if process.poll() is not None:
+                        self.fail("watcher exited during the fast-child stress run")
+                    time.sleep(0.05)
+                self.assertIsNotNone(output, "fast-child completion receipt")
+                self.assertEqual(16, output.get("sequence"))
+                self.assertEqual("finished", output.get("progress"))
+                self.assertEqual("x" * 1024, output.get("padding"))
+                self.assertEqual([str(number) for number in range(1, 17)], calls.read_text().splitlines())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_an_account_change_syncs_once_while_chat_saves_do_not(self):
+        with tempfile.TemporaryDirectory(prefix="watcher-account-folder-race-test-") as directory:
+            root = Path(directory)
+            account = root / "config.json"
+            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            folder = root / "claude-code-sessions" / "account" / "workspace"
+            folder.mkdir(parents=True)
+            calls = root / "calls"
+            child = root / "child.py"
+            child.write_text(
+                "import json, pathlib\n"
+                f"calls = pathlib.Path({str(calls)!r})\n"
+                "sequence = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1\n"
+                "with calls.open('a') as out: out.write(str(sequence) + '\\n')\n"
+                "print(json.dumps({'state': 'noop', 'sequence': sequence, 'progress': 'finished'}))\n"
+            )
+            status = root / "watcher-status.json"
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--account-file", str(account),
+                    "--profile", "Work",
+                    "--", sys.executable, str(child),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            def call_count():
+                return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and call_count() < 1:
+                    time.sleep(0.05)
+                self.assertEqual(1, call_count(), "startup auto run")
+
+                # Save a chat and switch accounts together. Only the switch syncs.
+                time.sleep(3.2)
+                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                (folder / "new-chat.json").write_text("{}")
+
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and call_count() < 2:
+                    if process.poll() is not None:
+                        self.fail("watcher exited during the account-folder race")
+                    time.sleep(0.05)
+                time.sleep(6)
+                self.assertEqual(
+                    2,
+                    call_count(),
+                    "only the account change may sync; a chat save must not",
+                )
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_legacy_receipts_remain_supported(self):
         for phase in ("ready", "finished"):
             with self.subTest(phase=phase):
@@ -126,7 +294,7 @@ class WatcherTests(unittest.TestCase):
         """Exercise the real watcher: a switch triggers a sync, never a quit."""
         self.live_scenario(change_account=True)
 
-    def test_a_changed_sidebar_folder_triggers_a_sync(self):
+    def test_a_changed_chat_folder_does_not_sync_while_claude_runs(self):
         self.live_scenario(touch_folder=True)
 
     def test_restart_suggestion_is_recorded_without_quitting(self):
@@ -225,7 +393,9 @@ class WatcherTests(unittest.TestCase):
                     self.assertTrue(wait_for(lambda: len(entries()) >= 2, 20), "a switch must trigger a sync")
                     self.assertNotIn("must-not-be-copied", (root / "account-restart.json").read_text())
                     if restart_on_switch:
-                        switches = lambda: [item for item in entries() if item[0] == "switch"]
+                        def switches():
+                            return [item for item in entries() if item[0] == "switch"]
+
                         self.assertTrue(wait_for(lambda: switches(), 30), "a switch must restart once")
                         self.assertIn("--after-account-switch", switches()[0])
                         self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
@@ -236,14 +406,15 @@ class WatcherTests(unittest.TestCase):
                 if touch_folder:
                     time.sleep(1)
                     (folder / "local_new.json").write_text("{}")
-                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a folder change must trigger a sync")
+                    time.sleep(7)
+                    self.assertEqual(1, len(entries()), "a chat save must not sync while Claude runs")
                 if suggest_restart:
                     self.assertTrue(wait_for(lambda: json.loads(status.read_text()).get("restart_suggested") == 2, 5))
                     time.sleep(2)
                     self.assertTrue(app_running(), "a suggestion must never quit Claude")
                 if request_during_sync:
                     time.sleep(1)
-                    (folder / "local_new.json").write_text("{}")
+                    account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
                     self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a sync must be running")
                 if request_restart:
                     (root / "restart-request").write_text(request_text)

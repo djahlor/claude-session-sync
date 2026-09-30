@@ -37,8 +37,8 @@ A new account joins the sync once you start a chat in it.
 
 1. Sign out of Claude.
 2. Sign in to the other account.
-3. Keep working. Chats sync in the background while Claude is open, so the
-   other account's sidebar is already up to date.
+3. Keep working. Chats sync when you switch accounts and when you quit
+   Claude, not every time a chat saves.
 
 With pin and group sync on, Claude restarts once right after the switch. Claude
 keeps pins and groups in its own locked database and reloads each account's
