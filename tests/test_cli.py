@@ -1351,7 +1351,7 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(1, len(fake.calls))
             self.assertTrue(fake.calls[0][0])
             desired = json.loads(fake.calls[0][1])
-            self.assertEqual("all-configured-profiles", desired["target_policy"])
+            self.assertEqual("logins", desired["target_policy"])
             self.assertTrue(desired["profiles"][1]["enabled"])
             self.assertTrue(desired["sync_sidebar_layout"])
             self.assertTrue(desired["sync_code_routines"])
@@ -1426,7 +1426,7 @@ class CliConfigureTests(unittest.TestCase):
                 ),
             )
             updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("all-configured-profiles", updated["target_policy"])
+            self.assertEqual("logins", updated["target_policy"])
             self.assertTrue(updated["acknowledge_cross_account_copy"])
             self.assertTrue(updated["acknowledge_cross_profile_copy"])
             self.assertTrue(updated["profiles"][1]["enabled"])
@@ -1552,6 +1552,83 @@ class CliRoutineTests(unittest.TestCase):
 
 
 class CliLayoutTests(unittest.TestCase):
+    def test_adopt_current_sidebar_option_reaches_only_layout_adapter(self):
+        calls = []
+
+        class RecordingLayout:
+            def sync(self, *, adopt_current_sidebar=False):
+                calls.append(adopt_current_sidebar)
+                return FakeLayoutReceipt()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            loaded = replace(
+                loaded,
+                profiles=loaded.profiles[:1],
+                sync_sidebar_layout=True,
+                sync_code_routines=True,
+            )
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            deps = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: RecordingLayout(),
+                routine_factory=lambda _config: FakeRoutine(),
+                process_probe=FakeProcessProbe(),
+            )
+            output = io.StringIO()
+            self.assertEqual(
+                0,
+                run(
+                    ["sync", "--adopt-current-sidebar", "--json"],
+                    dependencies=deps,
+                    stdout=output,
+                    stderr=io.StringIO(),
+                ),
+            )
+            self.assertEqual([True], calls)
+            self.assertEqual("synced", json.loads(output.getvalue())["layout"]["state"])
+
+    def test_adopt_current_sidebar_requires_one_default_profile_before_any_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            unsafe_configs = (
+                replace(loaded, sync_sidebar_layout=True),
+                replace(
+                    loaded,
+                    profiles=(replace(loaded.profiles[1], is_default=False),),
+                    sync_sidebar_layout=True,
+                ),
+                replace(
+                    loaded,
+                    profiles=loaded.profiles[:1],
+                    sync_sidebar_layout=False,
+                ),
+            )
+            for unsafe in unsafe_configs:
+                with self.subTest(config=unsafe):
+                    planner_calls = []
+                    deps = CliDependencies(
+                        config_loader=lambda path, value=unsafe: value,
+                        planner_factory=lambda value: planner_calls.append(value),
+                    )
+                    errors = io.StringIO()
+                    self.assertNotEqual(
+                        0,
+                        run(
+                            ["sync", "--adopt-current-sidebar"],
+                            dependencies=deps,
+                            stdout=io.StringIO(),
+                            stderr=errors,
+                        ),
+                    )
+                    self.assertEqual([], planner_calls)
+                    self.assertIn("exactly one default profile", errors.getvalue())
+
     def test_explicit_current_sidebar_option_reaches_only_layout_adapter(self):
         calls = []
 

@@ -67,6 +67,7 @@ class RunJournal:
         records: Iterable[Mapping[str, Any]],
         *,
         run_id: Optional[str] = None,
+        lenient: bool = False,
     ) -> "RunJournal":
         state = ensure_private_directory(state_root)
         authentication_key = cls._load_or_create_key(state)
@@ -114,6 +115,8 @@ class RunJournal:
                 "records": materialized,
                 "receipt": None,
             }
+            if lenient:
+                manifest["lenient"] = True
             journal = cls(state, identifier, manifest, authentication_key)
             journal._persist(destination=run_root / "manifest.json")
             fsync_directory(run_root)
@@ -178,6 +181,10 @@ class RunJournal:
 
     def mark_applied(self, index: int) -> None:
         self.records[index]["applied"] = True
+
+    def mark_retire_started(self, index: int) -> None:
+        self.records[index]["retire_started"] = True
+        self._persist()
 
     def mark_unapplied(self, index: int) -> None:
         self.records[index]["applied"] = False
@@ -322,11 +329,30 @@ class RunJournal:
         return key
 
 
-def prune_terminal_runs(state_root: PathLike, retention: int) -> List[str]:
-    """Best-effort deletion of old terminal journals only."""
+KEPT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+KEPT_MAX_BYTES = 500 * 1024 * 1024
+
+
+def prune_terminal_runs(
+    state_root: PathLike,
+    retention: int,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: int = KEPT_MAX_AGE_SECONDS,
+    max_bytes: int = KEPT_MAX_BYTES,
+) -> List[str]:
+    """Best-effort deletion of old terminal journals only.
+
+    Each journal holds the files its run replaced or removed, so it doubles as
+    the kept copy. The newest ``retention`` runs always stay. Older runs stay
+    for 30 days while all kept runs together fit in 500 MB.
+    """
 
     if retention < 1:
         raise ValueError("retention must be at least one run")
+    import time
+
+    current = time.time() if now is None else now
     state = ensure_private_directory(state_root)
     runs = ensure_private_directory(state / "runs")
     terminal = []
@@ -343,7 +369,14 @@ def prune_terminal_runs(state_root: PathLike, retention: int) -> List[str]:
     terminal.sort(key=lambda item: (item[0], item[1]), reverse=True)
 
     deleted = []
-    for unused_modified_ns, run_id, run_root in terminal[retention:]:
+    total = 0
+    for position, (modified_ns, run_id, run_root) in enumerate(terminal):
+        total += _tree_size(run_root)
+        if position < retention:
+            continue
+        too_old = current - modified_ns / 1_000_000_000 > max_age_seconds
+        if not too_old and total <= max_bytes:
+            continue
         try:
             shutil.rmtree(str(run_root))
             fsync_directory(runs)
@@ -351,6 +384,17 @@ def prune_terminal_runs(state_root: PathLike, retention: int) -> List[str]:
             continue
         deleted.append(run_id)
     return deleted
+
+
+def _tree_size(root: Path) -> int:
+    size = 0
+    for parent, _directories, files in os.walk(str(root)):
+        for name in files:
+            try:
+                size += os.lstat(os.path.join(parent, name)).st_size
+            except OSError:
+                pass
+    return size
 
 
 def abandoned_preparations(state_root: PathLike) -> List[str]:

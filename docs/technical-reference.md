@@ -43,11 +43,13 @@ data root:
 }
 ```
 
-Automatic mode accepts future account and workspace IDs only under data roots
-already present in the private config. It does not trust new filesystem roots.
-Malformed chats and real revision conflicts still stop chat writes. A malformed
-routine or sidebar record skips only that separate update, so a completed chat
-sync stays completed. Invalid chats do not stop valid routine or sidebar updates.
+Automatic mode uses the `logins` target policy. Only sidebar folders of real
+logins take part: the approved targets, plus any folder of the signed-in account
+that Claude writes a chat to after a login on this Mac. Leftover folders from
+another Mac or from account switches are ignored. It does not trust new
+filesystem roots. A malformed chat, or two copies that changed to different
+states with equal activity, is left alone and reported; every other chat still
+syncs. A malformed routine or sidebar record skips only that separate update.
 Receipts use aggregate counts; diagnostic error details can include local paths.
 
 ## Requirements and compatibility
@@ -65,8 +67,9 @@ The standard setup launches Claude normally with no `--user-data-dir`.
 
 For the easiest install, download the repository, double-click
 `Install Claude Session Sync.command`, and choose option 1. It uses the normal
-Claude app, trusts future accounts inside that app's existing data root, and
-syncs chats, Code routines, pins, and groups after Claude quits. It uses the
+Claude app, trusts future logins inside that app's existing data root, syncs
+chats when the account changes or Claude quits, and syncs Code routines, pins,
+and groups after Claude quits. It uses the
 macOS system Python and does not install Python packages globally.
 
 The same setup can run from Terminal:
@@ -132,23 +135,21 @@ claude-session-sync plan --json
 
 ## Use
 
-The automatic-mode workflow has three steps:
+In automatic mode, chats sync when the account changes and when Claude quits,
+never on every save:
 
 1. Sign out and sign in to another account in Claude when needed.
-2. Wait while the helper detects the changed account, quits Claude, and syncs.
-3. Claude reopens automatically after successful sync and confirmed launch.
+2. Keep working. The switch syncs the other account's chats.
+3. If chats arrived after Claude loaded the new account, the Sync menu shows how
+   many and offers **Restart Claude now**. Claude never restarts on its own.
 
-Status reports waiting for Claude, syncing, finished, or needs attention. It also
-shows the last successful sync time. A missing or interrupted run is never
-reported as finished. A menu-bar status item and a non-activating status window
-show progress without depending on macOS notification permissions.
+`claude-session-sync restart-claude` asks the helper for the same restart.
+Status reports syncing, finished, or needs attention, and the last successful
+sync time. A missing or interrupted run is never reported as finished. A
+menu-bar status item and a non-activating status window show progress without
+depending on macOS notification permissions.
 
-Safe mode and non-default profile apps still use manual quit, wait for
-“Sync finished”, then reopen. Signing back into the same account does not trigger
-an automatic restart. The first account observed on installation is the baseline.
-
-If Claude reopens before the watcher can write, no data is changed. Quit it
-again and let the watcher finish the pending sync.
+Safe mode and non-default profile apps still sync after a manual quit.
 
 Manual commands remain available:
 
@@ -274,40 +275,87 @@ account settings. Clients without enabled account settings sync keep the local
 path. This is a private Claude protocol, verified against the installed Desktop
 build, not a supported public API or a guarantee against future changes.
 
-## Automatic account-switch restart
+## How chat sync decides
 
-In automatic target mode, the macOS watcher observes only the default profile's
-`config.json` account marker, `lastKnownAccountUuid`. Claude Desktop's installed
-account handler writes this field after its account identity changes. The helper
-waits for the new UUID to remain stable for three seconds, saves a private
-SHA-256 account fingerprint, then requests a normal quit. It never reads browser
-cookies, copies credentials, or writes Claude's account config. The containing
-JSON can include credentials; only the UUID is used, and no config data is logged
-or copied into the restart receipt.
+Claude keeps one sidebar record per chat in each account's folder. Sync compares
+what each record says, never file times, because a click rewrites a record. It
+ignores fields each account or click rewrites on its own: `lastFocusedAt`,
+`errorAt`, the connector lists `remoteMcpServersConfig` and `enabledMcpTools`,
+`transcriptUnavailable`, `promptSuggestion`, `promptAppendSnapshot`, and
+`toolSurfaceSnapshot`.
 
-Once Claude exits, the watcher calls the existing `switch <profile> --json`
-handoff. That path holds the sync/launch lock, waits for remaining processes,
-syncs all enabled adapters, and confirms launch before reporting success. A
-failed or interrupted restart does not keep quitting the app or reopen it after
-failed sync. A normal manual quit and successful sync clears the attention state.
-The first observed account establishes a baseline, so installing while signed in
-does not itself quit Claude. Signing back into the same account does not restart.
-Only account UUID changes are watched, not organization-only switches or custom
-non-default profile apps. This field is a private Desktop interface and can change.
+- **Last agreed version.** A private state file remembers the version all
+  folders last shared. A copy that still matches it is unchanged.
+- **One side changed.** The changed copy wins, unless its activity is older.
+- **Both changed.** The copy with the later `lastActivityAt` wins. Claude moves
+  that only on real work: a message, a turn, or a permission answer.
+- **Tie.** Equal activity with different content is left alone and reported.
+  `claude-session-sync sync --prefer ACCOUNT/WORKSPACE` settles it, and
+  `--session ID` limits that to one chat.
+- **Deletes.** Claude writes a `deleted_<id>` marker. Unless the chat was used
+  after the delete, the other copies are retired and the marker travels.
+- **Lost chats.** A chat that vanished where it was seen, with no marker, is not
+  put back. `claude-session-sync forget-lost ID` lets the next sync restore it.
+- **Unreadable chats.** A record Claude would not accept freezes only that chat.
 
-Before quitting, the watcher allows up to three account/process checks. A
-temporary timeout retries after two seconds, then four seconds; malformed output
-and unsafe profiles do not retry. Each CLI process check has a five-second total
-budget, including one retry of the read itself. The watcher also allows for CLI
-startup time. While checking, it keeps the previous account fingerprint, shows
-progress, and prevents overlapping checks. Each attempt is saved before it starts,
-so replacing or crashing the helper cannot reset that account's retry budget.
-Three failed checks leave Claude open and report the cause. These retries never
-repeat a data write or force-kill Claude.
+`claude-session-sync plan --report` writes every planned action and every chat
+left alone to `plan-report.json` in the private state folder, with session IDs
+and short folder labels only.
+
+`claude-session-sync seed-state --from-unenrolled --dry-run` (then `--apply`)
+starts a new state from folders outside sync, such as an old Mac's leftovers.
+Where they all hold the same version of a chat, that version becomes the last
+agreed one, so a rename or archive since then is recognised as the change.
+
+## Live folders and account switches
+
+Claude holds the signed-in account's chats in memory and writes them back from
+memory. In those folders sync only adds missing chats; it never replaces or
+removes a file there. Claude records a new login before it flushes the old
+login's saves, so for two minutes after a switch every folder is treated that
+way. The login time comes from Claude's `main.log` when it names the login, or
+from the first time sync sees it. Each replace or retire checks again, right
+before the write, that its folder is not live. A create uses a hard link, so it
+never overwrites a file Claude wrote meanwhile.
+
+The watcher reads only `lastKnownAccountUuid` from Claude's `config.json` and
+keeps a SHA-256 fingerprint of it. It never reads cookies, copies credentials,
+or writes Claude's account config. A switch triggers a sync, and so does Claude
+quitting. Saving a chat does not: syncing on every save ran all session and
+showed failure banners mid-work. Chats created in the signed-in folder appear only after Claude reloads
+it; the watcher then offers a restart. A requested restart asks Claude to quit
+normally, runs `switch <profile> --json` with Claude closed, and reopens it. A
+failed restart check or sync leaves Claude open or closed and reports why. It
+never force-kills Claude.
+
+Every write goes through the journal. Each run keeps the files it replaced or
+removed. The newest runs always stay; older ones stay for 30 days while all
+kept runs fit in 500 MB.
 
 The watcher owns a persistent menu-bar status item and a non-activating status
-window. Completion stays visible in the menu after the window disappears. It
-does not rely on AppleScript or Notification Center delivery.
+window. It does not rely on AppleScript or Notification Center delivery.
+
+## Pins and groups across accounts
+
+Claude keeps pins and custom groups in its Local Storage database, which it
+locks while open, and each account's group list also lives in that account's
+settings on Anthropic's servers. At sign-in Claude replaces the local list with
+the server list. So pins and groups can only be carried between accounts with
+Claude closed, and the new account must then upload the copy.
+
+- **One source of truth.** After an adoption, one account's organization is the
+  source. The signed-in account wins when Claude closes normally.
+- **Account switches.** With `sync_sidebar_layout` on, the watcher restarts
+  Claude once after a switch and runs `switch <profile> --after-account-switch`.
+  The account just left holds the newest organization, so it is copied into the
+  new account, which is then marked for a canonical upload to its servers.
+- **Deletes stick.** A deleted group is gone from every account after the next
+  sync; nothing is merged back from older copies.
+- **A choice when unclear.** If the signed-in account's groups changed without
+  a switch restart, sync stops and asks. `claude-session-sync keep-sidebar
+  --apply` marks the signed-in account as the source for the next time Claude
+  closes, and `restart-claude` does that restart.
+- **Accounts not yet synced** are left alone.
 
 ## Claude Code routines
 
@@ -331,11 +379,13 @@ Cowork routines use different space-specific context and are left untouched.
 
 ## Failure handling
 
-`plan`, `auto`, and `switch` return `next_action=run-doctor` for malformed chat
-data or conflicts. Exact-target safe mode returns
+`auto` and `sync` report chats left alone in `counts` (`tied`, `lost`,
+`unreadable`, `future`) and return `next_action=run-plan-report` when one needs
+a choice. They never convert data corruption or an ambiguous revision into an
+overwrite. An unreadable chat state file stops chat writes with
+`reason=state-unusable`. Exact-target safe mode returns
 `next_action=approve-targets-or-enable-automatic-targets` when a new target is
-the only blocker. Automatic mode removes that approval step,
-but never converts data corruption or an ambiguous revision into an overwrite.
+the only blocker.
 
 Routine and sidebar errors are separate. A malformed routine manifest returns
 `routines={'state': 'skipped', 'reason': 'unsafe-routines', 'detail': '...'}`.

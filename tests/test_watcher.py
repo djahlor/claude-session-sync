@@ -98,6 +98,174 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual("failed", result["state"])
         self.assertEqual(1, result["exit_status"])
 
+    def test_launch_failure_does_not_prevent_a_subsequent_auto_attempt(self):
+        with tempfile.TemporaryDirectory(prefix="watcher-launch-failure-test-") as directory:
+            root = Path(directory)
+            status = root / "watcher-status.json"
+            account = root / "config.json"
+            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--account-file", str(account),
+                    "--profile", "Work",
+                    "--", str(root / "missing-sync-command"),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            def receipt():
+                try:
+                    return json.loads(status.read_bytes())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    return None
+
+            try:
+                deadline = time.monotonic() + 5
+                first = None
+                while time.monotonic() < deadline:
+                    first = receipt()
+                    if first and first["launch_failed"]:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(first, "initial launch failure receipt")
+                self.assertTrue(first["launch_failed"])
+
+                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                deadline = time.monotonic() + 7
+                second = None
+                while time.monotonic() < deadline:
+                    second = receipt()
+                    if second and second["timestamp"] != first["timestamp"]:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(second, "subsequent launch failure receipt")
+                self.assertNotEqual(first["timestamp"], second["timestamp"])
+                self.assertTrue(second["launch_failed"])
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_repeated_fast_children_finish_after_their_output_is_drained(self):
+        """One watcher must finish every child before starting the next retry."""
+        with tempfile.TemporaryDirectory(prefix="watcher-fast-exit-test-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            child = root / "child.py"
+            child.write_text(
+                "import json, pathlib, sys\n"
+                f"calls = pathlib.Path({str(calls)!r})\n"
+                "sequence = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1\n"
+                "with calls.open('a') as out: out.write(str(sequence) + '\\n')\n"
+                "result = {'state': 'noop', 'sequence': sequence, 'padding': 'x' * 1024}\n"
+                "if sequence <= 15: result.update(reason='busy', progress='waiting-for-sync')\n"
+                "else: result['progress'] = 'finished'\n"
+                "text = json.dumps(result)\n"
+                "before, after = text.split('\\\"progress\\\"', 1)\n"
+                "sys.stdout.write(before); sys.stdout.flush()\n"
+                "sys.stdout.write('\\\"progress\\\"' + after)\n"
+            )
+            status = root / "watcher-status.json"
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--", sys.executable, str(child),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 25
+                output = None
+                while time.monotonic() < deadline:
+                    try:
+                        receipt = json.loads(status.read_bytes())
+                        output = json.loads(receipt["output"])
+                    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                        time.sleep(0.05)
+                        continue
+                    if output.get("sequence") == 16 and output.get("progress") == "finished":
+                        break
+                    if process.poll() is not None:
+                        self.fail("watcher exited during the fast-child stress run")
+                    time.sleep(0.05)
+                self.assertIsNotNone(output, "fast-child completion receipt")
+                self.assertEqual(16, output.get("sequence"))
+                self.assertEqual("finished", output.get("progress"))
+                self.assertEqual("x" * 1024, output.get("padding"))
+                self.assertEqual([str(number) for number in range(1, 17)], calls.read_text().splitlines())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_an_account_change_syncs_once_while_chat_saves_do_not(self):
+        with tempfile.TemporaryDirectory(prefix="watcher-account-folder-race-test-") as directory:
+            root = Path(directory)
+            account = root / "config.json"
+            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            folder = root / "claude-code-sessions" / "account" / "workspace"
+            folder.mkdir(parents=True)
+            calls = root / "calls"
+            child = root / "child.py"
+            child.write_text(
+                "import json, pathlib\n"
+                f"calls = pathlib.Path({str(calls)!r})\n"
+                "sequence = len(calls.read_text().splitlines()) + 1 if calls.exists() else 1\n"
+                "with calls.open('a') as out: out.write(str(sequence) + '\\n')\n"
+                "print(json.dumps({'state': 'noop', 'sequence': sequence, 'progress': 'finished'}))\n"
+            )
+            status = root / "watcher-status.json"
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(status),
+                    "--account-file", str(account),
+                    "--profile", "Work",
+                    "--", sys.executable, str(child),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            def call_count():
+                return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and call_count() < 1:
+                    time.sleep(0.05)
+                self.assertEqual(1, call_count(), "startup auto run")
+
+                # Save a chat and switch accounts together. Only the switch syncs.
+                time.sleep(3.2)
+                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                (folder / "new-chat.json").write_text("{}")
+
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and call_count() < 2:
+                    if process.poll() is not None:
+                        self.fail("watcher exited during the account-folder race")
+                    time.sleep(0.05)
+                time.sleep(6)
+                self.assertEqual(
+                    2,
+                    call_count(),
+                    "only the account change may sync; a chat save must not",
+                )
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_legacy_receipts_remain_supported(self):
         for phase in ("ready", "finished"):
             with self.subTest(phase=phase):
@@ -122,38 +290,37 @@ class WatcherTests(unittest.TestCase):
                 )
                 self.assertEqual("needs-attention", result["restart_phase"])
 
-    def test_account_change_quits_syncs_and_reopens_once(self):
-        """Exercise the real watcher and macOS quit event, not a mocked timer."""
-        self.account_change_scenario()
+    def test_account_change_syncs_without_quitting_claude(self):
+        """Exercise the real watcher: a switch triggers a sync, never a quit."""
+        self.live_scenario(change_account=True)
 
-    def test_failed_sync_does_not_reopen_or_repeat_after_helper_restart(self):
-        self.account_change_scenario(fail_sync=True)
+    def test_a_changed_chat_folder_does_not_sync_while_claude_runs(self):
+        self.live_scenario(touch_folder=True)
 
-    def test_transient_restart_check_retries_without_another_account_change(self):
-        self.account_change_scenario(fail_preflight_once=True)
+    def test_restart_suggestion_is_recorded_without_quitting(self):
+        self.live_scenario(suggest_restart=True)
 
-    def test_repeated_preflight_timeouts_stop_without_quitting_or_looping(self):
-        self.account_change_scenario(fail_preflight_always=True)
+    def test_restart_request_quits_syncs_and_reopens_once(self):
+        self.live_scenario(request_restart=True)
 
-    def test_preflight_budget_survives_replacement_between_failed_checks(self):
-        self.account_change_scenario(fail_preflight_always=True, restart_between_preflights=True)
+    def test_failed_restart_sync_does_not_reopen_or_repeat(self):
+        self.live_scenario(request_restart=True, fail_sync=True)
 
-    def test_last_preflight_is_consumed_before_a_crash_during_the_probe(self):
-        self.account_change_scenario(fail_preflight_always=True, restart_during_third_preflight=True)
+    def test_blocked_restart_check_leaves_claude_open(self):
+        self.live_scenario(request_restart=True, block_preflight=True)
 
-    def test_unsavable_preflight_budget_never_probes_or_quits(self):
-        self.account_change_scenario(fail_receipt_save=True)
+    def test_a_restart_requested_during_a_sync_waits_for_it(self):
+        self.live_scenario(request_restart=True, request_during_sync=True)
 
-    def test_different_candidate_gets_its_own_budget_after_helper_replacement(self):
-        self.account_change_scenario(fail_preflight_always=True, replace_candidate_after_first=True)
+    def test_with_pins_and_groups_a_switch_restarts_once_and_copies_them(self):
+        self.live_scenario(change_account=True, restart_on_switch=True)
 
-    def test_invalid_preflight_never_quits_or_retries(self):
-        self.account_change_scenario(block_preflight=True)
+    def test_an_adoption_request_reaches_the_closed_claude_sync(self):
+        self.live_scenario(request_restart=True, request_text="adopt-current-sidebar\n")
 
-    def account_change_scenario(self, fail_sync=False, fail_preflight_once=False,
-                                fail_preflight_always=False, block_preflight=False,
-                                restart_between_preflights=False, restart_during_third_preflight=False,
-                                fail_receipt_save=False, replace_candidate_after_first=False):
+    def live_scenario(self, change_account=False, touch_folder=False, suggest_restart=False,
+                      request_restart=False, fail_sync=False, block_preflight=False,
+                      request_during_sync=False, restart_on_switch=False, request_text=""):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app = root / "SyncTest.app"
@@ -168,21 +335,15 @@ class WatcherTests(unittest.TestCase):
             }))
             account = root / "config.json"
             account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            folder = root / "claude-code-sessions" / "account" / "workspace"
+            folder.mkdir(parents=True)
             calls = root / "calls.jsonl"
             child = root / "child.py"
             child.write_text(
                 "import json, pathlib, subprocess, sys, time\n"
                 f"calls = pathlib.Path({str(calls)!r})\n"
                 "if sys.argv[1] == 'restart-check':\n"
-                " failure = calls.with_suffix('.preflight-failed')\n"
-                " checks = calls.with_suffix('.checks')\n"
-                " checks.write_text(str(int(checks.read_text()) + 1 if checks.exists() else 1))\n"
-                f" if {restart_during_third_preflight!r} and int(checks.read_text()) == 3:\n"
-                "  while not calls.with_suffix('.probe-release').exists(): time.sleep(0.05)\n"
                 f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
-                f" if {fail_preflight_always!r} or ({fail_preflight_once!r} and not failure.exists()):\n"
-                "  failure.touch()\n"
-                "  print(json.dumps({'state': 'failed', 'error_type': 'process-timeout', 'reason': 'process-inspection-timeout', 'next_action': 'retry-sync'})); raise SystemExit(1)\n"
                 f" result = subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], text=True, capture_output=True)\n"
                 " print(json.dumps({'state': 'ready', 'pids': [int(pid) for pid in result.stdout.split()]})); raise SystemExit(0)\n"
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -191,99 +352,100 @@ class WatcherTests(unittest.TestCase):
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention'}})); raise SystemExit(1)\n"
                 f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished'}))\n"
-                "else: print(json.dumps({'state': 'skipped', 'reason': 'app-running', 'progress': 'waiting-for-Claude'}))\n"
+                "else:\n"
+                f" if {request_during_sync!r} and len(calls.read_text().splitlines()) > 1: time.sleep(3)\n"
+                f" print(json.dumps({{'state': 'noop', 'progress': 'finished', 'restart_suggested': 2 if {suggest_restart!r} else 0}}))\n"
             )
             subprocess.run(["/usr/bin/open", str(app)], check=True)
             status = root / "watcher-status.json"
             env = dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1")
             watcher_command = [
                 str(self.binary), "--claude-executable", str(executable), "--status", str(status),
-                "--account-file", str(account), "--profile", "Work", "--",
+                "--account-file", str(account), "--profile", "Work",
+                *(["--restart-on-switch", "1"] if restart_on_switch else []), "--",
                 sys.executable, str(child),
             ]
             process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                deadline = time.monotonic() + 10
-                while not status.exists() and process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                self.assertIsNone(process.poll(), "watcher must support account-change detection")
-                self.assertTrue(status.exists())
-                receipt = root / "account-restart.json"
-                if fail_receipt_save:
-                    backup = root / "original-receipt.json"
-                    receipt.rename(backup)
-                    receipt.symlink_to(backup)
-                account.write_text('{"lastKnownAccountUuid":null,"secret":"must-not-be-copied"}')
-                time.sleep(2)
-                self.assertEqual(1, len(calls.read_text().splitlines()), "logout alone must not restart")
-                account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
-                deadline = time.monotonic() + 30
-                replacements = 0
+
+            def entries():
+                return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+            def wait_for(condition, seconds):
+                deadline = time.monotonic() + seconds
                 while time.monotonic() < deadline:
-                    entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                    checks = calls.with_suffix('.checks')
-                    between_failures = (restart_between_preflights and replacements < 2 and checks.exists()
-                            and int(checks.read_text()) == replacements + 1
-                            and json.loads(status.read_text()).get("restart_phase") == "checking")
-                    during_probe = (restart_during_third_preflight and replacements == 0 and checks.exists()
-                                    and int(checks.read_text()) == 3)
-                    new_candidate = (replace_candidate_after_first and replacements == 0 and checks.exists()
-                                     and int(checks.read_text()) == 1
-                                     and json.loads(status.read_text()).get("restart_phase") == "checking")
-                    if between_failures or during_probe or new_candidate:
-                        state = json.loads(receipt.read_text())
-                        self.assertEqual({"account_hash", "phase", "candidate_hash", "preflight_attempts", "retry_not_before"}, set(state))
-                        self.assertEqual("checking", state["phase"])
-                        self.assertEqual(int(checks.read_text()), state["preflight_attempts"])
-                        self.assertRegex(state["candidate_hash"], r"^[0-9a-f]{64}$")
-                        self.assertNotEqual(state["account_hash"], state["candidate_hash"])
-                        self.assertLessEqual(state["retry_not_before"], time.time() + 6)
-                        self.assertGreater(state["retry_not_before"], 0)
-                        self.assertNotIn(json.loads(account.read_text())["lastKnownAccountUuid"], receipt.read_text())
-                        process.terminate()
-                        process.communicate(timeout=5)
-                        if new_candidate:
-                            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
-                        if during_probe:
-                            calls.with_suffix('.probe-release').touch()
-                        process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                        replacements += 1
-                    if any(item[0] == "switch" for item in entries) or json.loads(status.read_text()).get("restart_phase") == "needs-attention":
-                        break
+                    if condition():
+                        return True
                     time.sleep(0.1)
-                if restart_between_preflights:
-                    self.assertEqual(2, replacements, "replace the helper after each of its first two failed checks")
-                if restart_during_third_preflight:
-                    self.assertEqual(1, replacements, "replace the helper while its last check is still running")
-                if replace_candidate_after_first:
-                    self.assertEqual(1, replacements, "a different candidate must be present when the helper restarts")
-                detail = (status.read_text(), receipt.read_text() if receipt.exists() else "no restart receipt", entries)
-                expected_switches = 0 if fail_preflight_always or block_preflight or fail_receipt_save else 1
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "account change must quit and hand off to sync-and-launch: " + repr(detail))
-                if not expected_switches:
-                    self.assertEqual(0, subprocess.run(['/usr/bin/pgrep', '-f', str(executable)], stdout=subprocess.DEVNULL).returncode, "failed preflight must leave the app running")
-                time.sleep(4)
-                entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "reopen must not create a restart loop")
-                phase = "needs-attention" if fail_sync or not expected_switches else "finished"
-                self.assertEqual(phase, json.loads(status.read_text())["restart_phase"])
-                state = json.loads(receipt.read_text())
-                self.assertEqual({"account_hash", "phase"}, set(state))
-                self.assertNotIn("must-not-be-copied", receipt.read_text())
-                process.terminate()
-                process.communicate(timeout=5)
-                process = subprocess.Popen(watcher_command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                time.sleep(5)
-                entries = [json.loads(line) for line in calls.read_text().splitlines()]
-                self.assertEqual(expected_switches, sum(item[0] == "switch" for item in entries), "helper restart must preserve the once-only guard")
-                self.assertEqual("ready" if fail_receipt_save else phase, json.loads(receipt.read_text())["phase"])
-                expected_checks = 0 if fail_receipt_save else 3 if fail_preflight_always else 2 if fail_preflight_once else 1
-                if replace_candidate_after_first:
-                    expected_checks += 1
-                actual_checks = int(checks.read_text()) if checks.exists() else 0
-                self.assertEqual(expected_checks, actual_checks, "preflight retries must be bounded across helper restarts")
+                return False
+
+            def app_running():
+                return subprocess.run(['/usr/bin/pgrep', '-f', str(executable)], stdout=subprocess.DEVNULL).returncode == 0
+
+            try:
+                self.assertTrue(wait_for(lambda: status.exists() and len(entries()) >= 1, 10), "startup sync")
+                self.assertIsNone(process.poll())
+                self.assertEqual(["auto", "--json"], entries()[0])
+                if change_account:
+                    account.write_text('{"lastKnownAccountUuid":null,"secret":"must-not-be-copied"}')
+                    time.sleep(2)
+                    self.assertEqual(1, len(entries()), "logout alone must not sync")
+                    account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 20), "a switch must trigger a sync")
+                    self.assertNotIn("must-not-be-copied", (root / "account-restart.json").read_text())
+                    if restart_on_switch:
+                        def switches():
+                            return [item for item in entries() if item[0] == "switch"]
+
+                        self.assertTrue(wait_for(lambda: switches(), 30), "a switch must restart once")
+                        self.assertIn("--after-account-switch", switches()[0])
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
+                        time.sleep(4)
+                        self.assertEqual(1, len(switches()), "no restart loop")
+                    else:
+                        self.assertTrue(app_running(), "a switch must never quit Claude")
+                if touch_folder:
+                    time.sleep(1)
+                    (folder / "local_new.json").write_text("{}")
+                    time.sleep(7)
+                    self.assertEqual(1, len(entries()), "a chat save must not sync while Claude runs")
+                if suggest_restart:
+                    self.assertTrue(wait_for(lambda: json.loads(status.read_text()).get("restart_suggested") == 2, 5))
+                    time.sleep(2)
+                    self.assertTrue(app_running(), "a suggestion must never quit Claude")
+                if request_during_sync:
+                    time.sleep(1)
+                    account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+                    self.assertTrue(wait_for(lambda: len(entries()) >= 2, 12), "a sync must be running")
+                if request_restart:
+                    (root / "restart-request").write_text(request_text)
+                    finished = wait_for(
+                        lambda: any(item[0] == "switch" for item in entries())
+                        or json.loads(status.read_text()).get("restart_phase") == "needs-attention",
+                        30,
+                    )
+                    self.assertTrue(
+                        finished,
+                        "the restart request must be handled: {} {}".format(
+                            status.read_text(), entries()
+                        ),
+                    )
+                    expected = 0 if block_preflight else 1
+                    time.sleep(4)
+                    self.assertEqual(expected, sum(item[0] == "switch" for item in entries()))
+                    if expected and request_text:
+                        switch_call = next(item for item in entries() if item[0] == "switch")
+                        self.assertIn("--adopt-current-sidebar", switch_call)
+                    self.assertFalse((root / "restart-request").exists())
+                    phase = json.loads(status.read_text())["restart_phase"]
+                    self.assertEqual("needs-attention" if fail_sync or block_preflight else "finished", phase)
+                    if block_preflight:
+                        self.assertTrue(app_running(), "a blocked check must leave Claude open")
+                    elif not fail_sync:
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen after the sync")
+                self.assertTrue(
+                    all(item[0] != "switch" for item in entries()) or request_restart or restart_on_switch
+                )
             finally:
-                calls.with_suffix('.probe-release').touch()
                 if process.poll() is None:
                     process.terminate()
                 process.communicate(timeout=5)

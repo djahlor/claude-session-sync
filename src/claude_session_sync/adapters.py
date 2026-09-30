@@ -100,7 +100,17 @@ def _failure(name, error) -> dict:
     return {"state": "skipped", "reason": singular + "-error"}
 
 
-def run_adapters(config, dependencies, running, *, probe_only=False, prefer_current_sidebar=False) -> dict:
+def run_adapters(
+    config,
+    dependencies,
+    running,
+    *,
+    probe_only=False,
+    prefer_current_sidebar=False,
+    adopt_current_sidebar=False,
+    adopt_source_scope=None,
+    after_account_switch=False,
+) -> dict:
     """A failed adapter cannot prevent the other enabled adapter from running."""
     results = {}
     probes = {}
@@ -109,7 +119,10 @@ def run_adapters(config, dependencies, running, *, probe_only=False, prefer_curr
             continue
         try:
             if running():
-                result = {"state": "skipped", "reason": "app-running"}
+                # Claude locks these stores while it runs. They sync when it
+                # quits; the last real status stays on disk until then.
+                results[name] = {"state": "deferred", "reason": "app-running"}
+                continue
             else:
                 adapter = getattr(dependencies, factory)(config)
                 if probe_only:
@@ -117,8 +130,14 @@ def run_adapters(config, dependencies, running, *, probe_only=False, prefer_curr
                 else:
                     # sync validates after guarded recovery. A probe before recovery
                     # could reject the interrupted state that recovery must repair.
-                    if name == "layout" and prefer_current_sidebar:
+                    if name == "layout" and adopt_source_scope is not None:
+                        receipt = adapter.sync(adopt_source_scope=adopt_source_scope)
+                    elif name == "layout" and adopt_current_sidebar:
+                        receipt = adapter.sync(adopt_current_sidebar=True)
+                    elif name == "layout" and prefer_current_sidebar:
                         receipt = adapter.sync(prefer_current_sidebar=True)
+                    elif name == "layout" and after_account_switch:
+                        receipt = adapter.sync(after_account_switch=True)
                     else:
                         receipt = adapter.sync()
                     result = {"state": receipt.state}
@@ -155,6 +174,6 @@ def adapter_failure(config, name: str) -> int:
         if name == key and getattr(config, flag):
             return int(
                 read_status(config.state_dir, filename).get("state")
-                not in ("synced", "noop")
+                not in ("synced", "noop", "unknown")
             )
     return 0

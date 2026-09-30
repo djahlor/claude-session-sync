@@ -140,19 +140,41 @@ class ProcessProbe:
             "capture_output": True,
         }
         deadline = None if timeout is None else time.monotonic() + timeout
-        if timeout is not None:
-            options["timeout"] = min(2.0, timeout)
-        command = ["ps", "-axo", "pid=,command="]
-        try:
-            completed = self._runner(command, **options)
-        except subprocess.TimeoutExpired:
-            # Retry only this read, never a write, and share the caller's total
-            # deadline so exit/launch safety checks remain bounded.
-            remaining = 0 if deadline is None else deadline - time.monotonic()
-            if remaining <= 0:
-                raise
-            options["timeout"] = remaining
-            completed = self._runner(command, **options)
+
+        def read(command):
+            current_options = dict(options)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                current_options["timeout"] = min(2.0, remaining)
+            try:
+                return self._runner(command, **current_options)
+            except subprocess.TimeoutExpired:
+                if deadline is None:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                current_options["timeout"] = remaining
+                return self._runner(command, **current_options)
+
+        expected_executable = os.fspath(_normalized(executable))
+        listing = read(["ps", "-axo", "pid=,comm="])
+        candidate_pids = []
+        for line in listing.stdout.splitlines():
+            pid_text, _separator, program = line.strip().partition(" ")
+            if program.strip() != expected_executable:
+                continue
+            try:
+                candidate_pids.append(str(int(pid_text)))
+            except ValueError:
+                continue
+        if not candidate_pids:
+            return ()
+        completed = read(
+            ["ps", "-p", ",".join(candidate_pids), "-o", "pid=,command="],
+        )
         return parse_process_table(
             completed.stdout,
             executable=executable,

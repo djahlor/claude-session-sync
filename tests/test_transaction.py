@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -359,13 +360,24 @@ class TransactionEngineTests(unittest.TestCase):
                     retention=1,
                 ).apply(make_plan(crashing_source, crashing_destination, None))
 
-            TransactionEngine(
-                root / "state", process_probe=lambda: False, retention=1
-            ).rollback(terminal_run_ids[0])
+            # A young terminal run doubles as the kept copy of what it replaced.
+            engine = TransactionEngine(root / "state", process_probe=lambda: False, retention=1)
+            engine.rollback(terminal_run_ids[0])
+            runs = root / "state" / "runs"
+            self.assertEqual(
+                {path.name for path in runs.iterdir()},
+                {incomplete_run_ids[0], *terminal_run_ids},
+            )
 
-            remaining = {path.name for path in (root / "state" / "runs").iterdir()}
+            # Past 30 days it goes, but the newest run and unfinished runs stay.
+            month_old = time.time() - 31 * 24 * 60 * 60
+            manifest = runs / terminal_run_ids[1] / "manifest.json"
+            os.utime(manifest, (month_old, month_old))
+            engine.rollback(terminal_run_ids[0])
+
+            remaining = {path.name for path in runs.iterdir()}
             self.assertEqual(remaining, {incomplete_run_ids[0], terminal_run_ids[0]})
-            self.assertFalse((root / "state" / "runs" / terminal_run_ids[1]).exists())
+            self.assertFalse((runs / terminal_run_ids[1]).exists())
 
     def test_incomplete_run_blocks_apply_until_public_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as root_string:

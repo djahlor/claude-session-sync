@@ -254,13 +254,19 @@ class Installer:
             claude_executable = Path(template["claude_executable"])
             watcher_status = Path(template["state_dir"]) / "watcher-status.json"
         account_arguments = ()
-        if configured is not None and configured.target_policy == "all-configured-profiles":
+        if configured is not None and configured.target_policy in (
+            "all-configured-profiles",
+            "logins",
+        ):
             defaults = [profile for profile in configured.profiles if profile.is_default]
             if len(defaults) == 1:
                 account_arguments = (
                     "--account-file", str(defaults[0].data_root / "config.json"),
                     "--profile", defaults[0].name,
                 )
+                if configured.sync_sidebar_layout:
+                    # Pins and groups move only with Claude closed.
+                    account_arguments += ("--restart-on-switch", "1")
         arguments = (
             (
                 str(self.layout.watcher_binary),

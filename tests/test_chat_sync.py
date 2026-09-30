@@ -1,0 +1,397 @@
+"""End-to-end chat sync over real folders: rules, liveness, journal, and state."""
+
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from claude_session_sync.chat_state import load_state, save_state, state_path
+from claude_session_sync.chat_sync import plan_chat_sync, run_chat_sync
+from claude_session_sync.config import ApprovedTarget, Config
+from claude_session_sync.fingerprint import fingerprint
+from claude_session_sync.model import Profile
+from claude_session_sync.planner import Planner
+from claude_session_sync.transaction import TransactionEngine
+
+A_ACCOUNT = "aaaaaaaa-0000-4000-8000-000000000001"
+A_ORG = "aaaaaaaa-0000-4000-8000-0000000000a1"
+B_ACCOUNT = "bbbbbbbb-0000-4000-8000-000000000002"
+B_ORG = "bbbbbbbb-0000-4000-8000-0000000000b2"
+X = "11111111-1111-4111-8111-111111111111"
+Y = "22222222-2222-4222-8222-222222222222"
+NOW_MS = int(time.time() * 1000)
+
+
+class ChatSyncFixture(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.data_root = self.root / "Claude"
+        self.a = self.folder(A_ACCOUNT, A_ORG)
+        self.b = self.folder(B_ACCOUNT, B_ORG)
+        self.app_log = self.root / "main.log"
+        self.app_log.write_text("", encoding="utf-8")
+        self.running = False
+        self.signed_in = A_ACCOUNT
+        self.config = Config(
+            profiles=(Profile("Work", self.data_root, ("open",), True),),
+            state_dir=self.root / "state",
+            retention=5,
+            acknowledge_cross_profile_copy=False,
+            acknowledge_cross_account_copy=True,
+            claude_executable=Path("/Applications/Claude.app/Contents/MacOS/Claude"),
+            approved_targets=(
+                ApprovedTarget("Work", A_ACCOUNT, A_ORG),
+                ApprovedTarget("Work", B_ACCOUNT, B_ORG),
+            ),
+            target_policy="logins",
+        )
+        self.write_config()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def folder(self, account, org):
+        path = self.data_root / "claude-code-sessions" / account / org
+        path.mkdir(parents=True)
+        return path
+
+    def write_config(self):
+        (self.data_root / "config.json").write_text(
+            json.dumps({"lastKnownAccountUuid": self.signed_in, "oauth": "secret"}),
+            encoding="utf-8",
+        )
+
+    def write(self, folder, session_id, **fields):
+        body = {"sessionId": "local_" + session_id, "title": "t", "lastActivityAt": 100}
+        body.update(fields)
+        path = folder / "local_{}.json".format(session_id)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        old = time.time() - 60
+        os.utime(path, (old, old))
+        return path
+
+    def read(self, folder, session_id):
+        path = folder / "local_{}.json".format(session_id)
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def processes(self, _config):
+        return (SimpleNamespace(pid=4242, user_data_dir=self.data_root),) if self.running else ()
+
+    def planner(self):
+        return Planner(running_processes=self.processes, app_log=self.app_log)
+
+    def sync(self, **options):
+        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: self.running)
+        return run_chat_sync(self.config, self.planner(), engine, **options)
+
+    def agree(self, session_id, **fields):
+        """Record the version both accounts last agreed on."""
+
+        body = {"sessionId": "local_" + session_id, "title": "t", "lastActivityAt": 100}
+        body.update(fields)
+        state = load_state(state_path(self.config.state_dir))
+        state_hash = fingerprint(session_id, json.dumps(body).encode()).state_hash
+        for key in self.keys():
+            state.sync.synced.setdefault(key, {})[session_id] = state_hash
+            state.sync.seen.setdefault(key, set()).add(session_id)
+        save_state(state_path(self.config.state_dir), state)
+
+    def keys(self):
+        return ["Work/{}/{}".format(A_ACCOUNT, A_ORG), "Work/{}/{}".format(B_ACCOUNT, B_ORG)]
+
+
+class ChatSyncTests(ChatSyncFixture):
+    def test_a_new_chat_is_copied_to_the_other_account(self):
+        self.write(self.a, X)
+
+        run = self.sync()
+
+        self.assertEqual(run.receipt.status, "committed")
+        self.assertEqual(self.read(self.b, X)["sessionId"], "local_" + X)
+
+    def test_the_side_that_changed_wins_even_when_the_other_file_is_newer(self):
+        self.write(self.a, X, title="t", lastActivityAt=100)
+        self.write(self.b, X, title="renamed", lastActivityAt=200)
+        self.agree(X, title="t", lastActivityAt=100)
+        # A click on the stale copy makes its file the newest one.
+        stale = self.write(self.a, X, title="t", lastActivityAt=100, lastFocusedAt=999)
+        os.utime(stale, None)
+
+        self.sync()
+
+        self.assertEqual(self.read(self.a, X)["title"], "renamed")
+
+    def test_a_click_or_a_connector_list_alone_is_not_copied(self):
+        self.write(self.a, X, lastFocusedAt=1, enabledMcpTools={"mcp__a__x": True})
+        self.write(self.b, X, lastFocusedAt=2, enabledMcpTools={"mcp__b__y": True})
+
+        run = self.sync()
+
+        self.assertEqual(run.receipt.status, "noop")
+        self.assertEqual(self.read(self.b, X)["enabledMcpTools"], {"mcp__b__y": True})
+
+    def test_a_tie_is_reported_and_the_other_chats_still_sync(self):
+        self.write(self.a, X, title="one", lastActivityAt=100)
+        self.write(self.b, X, title="two", lastActivityAt=100)
+        self.write(self.a, Y)
+        self.agree(X, title="zero")
+
+        run = self.sync()
+
+        self.assertEqual(run.problems, {"tied": 2})
+        self.assertIsNotNone(self.read(self.b, Y))
+        self.assertEqual(self.read(self.b, X)["title"], "two")
+
+    def test_prefer_settles_a_tie(self):
+        self.write(self.a, X, title="one", lastActivityAt=100)
+        self.write(self.b, X, title="two", lastActivityAt=100)
+        self.agree(X, title="zero")
+
+        self.sync(prefer="Work/{}/{}".format(A_ACCOUNT, A_ORG))
+
+        self.assertEqual(self.read(self.b, X)["title"], "one")
+
+    def test_a_deleted_chat_stays_deleted(self):
+        self.write(self.a, X, lastActivityAt=100)
+        (self.b / "deleted_{}".format(X)).write_text(str(NOW_MS - 1_000), encoding="ascii")
+        self.agree(X)
+
+        self.sync()
+
+        self.assertIsNone(self.read(self.a, X))
+        self.assertTrue((self.a / "deleted_{}".format(X)).exists())
+        runs = list((self.config.state_dir / "runs").iterdir())
+        self.assertEqual(len(runs), 1, "the retired record is kept in the run journal")
+
+    def test_a_chat_that_vanished_where_it_was_seen_is_not_put_back(self):
+        self.write(self.a, X)
+        self.write(self.b, X)
+        self.sync()
+        (self.b / "local_{}.json".format(X)).unlink()
+
+        run = self.sync()
+
+        self.assertEqual(run.problems, {"lost": 1})
+        self.assertIsNone(self.read(self.b, X))
+
+    def test_the_agreed_version_is_remembered_after_a_run(self):
+        self.write(self.a, X)
+
+        self.sync()
+
+        state = load_state(state_path(self.config.state_dir))
+        self.assertEqual({X}, set(state.sync.synced[self.keys()[0]]))
+        self.assertEqual({X}, set(state.sync.synced[self.keys()[1]]))
+        self.assertEqual(state.sync.seen[self.keys()[1]], {X})
+
+    def test_with_claude_open_the_signed_in_folder_only_gains_new_chats(self):
+        self.running = True
+        self.write(self.a, X, title="t", lastActivityAt=100)
+        self.write(self.b, X, title="renamed", lastActivityAt=200)
+        self.write(self.b, Y)
+        self.agree(X)
+        state = load_state(state_path(self.config.state_dir))
+        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
+        save_state(state_path(self.config.state_dir), state)
+
+        run = self.sync()
+
+        self.assertEqual(self.read(self.a, X)["title"], "t", "a live record is never replaced")
+        self.assertIsNotNone(self.read(self.a, Y), "a new chat may still be added")
+        self.assertEqual(run.problems, {"live": 1})
+        self.assertEqual(run.restart_suggested, 1)
+
+    def test_the_other_account_is_still_updated_while_claude_is_open(self):
+        self.running = True
+        self.write(self.a, X, title="renamed", lastActivityAt=200)
+        self.write(self.b, X, title="t", lastActivityAt=100)
+        self.agree(X)
+        state = load_state(state_path(self.config.state_dir))
+        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
+        save_state(state_path(self.config.state_dir), state)
+
+        run = self.sync()
+
+        self.assertEqual(self.read(self.b, X)["title"], "renamed")
+        self.assertEqual(run.restart_suggested, 0)
+
+    def test_right_after_a_switch_every_folder_only_gains_new_chats(self):
+        self.running = True
+        self.write(self.a, X, title="renamed", lastActivityAt=200)
+        self.write(self.b, X, title="t", lastActivityAt=100)
+        self.agree(X)
+        state = load_state(state_path(self.config.state_dir))
+        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 30 * 1000)
+        save_state(state_path(self.config.state_dir), state)
+
+        run = self.sync()
+
+        self.assertEqual(self.read(self.b, X)["title"], "t")
+        self.assertEqual(run.problems, {"live": 1})
+
+    def test_a_login_line_in_claudes_log_dates_the_switch(self):
+        self.running = True
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 30))
+        self.app_log.write_text(
+            "{} [info] [account] Login-state transition (loggedOut: true → false, "
+            "uuid: {} → {}), clearing oauth cache\n".format(stamp, B_ACCOUNT, A_ACCOUNT),
+            encoding="utf-8",
+        )
+        self.write(self.a, X, title="renamed", lastActivityAt=200)
+        self.write(self.b, X, title="t", lastActivityAt=100)
+        self.agree(X)
+
+        self.sync()
+
+        self.assertEqual(self.read(self.b, X)["title"], "t", "still inside the two minutes")
+        state = load_state(state_path(self.config.state_dir))
+        self.assertEqual(state.logins[str(self.data_root)][0], A_ACCOUNT)
+
+    def test_a_restart_clears_the_restart_suggestion(self):
+        self.running = True
+        self.write(self.b, Y)
+        state = load_state(state_path(self.config.state_dir))
+        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
+        save_state(state_path(self.config.state_dir), state)
+        self.assertEqual(self.sync().restart_suggested, 1)
+
+        self.running = False
+        self.assertEqual(self.sync().restart_suggested, 0)
+        self.assertEqual(load_state(state_path(self.config.state_dir)).live_creates, {})
+
+    def test_leftover_folders_are_ignored(self):
+        leftover = self.folder("cccccccc-0000-4000-8000-000000000003", A_ORG)
+        self.write(leftover, X)
+
+        run = self.sync()
+
+        self.assertEqual(run.plan.ignored_targets, 1)
+        self.assertIsNone(self.read(self.a, X))
+
+    def test_a_new_login_joins_once_claude_writes_a_chat_there(self):
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_folder = self.folder(new_account, A_ORG)
+        self.write(self.a, X)
+        self.running = True
+        self.signed_in = new_account
+        self.write_config()
+        state = load_state(state_path(self.config.state_dir))
+        state.logins[str(self.data_root)] = (new_account, NOW_MS - 10 * 60 * 1000)
+        save_state(state_path(self.config.state_dir), state)
+        fresh = new_folder / "local_{}.json".format(Y)
+        fresh.write_text(json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8")
+
+        run = self.sync()
+
+        self.assertEqual(run.newly_enrolled, 1)
+        self.assertIsNotNone(self.read(new_folder, X))
+
+    def test_planning_writes_nothing(self):
+        self.write(self.a, X)
+
+        run = plan_chat_sync(self.config, self.planner())
+
+        self.assertEqual(len(run.plan.operations), 1)
+        self.assertIsNone(self.read(self.b, X))
+        self.assertFalse(state_path(self.config.state_dir).exists())
+
+    def test_a_file_that_moves_on_mid_run_waits_for_the_next_run(self):
+        self.write(self.a, X)
+        self.write(self.a, Y)
+        planner = self.planner()
+        plan = planner.plan(SimpleNamespace(config=self.config))
+        # Claude writes Y into B after planning.
+        self.write(self.b, Y, title="claude wrote this")
+        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: False)
+
+        receipt = engine.apply(plan, live_guard=plan.context.is_live_path)
+
+        self.assertEqual(receipt.status, "partial")
+        self.assertEqual(receipt.skipped_count, 1)
+        self.assertIsNotNone(self.read(self.b, X))
+        self.assertEqual(self.read(self.b, Y)["title"], "claude wrote this")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class RecoveryTests(ChatSyncFixture):
+    """Paired steps, crashes mid-run, and leftovers of killed runs."""
+
+    def test_a_marker_stays_when_the_record_meant_to_replace_it_waits(self):
+        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000)
+        marker = self.b / "deleted_{}".format(X)
+        marker.write_text(str(NOW_MS - 10_000), encoding="ascii")
+        plan = self.planner().plan(SimpleNamespace(config=self.config))
+        self.assertEqual(["create", "retire"], [op.kind for op in plan.operations])
+        # Claude saves the chat in A between planning and writing.
+        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000, title="saved again")
+        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: False)
+
+        receipt = engine.apply(plan, live_guard=plan.context.is_live_path)
+
+        self.assertEqual(2, receipt.skipped_count)
+        self.assertTrue(marker.exists(), "the marker must not go without the record")
+        self.assertIsNone(self.read(self.b, X))
+
+    def test_a_crash_right_after_a_removal_neither_blocks_sync_nor_loses_the_file(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X, lastActivityAt=100)
+        (self.b / "deleted_{}".format(X)).write_text(str(NOW_MS - 1_000), encoding="ascii")
+        self.agree(X)
+        real_unlink = transaction.durable_unlink
+
+        def unlink_then_die(path):
+            real_unlink(path)
+            raise KeyboardInterrupt("killed mid-run")
+
+        with patch.object(transaction, "durable_unlink", unlink_then_die):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        self.assertIsNone(self.read(self.a, X))
+        run_id = next((self.config.state_dir / "runs").iterdir()).name
+
+        # The removed record can still be put back from the journal.
+        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(run_id)
+        self.assertIsNotNone(self.read(self.a, X))
+
+        # And the next live run is not blocked by the crash.
+        self.write(self.a, Y)
+        run = self.sync()
+        self.assertIn(run.receipt.status, ("committed", "partial"))
+        self.assertIsNotNone(self.read(self.b, Y))
+
+    def test_an_interrupted_live_run_is_closed_and_the_next_run_goes_on(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X)
+        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+
+        run = self.sync()
+
+        self.assertEqual("committed", run.receipt.status)
+        self.assertIsNotNone(self.read(self.b, X))
+
+    def test_staged_copies_left_by_a_killed_run_are_swept(self):
+        leftover = self.b / ".local_{}.json.0123.stage".format(X)
+        leftover.write_text("{}", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(leftover, (old, old))
+        fresh = self.b / ".local_{}.json.4567.stage".format(Y)
+        fresh.write_text("{}", encoding="utf-8")
+        self.write(self.a, X)
+
+        self.sync()
+
+        self.assertFalse(leftover.exists())
+        self.assertTrue(fresh.exists(), "a staged copy this new may belong to a running sync")

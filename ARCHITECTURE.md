@@ -15,6 +15,11 @@ apply(plan) -> RunReceipt
 rollback(run_id) -> RecoveryReceipt
 ```
 
+Chat sync may run while Claude is open. The planner decides per session from
+content and a private record of the last agreed version (rules.py, ported from
+vinlim/claude-desktop-sync under 0BSD). Liveness marks the signed-in account's
+folders, and every folder for two minutes after a login change, as add-only.
+
 `switch(profile)` is a thin macOS adapter: it can wait a bounded time for every
 managed Claude process to exit, applies the current plan, and launches the
 selected profile. Because the termination watcher may start the same work, the
@@ -26,12 +31,13 @@ fail-closed until the selected profile is confirmed or the user explicitly
 clears a known failed launch. It adds no synchronization policy.
 
 In automatic target mode, the native watcher observes the default profile's
-account UUID marker. A stable change requests one normal quit, then reuses
-`switch(profile)` for sync and confirmed launch. A private account fingerprint
-and phase receipt is saved before requesting quit, preventing helper restarts
-from repeating a failed quit. Manual quits still trigger ordinary sync without
-reopening the app. A persistent status menu and a non-activating window display
-progress without depending on Notification Center.
+account UUID marker and the sidebar folders. A stable account change or a folder
+change triggers `auto`, which syncs chats with Claude open. It never quits
+Claude for a switch. When chats were created in the signed-in folder, which
+Claude reads only at load, the menu offers a restart. Only that request quits
+Claude once and reuses `switch(profile)` for sync and confirmed launch. A
+persistent status menu and a non-activating window display progress without
+depending on Notification Center.
 
 ## Domain language
 
@@ -47,19 +53,26 @@ progress without depending on Notification Center.
 ## Invariants
 
 1. Cross-profile copying is disabled unless the configuration explicitly
-   acknowledges it. Target discovery uses either the private exact-target
-   allowlist or an explicit `all-configured-profiles` policy restricted to the
-   configured profile roots.
-2. A plan with conflicts or invalid replicas cannot be applied.
+   acknowledges it. Target discovery uses the private exact-target allowlist,
+   the `logins` policy (approved targets plus folders Claude wrote to after a
+   login), or an explicit `all-configured-profiles` policy, always restricted to
+   the configured profile roots.
+2. A plan with invalid targets cannot be applied. A session the rules leave
+   alone (tied, lost, unreadable, future, or live) is reported and never blocks
+   another session.
 3. One exclusive file lock covers revalidation, journal creation, staging,
    commit, verification, and receipt persistence.
 4. Existing destinations are journaled before mutation. New destinations are
    recorded so rollback can remove only the exact content the run introduced.
-5. Live destinations are changed only by same-directory atomic replacement.
+5. Files change only by same-directory atomic replacement, by a hard-link
+   create that never overwrites, or by a journaled removal. In a folder a
+   running Claude may hold, only creates happen, re-checked before each write.
 6. A rollback verifies every preimage before it changes live data and never
-   suppresses restore failures.
-7. Unknown layouts, malformed JSON, symlinks, and equal-mtime divergent
-   revisions block instead of being guessed through.
+   suppresses restore failures. Automatic rollback after a failed live run
+   leaves alone any file that changed after the run wrote it.
+7. File times never decide. Unknown layouts and symlinks block the run;
+   malformed records and equal-activity divergent copies freeze only their
+   session instead of being guessed through.
 8. Logs contain run IDs, phases, counts, bytes, and profile labels, never chat
    titles, contents, or raw account identifiers.
 9. Default-profile process identity is explicit configuration, never inferred
@@ -78,6 +91,9 @@ progress without depending on Notification Center.
     `scheduled-tasks.json` targets and cannot undo or relabel a chat sync.
 14. Routine additions, edits, and deletions use a private three-way snapshot.
     Equal-time divergent edits stop only the routine adapter.
+15. Chat state is saved before a run's first write and after it settles. An
+    unreadable chat state stops chat writes rather than forgetting what was
+    agreed or seen.
 
 ## Sidebar layout adapter
 

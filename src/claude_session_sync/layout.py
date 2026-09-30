@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Any,
@@ -51,6 +51,7 @@ SYNC_QUARANTINE_KEY = ORIGIN_PREFIX + b"ccd-sync-quarantine"
 SYNC_METADATA_KEYS = (SYNC_OWNER_KEY, SYNC_ACTIVE_KEY, SYNC_QUARANTINE_KEY, GROUP_UPLOAD_KEY)
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
+ADOPT_PENDING_FILENAME = "sidebar-adopt-pending.json"
 
 
 class LayoutError(RuntimeError):
@@ -71,6 +72,9 @@ class LayoutSnapshot:
     assignments: Mapping[str, str]
     pinned_order: Tuple[str, ...]
     home_projects_pinned_order: Tuple[str, ...]
+    group_order: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    group_records: Tuple[Mapping[str, Any], ...] = ()
+    adopted_scope: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +83,12 @@ class LayoutSnapshot:
             "assignments": dict(sorted(self.assignments.items())),
             "pinned_order": list(self.pinned_order),
             "home_projects_pinned_order": list(self.home_projects_pinned_order),
+            "group_order": {
+                name: list(sessions)
+                for name, sessions in sorted(self.group_order.items())
+            },
+            "group_records": [copy.deepcopy(group) for group in self.group_records],
+            "adopted_scope": self.adopted_scope,
         }
 
 
@@ -90,6 +100,7 @@ class LayoutTransform:
     assignment_count: int
     pin_count: int
     ambiguous_assignments: int
+    canonical_upload_scope: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -121,10 +132,17 @@ def _string_map(value: Any, label: str) -> Dict[str, str]:
 
 
 def _decode_record(value: bytes, label: str) -> Dict[str, Any]:
-    if not value or len(value) > MAX_RECORD_BYTES or value[:1] != b"\x01":
+    if not value or len(value) > MAX_RECORD_BYTES or value[:1] not in (b"\x00", b"\x01"):
         raise LayoutError("{} has an unknown encoding".format(label))
     try:
-        decoded = json.loads(value[1:].decode("utf-8"))
+        payload = value[1:]
+        if value[:1] == b"\x00":
+            if len(payload) % 2:
+                raise UnicodeError("odd UTF-16 payload")
+            text = payload.decode("utf-16-le")
+        else:
+            text = payload.decode("latin-1")
+        decoded = json.loads(text)
     except (UnicodeError, json.JSONDecodeError) as error:
         raise LayoutError("{} contains malformed JSON".format(label)) from error
     if not isinstance(decoded, dict):
@@ -135,9 +153,9 @@ def _decode_record(value: bytes, label: str) -> Dict[str, Any]:
 def _encode_record(value: Mapping[str, Any]) -> bytes:
     return b"\x01" + json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=True,
         separators=(",", ":"),
-    ).encode("utf-8")
+    ).encode("ascii")
 
 
 def same_recovery_payload(key: bytes, expected: Optional[bytes], current: Optional[bytes]) -> bool:
@@ -219,10 +237,26 @@ def _ordered_group_pairs(scope: Any) -> List[Tuple[str, str]]:
     if set(order) - set(ids):
         raise LayoutError("custom group order references an unknown group")
     for group_id, sessions in order.items():
-        ordered_sessions = _string_list(sessions, "custom group session order")
-        if any(assignments.get(session) != group_id for session in ordered_sessions):
-            raise LayoutError("custom group order disagrees with assignments")
+        _string_list(sessions, "custom group session order")
     return pairs
+
+
+def _scope_order_by_name(scope: Mapping[str, Any]) -> Dict[str, Tuple[str, ...]]:
+    """Return the valid part of Chromium's stale-prone order index."""
+
+    pairs = _ordered_group_pairs(scope)
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    raw_order = scope.get("order", {})
+    return {
+        name: tuple(
+            session
+            for session in _string_list(
+                raw_order.get(group_id, []), "custom group session order"
+            )
+            if assignments.get(session) == group_id
+        )
+        for group_id, name in pairs
+    }
 
 
 def _scope_assignments_by_name(scope: Mapping[str, Any]) -> Dict[str, str]:
@@ -278,12 +312,27 @@ def _merge_scope_pair(
             raise LayoutError("custom group scope metadata disagrees")
         merged.setdefault(key, copy.deepcopy(value))
 
-    merged["groups"] = [{"id": ids_by_name[name], "name": name} for name in group_names]
+    preferred_groups = {group["name"]: group for group in preferred["groups"]}
+    fallback_groups = {group["name"]: group for group in fallback["groups"]}
+    merged_groups = []
+    for name in group_names:
+        group = copy.deepcopy(fallback_groups.get(name, {}))
+        group.update(copy.deepcopy(preferred_groups.get(name, {})))
+        group.update({"id": ids_by_name[name], "name": name})
+        merged_groups.append(group)
+    merged["groups"] = merged_groups
     merged["assignments"] = {
         session: ids_by_name[name] for session, name in assignments_by_name.items()
     }
     preferred_order = preferred.get("order", {})
     fallback_order = fallback.get("order", {})
+    if (
+        preferred_pairs == fallback_pairs
+        and preferred_assignments == fallback_assignments
+    ):
+        merged["order"] = copy.deepcopy(preferred_order)
+        _ordered_group_pairs(merged)
+        return merged
     merged_order = {}
     for name in group_names:
         group_id = ids_by_name[name]
@@ -332,8 +381,32 @@ def _stable_union(sequences: Iterable[Sequence[str]]) -> List[str]:
 def _load_snapshot_document(document: Any) -> LayoutSnapshot:
     if not isinstance(document, dict) or document.get("version") != SNAPSHOT_VERSION:
         raise LayoutError("sidebar snapshot has an unknown version")
+    groups = tuple(_string_list(document.get("groups"), "snapshot groups"))
+    raw_order = document.get("group_order", {})
+    if not isinstance(raw_order, dict) or any(
+        not isinstance(name, str) for name in raw_order
+    ):
+        raise LayoutError("snapshot group order has an unknown shape")
+    if set(raw_order) - set(groups):
+        raise LayoutError("snapshot group order references an unknown group")
+    raw_group_records = document.get("group_records", [])
+    if not isinstance(raw_group_records, list) or any(
+        not isinstance(group, dict) for group in raw_group_records
+    ):
+        raise LayoutError("snapshot group records have an unknown shape")
+    if raw_group_records:
+        pairs = _ordered_group_pairs(
+            {"groups": raw_group_records, "assignments": {}, "order": {}}
+        )
+        if tuple(name for _group_id, name in pairs) != groups:
+            raise LayoutError("snapshot group records disagree with groups")
+    adopted_scope = document.get("adopted_scope")
+    if adopted_scope is not None and (
+        not isinstance(adopted_scope, str) or "/" not in adopted_scope
+    ):
+        raise LayoutError("snapshot adopted scope has an unknown shape")
     return LayoutSnapshot(
-        groups=tuple(_string_list(document.get("groups"), "snapshot groups")),
+        groups=groups,
         assignments=_string_map(document.get("assignments"), "snapshot assignments"),
         pinned_order=tuple(_string_list(document.get("pinned_order"), "snapshot pins")),
         home_projects_pinned_order=tuple(
@@ -342,6 +415,12 @@ def _load_snapshot_document(document: Any) -> LayoutSnapshot:
                 "snapshot project pins",
             )
         ),
+        group_order={
+            name: tuple(_string_list(sessions, "snapshot group order"))
+            for name, sessions in raw_order.items()
+        },
+        group_records=tuple(copy.deepcopy(raw_group_records)),
+        adopted_scope=adopted_scope,
     )
 
 
@@ -385,6 +464,138 @@ def load_snapshot(path: Path) -> Optional[LayoutSnapshot]:
     return _decode_snapshot(_snapshot_bytes(path))
 
 
+def _copy_authoritative_scope(
+    source: Mapping[str, Any], existing: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Copy one trusted layout while retaining unrelated target metadata."""
+
+    _ordered_group_pairs(source)
+    _ordered_group_pairs(existing)
+    existing_groups = {
+        group["name"]: group
+        for group in existing.get("groups", [])
+    }
+    replacement = copy.deepcopy(existing)
+    replacement_groups = []
+    for source_group in source["groups"]:
+        merged_group = copy.deepcopy(existing_groups.get(source_group["name"], {}))
+        merged_group.update(copy.deepcopy(source_group))
+        replacement_groups.append(merged_group)
+    replacement["groups"] = replacement_groups
+    replacement["assignments"] = copy.deepcopy(source.get("assignments", {}))
+    canonical_order = _scope_order_by_name(source)
+    replacement["order"] = {
+        group["id"]: list(canonical_order[group["name"]])
+        for group in source["groups"]
+    }
+    return replacement
+
+
+def _adopt_current_sidebar_records(
+    group_record: Mapping[str, Any],
+    local_record: Mapping[str, Any],
+    store_record: Mapping[str, Any],
+    target_sessions: Mapping[str, Set[str]],
+    *,
+    timestamp_ms: Optional[int],
+    source_scope: Optional[str] = None,
+    active_scope: Optional[str] = None,
+) -> LayoutTransform:
+    """Bootstrap from the currently displayed scope without historical union."""
+
+    store_state = store_record["state"]
+    store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
+    persisted_scopes = _validated_scopes(group_record["value"])
+    stored_active = store_state.get("lastSidebarScopeKey")
+    if active_scope is None:
+        active_scope = stored_active
+    if (
+        not isinstance(active_scope, str)
+        or active_scope not in target_sessions
+    ):
+        raise LayoutError(
+            "current sidebar must belong to an approved sync target"
+        )
+    selected_scope = active_scope if source_scope is None else source_scope
+    if (
+        selected_scope not in target_sessions
+        or selected_scope not in store_scopes
+        or not _ordered_group_pairs(store_scopes[selected_scope])
+    ):
+        raise LayoutError(
+            "adopted sidebar source must have groups and belong to an approved sync target"
+        )
+
+    source = store_scopes[selected_scope]
+    groups = tuple(name for _group_id, name in _ordered_group_pairs(source))
+    assignments = _scope_assignments_by_name(source)
+    group_order = _scope_order_by_name(source)
+    current_pins = _string_list(store_state.get("pinnedOrder", []), "stored pins")
+    current_project_pins = _string_list(
+        store_state.get("homeProjectsPinnedOrder", []), "stored project pins"
+    )
+
+    updated_store_scopes = copy.deepcopy(store_scopes)
+    updated_persisted_scopes = copy.deepcopy(persisted_scopes)
+    for scope_key in sorted(target_sessions):
+        if scope_key == selected_scope:
+            updated_persisted_scopes[scope_key] = copy.deepcopy(source)
+            continue
+        existing = updated_store_scopes.get(
+            scope_key,
+            updated_persisted_scopes.get(
+                scope_key, {"groups": [], "assignments": {}, "order": {}}
+            ),
+        )
+        replacement = _copy_authoritative_scope(source, existing)
+        updated_store_scopes[scope_key] = replacement
+        updated_persisted_scopes[scope_key] = copy.deepcopy(replacement)
+
+    updated_store = copy.deepcopy(store_record)
+    updated_group = copy.deepcopy(group_record)
+    updated_local = copy.deepcopy(local_record)
+    updated_store["state"]["customGroupsByScope"] = updated_store_scopes
+    if active_scope != stored_active:
+        # The signed-in account's folder, when Claude had not shown it yet.
+        updated_store["state"]["lastSidebarScopeKey"] = active_scope
+    updated_group["value"] = updated_persisted_scopes
+    updated_store["state"]["pinnedOrder"] = current_pins
+    updated_local["value"]["pinnedOrder"] = current_pins
+    updated_store["state"]["homeProjectsPinnedOrder"] = current_project_pins
+    updated_local["value"]["homeProjectsPinnedOrder"] = current_project_pins
+    now = int(time.time() * 1000) if timestamp_ms is None else timestamp_ms
+    if updated_group != group_record:
+        updated_group["timestamp"] = now
+    if updated_local != local_record:
+        updated_local["timestamp"] = now
+
+    return LayoutTransform(
+        records={
+            GROUP_SCOPES_KEY: _encode_record(updated_group),
+            LOCAL_SLICE_KEY: _encode_record(updated_local),
+            DFRAME_STORE_KEY: _encode_record(updated_store),
+        },
+        snapshot=LayoutSnapshot(
+            groups=groups,
+            assignments=assignments,
+            pinned_order=tuple(current_pins),
+            home_projects_pinned_order=tuple(current_project_pins),
+            group_order=group_order,
+            group_records=tuple(copy.deepcopy(source["groups"])),
+            # The account in use now holds the copy, so it is the source of
+            # truth from here: its later edits win until the next switch.
+            adopted_scope=active_scope,
+        ),
+        group_count=len(groups),
+        assignment_count=len(assignments),
+        pin_count=len(current_pins),
+        ambiguous_assignments=0,
+        canonical_upload_scope=(
+            active_scope if selected_scope != active_scope else None
+        ),
+    )
+
+
 def transform_layout_records(
     records: Mapping[bytes, bytes],
     target_sessions: Mapping[str, Set[str]],
@@ -392,8 +603,19 @@ def transform_layout_records(
     snapshot: Optional[LayoutSnapshot] = None,
     timestamp_ms: Optional[int] = None,
     prefer_current_sidebar: bool = False,
+    adopt_current_sidebar: bool = False,
+    adopt_source_scope: Optional[str] = None,
+    after_account_switch: bool = False,
+    owner_account: Optional[str] = None,
 ) -> LayoutTransform:
-    """Return exact allowlisted record replacements for one Claude data root."""
+    """Return exact allowlisted record replacements for one Claude data root.
+
+    Once a layout has been adopted, one account's sidebar is the source of
+    truth at a time. The signed-in account's groups are copied to the other
+    accounts. Right after an account switch, the account just left still
+    holds the newest organization, because Claude reloads the new account's
+    groups from its servers at sign-in, so that one is copied instead.
+    """
 
     if set(records) != set(LAYOUT_KEYS):
         raise LayoutError("required sidebar records are missing")
@@ -406,6 +628,32 @@ def transform_layout_records(
         raise LayoutError("local slice record has an unknown shape")
     if not isinstance(store_record.get("state"), dict):
         raise LayoutError("dframe store record has an unknown shape")
+    if sum(bool(value) for value in (
+        prefer_current_sidebar, adopt_current_sidebar, adopt_source_scope
+    )) > 1:
+        raise LayoutError("current sidebar modes cannot be combined")
+    if adopt_current_sidebar or adopt_source_scope is not None:
+        return _adopt_current_sidebar_records(
+            group_record,
+            local_record,
+            store_record,
+            target_sessions,
+            timestamp_ms=timestamp_ms,
+            source_scope=adopt_source_scope,
+        )
+
+    if snapshot is not None and snapshot.adopted_scope is not None and not prefer_current_sidebar:
+        return _follow_adopted_sidebar(
+            records,
+            group_record,
+            local_record,
+            store_record,
+            target_sessions,
+            snapshot,
+            timestamp_ms=timestamp_ms,
+            after_account_switch=after_account_switch,
+            owner_account=owner_account,
+        )
 
     store_state = store_record["state"]
     store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
@@ -427,11 +675,36 @@ def transform_layout_records(
     active_scope = store_state.get("lastSidebarScopeKey")
     if active_scope is not None and not isinstance(active_scope, str):
         raise LayoutError("last sidebar scope has an unknown shape")
+    if (
+        snapshot is not None
+        and snapshot.adopted_scope is not None
+        and active_scope != snapshot.adopted_scope
+        and active_scope in store_scopes
+    ):
+        active = store_scopes[active_scope]
+        active_groups = tuple(
+            name for _group_id, name in _ordered_group_pairs(active)
+        )
+        active_is_empty = (
+            not active_groups
+            and not active.get("assignments", {})
+            and not any(active.get("order", {}).values())
+        )
+        if not active_is_empty and (
+            active_groups != snapshot.groups
+            or _scope_assignments_by_name(active) != snapshot.assignments
+            or _scope_order_by_name(active) != snapshot.group_order
+        ):
+            raise LayoutError(
+                "current account sidebar differs from the adopted canonical layout"
+            )
     ordered_scope_keys = []
-    if active_scope in store_scopes:
+    if active_scope in store_scopes and active_scope in target_sessions:
         ordered_scope_keys.append(active_scope)
     ordered_scope_keys.extend(
-        scope_key for scope_key in sorted(store_scopes) if scope_key != active_scope
+        scope_key
+        for scope_key in sorted(store_scopes)
+        if scope_key != active_scope and scope_key in target_sessions
     )
 
     active_has_groups = bool(
@@ -499,6 +772,11 @@ def transform_layout_records(
         current_project_pins = list(snapshot.home_projects_pinned_order)
 
     updated_scopes = copy.deepcopy(store_scopes)
+    snapshot_order = snapshot.group_order if snapshot is not None else {}
+    snapshot_groups_by_name = {
+        group["name"]: group
+        for group in (snapshot.group_records if snapshot is not None else ())
+    }
     for scope_key, sessions in sorted(target_sessions.items()):
         existing = updated_scopes.get(
             scope_key, {"groups": [], "assignments": {}, "order": {}}
@@ -508,17 +786,27 @@ def transform_layout_records(
         for name in groups:
             ids_by_name.setdefault(
                 name,
-                "cg-{}".format(
-                    uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        "claude-session-sync:{}:{}".format(scope_key, name),
-                    )
+                snapshot_groups_by_name.get(name, {}).get(
+                    "id",
+                    "cg-{}".format(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            "claude-session-sync:{}:{}".format(scope_key, name),
+                        )
+                    ),
                 ),
             )
         replacement = copy.deepcopy(existing)
-        replacement["groups"] = [
-            {"id": ids_by_name[name], "name": name} for name in groups
-        ]
+        existing_groups_by_name = {
+            group["name"]: group for group in existing.get("groups", [])
+        }
+        replacement_groups = []
+        for name in groups:
+            group = copy.deepcopy(snapshot_groups_by_name.get(name, {}))
+            group.update(copy.deepcopy(existing_groups_by_name.get(name, {})))
+            group.update({"id": ids_by_name[name], "name": name})
+            replacement_groups.append(group)
+        replacement["groups"] = replacement_groups
         existing_by_name = _scope_assignments_by_name(existing)
         target_assignments = {}
         for session in sorted(sessions):
@@ -527,8 +815,20 @@ def transform_layout_records(
                 name = existing_by_name.get(session)
             if name in group_names:
                 target_assignments[session] = ids_by_name[name]
+        for session, name in existing_by_name.items():
+            if session not in sessions and name in group_names:
+                target_assignments[session] = ids_by_name[name]
         replacement["assignments"] = target_assignments
         existing_order = existing.get("order", {})
+        if (
+            snapshot is not None
+            and replacement["groups"] == existing.get("groups", [])
+            and target_assignments == existing.get("assignments", {})
+            and dict(snapshot_order) == _scope_order_by_name(existing)
+        ):
+            replacement["order"] = copy.deepcopy(existing_order)
+            updated_scopes[scope_key] = replacement
+            continue
         replacement_order = {}
         for name in groups:
             group_id = ids_by_name[name]
@@ -536,6 +836,8 @@ def transform_layout_records(
                 (item_id for item_id, item_name in pairs if item_name == name), None
             )
             previous = list(existing_order.get(previous_id, []))
+            if not previous:
+                previous = list(snapshot_order.get(name, ()))
             assigned = [
                 session
                 for session, assigned_group in target_assignments.items()
@@ -569,11 +871,23 @@ def transform_layout_records(
         LOCAL_SLICE_KEY: _encode_record(updated_local),
         DFRAME_STORE_KEY: _encode_record(updated_store),
     }
+    next_group_order = dict(snapshot_order)
+    if active_scope in updated_scopes:
+        next_group_order = _scope_order_by_name(updated_scopes[active_scope])
     next_snapshot = LayoutSnapshot(
         tuple(groups),
         dict(assignments),
         tuple(current_pins),
         tuple(current_project_pins),
+        next_group_order,
+        tuple(
+            copy.deepcopy(group)
+            for group in (
+                updated_scopes.get(active_scope, {}).get("groups", [])
+                or (snapshot.group_records if snapshot is not None else ())
+            )
+        ),
+        snapshot.adopted_scope if snapshot is not None else None,
     )
     return LayoutTransform(
         records=updated_records,
@@ -582,6 +896,134 @@ def transform_layout_records(
         assignment_count=len(assignments),
         pin_count=len(current_pins),
         ambiguous_assignments=len(ambiguous_sessions),
+    )
+
+
+def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
+    if scope is None:
+        return True
+    return (
+        not _ordered_group_pairs(scope)
+        and not scope.get("assignments", {})
+        and not any(scope.get("order", {}).values())
+    )
+
+
+def _follow_adopted_sidebar(
+    records: Mapping[bytes, bytes],
+    group_record: Mapping[str, Any],
+    local_record: Mapping[str, Any],
+    store_record: Mapping[str, Any],
+    target_sessions: Mapping[str, Set[str]],
+    snapshot: LayoutSnapshot,
+    *,
+    timestamp_ms: Optional[int],
+    after_account_switch: bool,
+    owner_account: Optional[str],
+) -> LayoutTransform:
+    store_state = store_record["state"]
+    store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
+    persisted_scopes = _validated_scopes(group_record["value"])
+    active = store_state.get("lastSidebarScopeKey")
+    if active is not None and not isinstance(active, str):
+        raise LayoutError("last sidebar scope has an unknown shape")
+    if owner_account is not None and (
+        not isinstance(active, str) or active.partition("/")[0] != owner_account
+    ):
+        # Claude has not shown the signed-in account's Code sidebar yet.
+        owned = [key for key in target_sessions if key.partition("/")[0] == owner_account]
+        if len(owned) != 1:
+            return _unchanged(records, snapshot)
+        active = owned[0]
+    if not isinstance(active, str) or active not in target_sessions:
+        return _unchanged(records, snapshot)  # an account that does not sync yet
+
+    adopted = snapshot.adopted_scope
+    if active == adopted:
+        source = active
+    elif after_account_switch or _scope_is_empty(
+        store_scopes.get(active, persisted_scopes.get(active))
+    ):
+        source = adopted
+    else:
+        raise LayoutError(
+            "current account sidebar differs from the adopted canonical layout; "
+            "keep one with sync --adopt-current-sidebar or --adopt-source-scope"
+        )
+    if (
+        source not in target_sessions
+        or source not in store_scopes
+        or not _ordered_group_pairs(store_scopes[source])
+    ):
+        raise LayoutError(
+            "the last synced sidebar is not available; keep one with "
+            "sync --adopt-current-sidebar or --adopt-source-scope"
+        )
+    return _adopt_current_sidebar_records(
+        group_record,
+        local_record,
+        store_record,
+        target_sessions,
+        timestamp_ms=timestamp_ms,
+        source_scope=source,
+        active_scope=active,
+    )
+
+
+def request_adoption(state_dir: Path, source_scope: str) -> None:
+    """Make one account's pins and groups the source of truth at the next closed-Claude sync."""
+
+    account, separator, workspace = source_scope.partition("/")
+    if not account or not separator or not workspace or "/" in workspace:
+        raise LayoutError("sidebar scope must be ACCOUNT/WORKSPACE")
+    ensure_private_directory(state_dir)
+    path = Path(state_dir) / ADOPT_PENDING_FILENAME
+    atomic_write_bytes(
+        path, (json.dumps({"version": 1, "source_scope": source_scope}) + "\n").encode("utf-8")
+    )
+    os.chmod(str(path), 0o600)
+
+
+def read_pending_adoption(state_dir: Path) -> Optional[str]:
+    content = _snapshot_bytes(Path(state_dir) / ADOPT_PENDING_FILENAME)
+    if content is None:
+        return None
+    try:
+        document = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise LayoutError("pending sidebar adoption is malformed") from error
+    scope = document.get("source_scope") if isinstance(document, dict) else None
+    if document.get("version") != 1 or not isinstance(scope, str) or scope.count("/") != 1:
+        raise LayoutError("pending sidebar adoption is malformed")
+    return scope
+
+
+def clear_pending_adoption(state_dir: Path) -> None:
+    path = Path(state_dir) / ADOPT_PENDING_FILENAME
+    if os.path.lexists(str(path)):
+        durable_unlink(path)
+
+
+def _owner_account(value: Optional[bytes]) -> Optional[str]:
+    """The signed-in account Claude recorded for its settings sync, if any."""
+
+    if value is None or not value.startswith(b"\x01"):
+        return None
+    try:
+        account = value[1:].decode("utf-8")
+    except UnicodeError:
+        return None
+    return account if account and "/" not in account else None
+
+
+def _unchanged(records: Mapping[bytes, bytes], snapshot: LayoutSnapshot) -> LayoutTransform:
+    return LayoutTransform(
+        records={key: records[key] for key in LAYOUT_KEYS},
+        snapshot=snapshot,
+        group_count=len(snapshot.groups),
+        assignment_count=len(snapshot.assignments),
+        pin_count=len(snapshot.pinned_order),
+        ambiguous_assignments=0,
     )
 
 
@@ -676,6 +1118,7 @@ class LayoutSynchronizer:
         current: Mapping[bytes, bytes],
         replacements: Mapping[bytes, bytes],
         target_sessions: Mapping[str, Set[str]],
+        canonical_upload_scope: Optional[str] = None,
     ) -> Optional[Tuple[Optional[bytes], bytes]]:
         """Use Claude's scoped migration path, never replace server preferences.
 
@@ -730,6 +1173,12 @@ class LayoutSynchronizer:
         new_groups = new_scopes.get(active, {}).get("groups", [])
         if not settings_sync_active or active not in target_sessions or old_groups == new_groups:
             return None
+        if canonical_upload_scope is not None:
+            if canonical_upload_scope != active:
+                raise LayoutError("canonical sidebar upload does not match the active scope")
+            if pending is not None:
+                raise LayoutBusyError("another account sidebar update is pending")
+            return None, scoped
         return pending, scoped + b"|migrate"
 
     def _check_database_path(self, path: Path) -> None:
@@ -793,11 +1242,36 @@ class LayoutSynchronizer:
             "assignment_count": assignments,
         }
 
-    def sync(self, *, prefer_current_sidebar: bool = False) -> LayoutReceipt:
+    def sync(
+        self,
+        *,
+        prefer_current_sidebar: bool = False,
+        adopt_current_sidebar: bool = False,
+        adopt_source_scope: Optional[str] = None,
+        after_account_switch: bool = False,
+    ) -> LayoutReceipt:
         if not self.config.sync_sidebar_layout:
             return LayoutReceipt("disabled", 0, 0, 0, 0, 0, 0)
+        if sum(bool(value) for value in (
+            prefer_current_sidebar, adopt_current_sidebar, adopt_source_scope
+        )) > 1:
+            raise LayoutError("current sidebar modes cannot be combined")
         if prefer_current_sidebar and len(self.config.profiles) != 1:
             raise LayoutError("choose one data profile before preferring its current sidebar")
+        pending = None
+        if not (prefer_current_sidebar or adopt_current_sidebar or adopt_source_scope):
+            pending = read_pending_adoption(self.config.state_dir)
+            if pending is not None:
+                # An adoption asked for while Claude was open: the chosen
+                # account's organization becomes the source of truth.
+                adopt_source_scope = pending
+                after_account_switch = False
+        if (adopt_current_sidebar or adopt_source_scope is not None) and (
+            len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
+        ):
+            raise LayoutError(
+                "choose the single default data profile before adopting its current sidebar"
+            )
         self._assert_stopped()
         if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
             raise LayoutError("sidebar helper is not installed")
@@ -827,14 +1301,25 @@ class LayoutSynchronizer:
                     index
                 )
                 snapshot_before = _snapshot_bytes(snapshot_path)
+                self._assert_stopped()
                 transformed = transform_layout_records(
                     current,
                     target_sessions,
                     snapshot=_decode_snapshot(snapshot_before),
                     prefer_current_sidebar=prefer_current_sidebar,
+                    adopt_current_sidebar=adopt_current_sidebar,
+                    adopt_source_scope=adopt_source_scope,
+                    after_account_switch=after_account_switch,
+                    owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
                 )
                 planned_records = dict(transformed.records)
-                marker = self._group_upload_marker(database, current, planned_records, target_sessions)
+                marker = self._group_upload_marker(
+                    database,
+                    current,
+                    planned_records,
+                    target_sessions,
+                    canonical_upload_scope=transformed.canonical_upload_scope,
+                )
                 if marker is not None:
                     current[GROUP_UPLOAD_KEY], planned_records[GROUP_UPLOAD_KEY] = marker
                 replacements = {
@@ -862,6 +1347,8 @@ class LayoutSynchronizer:
                 totals[2] = max(totals[2], transformed.assignment_count)
                 totals[3] = max(totals[3], transformed.pin_count)
                 totals[4] += transformed.ambiguous_assignments
+            if pending is not None:
+                clear_pending_adoption(self.config.state_dir)
             return LayoutReceipt(
                 "synced" if changed_profiles else "noop",
                 len(self.config.profiles),
@@ -880,19 +1367,11 @@ class LayoutSynchronizer:
         discovery = SessionStore().discover_targets(self.config)
         if discovery.invalid_replicas:
             raise LayoutError("Claude session storage has an unknown layout")
-        approved = {
-            (target.account_id, target.workspace_id)
-            for target in self.config.approved_targets
-            if target.profile_name == profile_name
-        }
+        from .enrollment import selected_targets
+
         targets = {}
-        for target in discovery.targets:
+        for target in selected_targets(self.config, discovery.targets):
             if target.profile_name != profile_name:
-                continue
-            if (
-                self.config.target_policy == "approved-only"
-                and (target.account_id, target.workspace_id) not in approved
-            ):
                 continue
             sessions = set()
             for replica in target.path.iterdir():

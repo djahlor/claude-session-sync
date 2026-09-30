@@ -30,13 +30,17 @@ def finish_progress(config, payload: dict) -> str:
         payload[key].get("state") for key in ("routines", "layout") if key in payload
     )
     attention = any(
-        value not in ("committed", "synced", "noop", "disabled") for value in outcomes
+        value not in ("committed", "partial", "synced", "noop", "disabled", "deferred")
+        for value in outcomes
     )
     attention = attention or any(
         payload.get(key, {}).get("reporting_error") for key in ("routines", "layout")
     )
     state = "needs-attention" if attention else "finished"
-    record_progress(config, state, result=payload)
+    fields = {"result": payload}
+    if payload.get("restart_suggested"):
+        fields["restart_suggested"] = payload["restart_suggested"]
+    record_progress(config, state, **fields)
     return state
 
 
@@ -59,7 +63,9 @@ def _writer_active(config) -> bool:
         os.close(descriptor)
 
 
-def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
+def current_progress(config, *, app_running: bool, failures: int = 0, live: bool = False) -> dict:
+    """Aggregate status. With live sync an open Claude is normal, not a wait."""
+
     payload = read_status(config.state_dir, "sync-progress.json")
     watcher = read_status(config.state_dir, "watcher-status.json")
     restart_phase = watcher.get("restart_phase")
@@ -84,7 +90,7 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
         state = "needs-attention"
     elif failures or saved_state in ("needs-attention", "unreadable"):
         state = "needs-attention"
-    elif app_running:
+    elif app_running and not live:
         state = "waiting-for-Claude"
     elif saved_state == "finished":
         state = "finished"
@@ -101,6 +107,9 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
         "checking-account": "wait-for-automatic-restart",
     }
     result = {"progress": state, "last_success_at": payload.get("last_success_at")}
+    if live and payload.get("restart_suggested"):
+        result["restart_suggested"] = payload["restart_suggested"]
+        actions["finished"] = "restart-claude-to-see-new-chats"
     if watcher.get("automatic_restart") is True:
         result["automatic_restart"] = True
         result["restart_phase"] = restart_phase

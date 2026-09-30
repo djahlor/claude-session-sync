@@ -58,7 +58,7 @@ _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
 }
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
 _TARGET_KEYS = {"profile", "account", "workspace"}
-_TARGET_POLICIES = {"approved-only", "all-configured-profiles"}
+_TARGET_POLICIES = {"approved-only", "all-configured-profiles", "logins"}
 
 
 def _object(value: Any, label: str) -> Mapping[str, Any]:
@@ -244,10 +244,10 @@ def load_config(path: Union[str, Path]) -> Config:
                 ", ".join(sorted(_TARGET_POLICIES))
             )
         )
-    if target_policy == "all-configured-profiles" and not account_acknowledgement:
+    if target_policy in ("all-configured-profiles", "logins") and not account_acknowledgement:
         raise ConfigError(
             "acknowledge_cross_account_copy must be true when target_policy "
-            "is all-configured-profiles"
+            "is {}".format(target_policy)
         )
 
     sync_sidebar_layout = document.get("sync_sidebar_layout", False)

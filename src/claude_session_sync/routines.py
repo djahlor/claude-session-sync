@@ -505,16 +505,9 @@ class RoutineSynchronizer:
         discovery = SessionStore().discover_targets(self.config)
         if discovery.invalid_replicas:
             raise RoutineError("Claude Code session storage is unsafe")
-        approved = {
-            (target.profile_name, target.account_id, target.workspace_id)
-            for target in self.config.approved_targets
-        }
-        targets = tuple(
-            target
-            for target in discovery.targets
-            if self.config.target_policy != "approved-only"
-            or (target.profile_name, target.account_id, target.workspace_id) in approved
-        )
+        from .enrollment import selected_targets
+
+        targets = selected_targets(self.config, discovery.targets)
         if not targets:
             raise RoutineError("no approved Claude Code routine targets were found")
         account_namespaces = {

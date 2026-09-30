@@ -48,23 +48,23 @@ def _adapter_recovery_pending(config) -> int:
 def doctor_summary(
     config: Config, dependencies, running, launch_guard_failure: int
 ) -> dict:
+    from .enrollment import auto_enrolled, select_targets
     from .journal import JournalError, pending_recovery_runs
     from .store import SessionStore
 
-    discovery = SessionStore().discover(config)
-    approved = {
-        (target.profile_name, target.account_id, target.workspace_id)
-        for target in config.approved_targets
-    }
-    unapproved = 0
-    if config.target_policy == "approved-only":
-        unapproved = sum(
-            1
-            for target in discovery.targets
-            if (target.profile_name, target.account_id, target.workspace_id)
-            not in approved
-        )
-    errors = len(discovery.invalid_replicas) + unapproved
+    store = SessionStore()
+    found = store.discover_targets(config)
+    selected, ignored = select_targets(config, found.targets, auto_enrolled(config))
+    discovery = store.scan_targets(selected)
+    unapproved = len(ignored) if config.target_policy == "approved-only" else 0
+    # A record read whole that Claude would not accept. A save caught mid-read
+    # (empty digest) is judged again next run and is not a fault.
+    unreadable = sum(
+        1 for replica in discovery.replicas if replica.state_hash is None and replica.digest
+    )
+    errors = (
+        len(found.invalid_replicas) + len(discovery.invalid_replicas) + unapproved + unreadable
+    )
     executable = config.claude_executable
     if not executable.is_file() or not os.access(str(executable), os.X_OK):
         errors += 1

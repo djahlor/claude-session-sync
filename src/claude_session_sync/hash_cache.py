@@ -59,6 +59,15 @@ class HashCache:
             self._connection.execute(
                 "ALTER TABLE file_hashes ADD COLUMN session_id TEXT"
             )
+        for column, kind in (
+            ("state_hash", "TEXT"),
+            ("activity", "INTEGER"),
+            ("normalisation", "TEXT"),
+        ):
+            if column not in columns:
+                self._connection.execute(
+                    "ALTER TABLE file_hashes ADD COLUMN {} {}".format(column, kind)
+                )
         # Validation rules changed to reject duplicate keys and non-finite numbers.
         # Keep digest caching, but never reuse validation from the older reader.
         if self._connection.execute("PRAGMA user_version").fetchone()[0] < 1:
@@ -113,6 +122,54 @@ class HashCache:
             )
         self._store(replica_path, current, session_id, digest)
 
+    def lookup_record(
+        self,
+        path: Union[str, Path],
+        stat_result: os.stat_result,
+        session_id: str,
+        normalisation: str,
+    ) -> Optional[Tuple[str, str, int]]:
+        """Return (digest, state hash, activity) cached for these exact file metadata."""
+
+        size, mtime_ns, ctime_ns, inode = _signature(stat_result)
+        row = self._connection.execute(
+            """
+            SELECT digest, state_hash, activity FROM file_hashes
+            WHERE path = ? AND size = ? AND mtime_ns = ? AND ctime_ns = ? AND inode = ?
+              AND session_id = ? AND normalisation = ? AND state_hash IS NOT NULL
+            """,
+            (str(path), size, mtime_ns, ctime_ns, inode, session_id, normalisation),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1]), int(row[2] or 0)
+
+    def store_record(
+        self,
+        path: Union[str, Path],
+        stat_result: os.stat_result,
+        session_id: str,
+        digest: str,
+        state_hash: str,
+        activity: int,
+        normalisation: str,
+    ) -> None:
+        replica_path = Path(path)
+        current = replica_path.lstat()
+        if _signature(current) != _signature(stat_result):
+            raise FileChangedError(
+                "file changed before caching: {}".format(replica_path)
+            )
+        self._store(
+            replica_path,
+            current,
+            session_id,
+            digest,
+            state_hash=state_hash,
+            activity=activity,
+            normalisation=normalisation,
+        )
+
     def _lookup(
         self,
         path: Path,
@@ -145,6 +202,10 @@ class HashCache:
         stat_result: os.stat_result,
         session_id: Optional[str],
         digest: str,
+        *,
+        state_hash: Optional[str] = None,
+        activity: Optional[int] = None,
+        normalisation: Optional[str] = None,
     ) -> None:
         size, mtime_ns, ctime_ns, inode = _signature(stat_result)
         # One transaction spans a discovery pass. Committing every validated
@@ -153,10 +214,16 @@ class HashCache:
         self._connection.execute("DELETE FROM file_hashes WHERE path = ?", (str(path),))
         self._connection.execute(
             """
-            INSERT INTO file_hashes(path, size, mtime_ns, ctime_ns, inode, session_id, digest)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO file_hashes(
+                path, size, mtime_ns, ctime_ns, inode, session_id, digest,
+                state_hash, activity, normalisation
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (str(path), size, mtime_ns, ctime_ns, inode, session_id, digest),
+            (
+                str(path), size, mtime_ns, ctime_ns, inode, session_id, digest,
+                state_hash, activity, normalisation,
+            ),
         )
 
     def close(self) -> None:

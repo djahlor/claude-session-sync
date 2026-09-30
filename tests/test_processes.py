@@ -66,47 +66,53 @@ class ProcessParsingTests(unittest.TestCase):
 
 
 class ProcessProbeTests(unittest.TestCase):
-    def test_transient_read_timeout_retries_within_the_original_budget(self):
+    def test_transient_executable_listing_timeout_retries_within_original_budget(self):
         calls = []
 
         def runner(command, **kwargs):
-            calls.append(kwargs["timeout"])
+            calls.append((command, kwargs["timeout"]))
             if len(calls) == 1:
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-            return subprocess.CompletedProcess(command, 0, stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n")
+            if command == ["ps", "-axo", "pid=,comm="]:
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n",
+                )
+            return subprocess.CompletedProcess(
+                command, 0,
+                stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n",
+            )
 
-        probe = ProcessProbe(runner=runner)
-        result = probe.running(executable=DEFAULT_CLAUDE_EXECUTABLE,
-            managed_profile_roots=(Path("/tmp/work"),), default_profile_root=Path("/tmp/work"), timeout=5)
+        result = ProcessProbe(runner=runner).running(
+            executable=DEFAULT_CLAUDE_EXECUTABLE,
+            managed_profile_roots=(Path("/tmp/work"),),
+            default_profile_root=Path("/tmp/work"),
+            timeout=5,
+        )
+
         self.assertEqual([301], [item.pid for item in result])
-        self.assertEqual(2, len(calls))
-        self.assertEqual(2.0, calls[0])
-        self.assertGreater(calls[1], 0)
-        self.assertLessEqual(calls[1], 5)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(2.0, calls[0][1])
+        self.assertGreater(calls[1][1], 0)
+        self.assertLessEqual(calls[1][1], 5)
 
-    def test_repeated_read_timeout_stays_bounded_and_never_means_app_closed(self):
-        calls = []
-
-        def runner(command, **kwargs):
-            calls.append(kwargs["timeout"])
-            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-
-        with self.assertRaises(subprocess.TimeoutExpired):
-            ProcessProbe(runner=runner).running(executable=DEFAULT_CLAUDE_EXECUTABLE,
-                managed_profile_roots=(Path("/tmp/work"),), timeout=5)
-        self.assertEqual(2, len(calls))
-
-    def test_exhausted_budget_does_not_start_another_read(self):
+    def test_exhausted_budget_does_not_start_another_process_read(self):
         calls = []
 
         def runner(command, **kwargs):
             calls.append(command)
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
-        with patch("claude_session_sync.processes.time.monotonic", side_effect=(100, 105)):
+        with patch(
+            "claude_session_sync.processes.time.monotonic",
+            side_effect=(100, 100, 105),
+        ):
             with self.assertRaises(subprocess.TimeoutExpired):
-                ProcessProbe(runner=runner).running(executable=DEFAULT_CLAUDE_EXECUTABLE,
-                    managed_profile_roots=(Path("/tmp/work"),), timeout=5)
+                ProcessProbe(runner=runner).running(
+                    executable=DEFAULT_CLAUDE_EXECUTABLE,
+                    managed_profile_roots=(Path("/tmp/work"),),
+                    timeout=5,
+                )
         self.assertEqual(1, len(calls))
 
     def test_probe_reads_process_table_through_injected_runner(self):
@@ -114,6 +120,13 @@ class ProcessProbeTests(unittest.TestCase):
 
         def runner(command, **kwargs):
             calls.append((command, kwargs))
+            if command == ["ps", "-axo", "pid=,comm="]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n",
+                    stderr="",
+                )
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -130,11 +143,13 @@ class ProcessProbeTests(unittest.TestCase):
         )
 
         self.assertEqual([process.pid for process in processes], [301])
-        self.assertEqual(calls[0][0], ["ps", "-axo", "pid=,command="])
+        self.assertEqual(calls[0][0], ["ps", "-axo", "pid=,comm="])
         self.assertTrue(calls[0][1]["check"])
         self.assertTrue(calls[0][1]["text"])
         self.assertTrue(calls[0][1]["capture_output"])
-        self.assertEqual(calls[0][1]["timeout"], 0.25)
+        self.assertGreater(calls[0][1]["timeout"], 0)
+        self.assertLessEqual(calls[0][1]["timeout"], 0.25)
+        self.assertEqual(calls[1][0], ["ps", "-p", "301", "-o", "pid=,command="])
 
     def test_config_tuple_keeps_process_executable_separate_from_launch_command(self):
         class RecordingProbe:

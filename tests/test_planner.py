@@ -174,10 +174,17 @@ class PlannerTests(unittest.TestCase):
         session_id: str,
         revision: str,
         mtime_ns: int,
+        activity: int = 100,
     ) -> Path:
         path = self.target(data_root) / "local_{}.json".format(session_id)
         path.write_text(
-            json.dumps({"sessionId": session_id, "revision": revision}),
+            json.dumps(
+                {
+                    "sessionId": "local_" + session_id,
+                    "revision": revision,
+                    "lastActivityAt": activity,
+                }
+            ),
             encoding="utf-8",
         )
         os.utime(path, ns=(mtime_ns, mtime_ns))
@@ -186,20 +193,20 @@ class PlannerTests(unittest.TestCase):
     def plan(self, config: Config) -> Plan:
         return Planner(SessionStore()).plan(SyncRequest(config))
 
-    def test_equal_max_mtime_divergent_revisions_are_a_conflict(self) -> None:
+    def test_equal_activity_divergent_revisions_are_left_alone_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
             self.write_session(root / "standard", "tied", "standard", 5_000_000_000)
-            self.write_session(root / "personal", "tied", "personal", 5_000_000_000)
+            self.write_session(root / "personal", "tied", "personal", 9_000_000_000)
+            self.write_session(root / "standard", "other", "only", 5_000_000_000)
 
             plan = self.plan(config)
 
-            self.assertEqual((), plan.operations)
-            self.assertEqual(1, len(plan.conflicts))
-            self.assertEqual("tied", plan.conflicts[0].session_id)
-            self.assertIn("equal maximum mtime", plan.conflicts[0].reason)
-            self.assertEqual(0, plan.total_bytes)
+            self.assertEqual((), plan.conflicts)
+            self.assertEqual({"tied"}, {problem.kind for problem in plan.problems})
+            self.assertEqual({"tied"}, {problem.session_id for problem in plan.problems})
+            self.assertEqual(["other"], [op.session_id for op in plan.operations])
 
     def test_multiple_account_namespaces_require_explicit_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -227,17 +234,18 @@ class PlannerTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "acknowledge_cross_account_copy"):
                 self.plan(config)
 
-    def test_unique_newest_revision_wins_and_copies_missing_or_different_destinations(
+    def test_latest_activity_wins_and_missing_copies_are_created(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
+            # The older activity has the newer file: file time plays no part.
             old = self.write_session(
-                root / "standard", "overwrite", "old", 5_000_000_000
+                root / "standard", "overwrite", "old", 9_000_000_000, activity=100
             )
             newest = self.write_session(
-                root / "personal", "overwrite", "new", 6_000_000_000
+                root / "personal", "overwrite", "new", 6_000_000_000, activity=200
             )
             missing_source = self.write_session(
                 root / "standard", "missing", "only-copy", 7_000_000_000
@@ -256,8 +264,10 @@ class PlannerTests(unittest.TestCase):
                 missing.destination,
             )
             self.assertIsNone(missing.destination_digest_or_none)
+            self.assertEqual("create", missing.kind)
             self.assertEqual(newest, overwrite.source)
             self.assertEqual(old, overwrite.destination)
+            self.assertEqual("replace", overwrite.kind)
             self.assertIsNotNone(overwrite.destination_digest_or_none)
             self.assertEqual(sum(op.size for op in plan.operations), plan.total_bytes)
 
