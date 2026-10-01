@@ -97,8 +97,6 @@ class Discovery:
 
 @dataclass(frozen=True)
 class Plan:
-    version: int
-    config_digest: str
     operations: Tuple[Operation, ...]
     invalid_replicas: Tuple[InvalidReplica, ...]
     plan_id: str
