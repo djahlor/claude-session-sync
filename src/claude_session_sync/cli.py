@@ -803,7 +803,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         )
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
-        return 0 if payload["progress"] == "finished" else 1
+        return _exit_code(arguments, payload["progress"])
     except Exception:
         record_progress(
             config, "needs-attention", reason="sync-error", next_action="run-doctor"
@@ -814,11 +814,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
 
 
 def _report_waiting(arguments, config: Config, output: TextIO, reason: str) -> int:
-    """Nothing was written. The next quit, switch, or retry syncs.
-
-    Only `auto` counts this as success: the watcher runs it again. A manual
-    `sync` that did not happen exits nonzero.
-    """
+    """Nothing was written. The next quit, switch, or retry syncs."""
 
     if reason == "claude-open":
         payload = {"state": "waiting", "reason": reason, "progress": "waiting-for-Claude"}
@@ -826,7 +822,19 @@ def _report_waiting(arguments, config: Config, output: TextIO, reason: str) -> i
         payload = {"state": "skipped", "reason": reason, "progress": "waiting-for-sync"}
     record_progress(config, payload["progress"])
     _write(payload, as_json=arguments.as_json, stream=output)
-    return 0 if arguments.command == "auto" else 1
+    return _exit_code(arguments, payload["progress"])
+
+
+def _exit_code(arguments, progress: str) -> int:
+    """`auto` succeeds while it waits, because the watcher runs it again.
+
+    A manual `sync` succeeds only when everything finished.
+    """
+
+    if progress == "finished":
+        return 0
+    waiting = progress in ("waiting-for-Claude", "waiting-for-sync")
+    return 0 if waiting and arguments.command == "auto" else 1
 
 
 def run(

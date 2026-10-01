@@ -180,7 +180,10 @@ launch two profiles. The wait uses a wall-clock deadline and a bounded process
 probe, so slow process inspection cannot silently extend the advertised limit.
 It launches the selected profile after synchronization, even when the sync failed.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
-returns success with `state=waiting` and `reason=claude-open`. A busy writer
+returns success with `state=waiting` and `reason=claude-open`. If Claude opens
+again after the chats synced but before pins, groups, or routines did, those
+report `deferred` and the run reports `progress=waiting-for-Claude`, not
+finished. The next quit syncs them. A busy writer
 returns success with `state=skipped` and `reason=busy`. `sync` reports the same
 states but exits nonzero. The watcher retries a busy writer, and a Claude that
 is still shutting down after a quit, for up to 30 seconds, without changing open

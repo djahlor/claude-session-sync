@@ -25,18 +25,21 @@ def record_progress(config, state: str, **fields) -> dict:
 
 
 def finish_progress(config, payload: dict) -> str:
-    outcomes = [payload.get("state")]
-    outcomes.extend(
-        payload[key].get("state") for key in ("routines", "layout") if key in payload
-    )
+    """Record how a sync ended. A component deferred because Claude reopened is unfinished."""
+
+    adapters = [payload[key] for key in ("routines", "layout") if key in payload]
+    outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
     attention = any(
         value not in ("committed", "synced", "noop", "disabled", "deferred")
         for value in outcomes
     )
-    attention = attention or any(
-        payload.get(key, {}).get("reporting_error") for key in ("routines", "layout")
-    )
-    state = "needs-attention" if attention else "finished"
+    attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
+    if attention:
+        state = "needs-attention"
+    elif any(adapter.get("state") == "deferred" for adapter in adapters):
+        state = "waiting-for-Claude"
+    else:
+        state = "finished"
     record_progress(config, state, result=payload)
     return state
 

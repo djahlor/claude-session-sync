@@ -20,6 +20,7 @@ from test_cli import (
     FakePlanner,
     FakeProcessProbe,
     FakeRoutine,
+    SequencedProcessProbe,
 )
 
 
@@ -222,6 +223,34 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(
                 "waiting-for-Claude", json.loads(out.getvalue())["progress"]
             )
+
+    def test_a_component_deferred_because_claude_reopened_is_not_finished(self):
+        from claude_session_sync.model import RunReceipt
+
+        for command, expected_exit in (("auto", 0), ("sync", 1)):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                loaded = replace(config(Path(directory)), sync_sidebar_layout=True)
+                plan = Plan(1, "digest", (), (), (), "plan", 0)
+                deps = CliDependencies(
+                    config_loader=lambda _: loaded,
+                    planner_factory=lambda _: FakePlanner(plan),
+                    engine_factory=lambda _: FakeEngine(RunReceipt("run", "committed", "plan", 1, 10)),
+                    layout_factory=lambda _: self.fail("pins and groups must wait for Claude"),
+                    # Closed for the chat phase, open again before pins and groups.
+                    process_probe=SequencedProcessProbe(((), (object(),))),
+                )
+                out = io.StringIO()
+
+                exit_code = run((command, "--json"), dependencies=deps, stdout=out, stderr=io.StringIO())
+
+                payload = json.loads(out.getvalue())
+                self.assertEqual(expected_exit, exit_code)
+                self.assertEqual("committed", payload["state"])
+                self.assertEqual("deferred", payload["layout"]["state"])
+                self.assertEqual("waiting-for-Claude", payload["progress"])
+                saved = read_status(loaded.state_dir, "sync-progress.json")
+                self.assertEqual("waiting-for-Claude", saved["state"])
+                self.assertIsNone(saved["last_success_at"])
 
     def test_fifo_status_is_rejected_without_blocking(self):
         with tempfile.TemporaryDirectory() as directory:

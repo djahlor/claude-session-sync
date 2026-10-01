@@ -491,7 +491,9 @@ private final class SessionSyncWatcher: NSObject {
       }
     }
     writeStatus(exitStatus: result == nil ? 1 : exitStatus, output: output, launchFailed: false)
-    if reason == "claude-open" && NSWorkspace.shared.runningApplications.contains(where: {
+    // Nothing synced, or pins, groups, or routines waited, because Claude is open.
+    let waitingForClaude = progress == "waiting-for-Claude"
+    if waitingForClaude && NSWorkspace.shared.runningApplications.contains(where: {
       $0.executableURL?.standardizedFileURL.path == claudeExecutable
     }) {
       retryDeadline = nil
@@ -499,7 +501,7 @@ private final class SessionSyncWatcher: NSObject {
       runQueuedWork(restarting: restarting)
       return
     }
-    if reason == "busy" || (reason == "claude-open" && retryDeadline != nil) {
+    if reason == "busy" || (waitingForClaude && retryDeadline != nil) {
       if retryDeadline == nil { retryDeadline = Date().addingTimeInterval(30) }
       if let deadline = retryDeadline, Date() < deadline {
         queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startAutoIfNeeded() }
