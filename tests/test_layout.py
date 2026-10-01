@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from claude_session_sync.config import Config
 from claude_session_sync.layout import (
+    LayoutTransform,
     DFRAME_STORE_KEY,
     GROUP_SCOPES_KEY,
     LOCAL_SLICE_KEY,
@@ -1066,6 +1067,37 @@ class FollowAccountTests(unittest.TestCase):
             self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "main-account-has-no-groups"), receipt)
             self.assertEqual(before, values)
             self.assertEqual({"version": 1, "adopted_scope": "a/w"}, json.loads(snapshot_path.read_text()))
+
+    def test_a_profile_left_alone_on_purpose_keeps_its_reason_when_another_changed(self):
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            second = Profile("Second", root / "second", ("open",), False)
+            (second.data_root / "Local Storage" / "leveldb").mkdir(parents=True)
+            synchronizer.config = replace(
+                synchronizer.config, profiles=synchronizer.config.profiles + (second,)
+            )
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+            plans = iter([
+                ({DFRAME_STORE_KEY: b"before"}, {DFRAME_STORE_KEY: b"after"},
+                 LayoutTransform({}, None, 1, 0, 0)),
+                ({DFRAME_STORE_KEY: b"before"}, {DFRAME_STORE_KEY: b"before"},
+                 LayoutTransform({}, None, 0, 0, 0, reason="main-account-has-no-groups")),
+            ])
+
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets_ab
+            ), patch.object(
+                synchronizer, "_plan_profile", side_effect=lambda *args, **kwargs: next(plans)
+            ), patch.object(synchronizer, "_commit"):
+                receipt = synchronizer.sync()
+
+            self.assertEqual("synced", receipt.state)
+            self.assertEqual("main-account-has-no-groups", receipt.reason)
 
     def test_a_divergent_account_without_a_switch_is_left_for_a_choice(self):
         targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}

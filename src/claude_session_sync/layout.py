@@ -1228,7 +1228,7 @@ class LayoutSynchronizer:
                 totals[1],
                 totals[2],
                 totals[3],
-                reasons[0] if reasons and not changed_profiles else None,
+                ",".join(dict.fromkeys(reasons)) or None,
             )
         finally:
             lock.release()
