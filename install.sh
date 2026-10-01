@@ -99,20 +99,17 @@ else
   echo "Open Claude normally. No separate profile app is needed."
 fi
 if [[ "$automatic_targets" == true ]]; then
-  echo "Chats sync in the background while Claude is open."
-  echo "A new account joins once you start a chat in it."
-  if [[ "$sync_layout" == true ]]; then
-    echo "After an account switch, Claude restarts once to bring your pins and groups."
-  else
-    echo "Switching accounts never quits Claude. If new chats need a restart to show,"
-    echo "the Sync menu offers one."
-  fi
+  echo "Chats sync when you switch accounts and when you quit Claude."
+  echo "After a switch, Claude closes, syncs, and opens again by itself."
+  echo "A new account joins after you chat in it and then switch accounts or quit Claude."
 else
   echo "Safe mode is active. New account and workspace IDs need explicit approval."
+  echo "Chats sync when you quit Claude."
 fi
+echo "Nothing syncs while Claude is open."
 if [[ "$sync_layout" == true ]]; then
   echo "Pins and custom groups sync whenever Claude closes or restarts."
 fi
 if [[ "$sync_routines" == true ]]; then
-  echo "Claude Code routines will sync after Claude quits."
+  echo "Claude Code routines sync whenever Claude closes or restarts."
 fi
