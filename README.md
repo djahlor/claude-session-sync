@@ -67,8 +67,9 @@ The **Sync** menu keeps the latest status.
 
 Pins and groups follow the account you use. When you switch, the account you
 just left is the source. Otherwise the account you are signed into wins. A
-group you delete stays deleted in every account. To pick another main account
-later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
+group you delete stays deleted in every account. The one exception: if you
+delete the main account's last group, the other accounts keep theirs, and the
+status says so. To pick another main account later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
 Routines sync at the same moments as chats.
 
 ## Update
