@@ -871,6 +871,69 @@ class CliSwitchTests(unittest.TestCase):
             self.assertEqual(events[1], ("launch", loaded.profiles[1].launch_command))
             self.assertEqual("finished", json.loads(out.getvalue())["progress"])
 
+    def test_a_failed_switch_sync_still_reopens_claude_and_reports_it(self):
+        class BrokenEngine(FakeEngine):
+            def apply(self, plan):
+                raise RuntimeError("private engine detail")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            invalid = Plan(1, "digest", (), (), (InvalidReplica(root / "bad", "malformed JSON"),), "plan", 0)
+            valid = Plan(1, "digest", (), (), (), "plan", 0)
+            for plan, engine, expected_state in (
+                (invalid, FakeEngine(None), "blocked_invalid"),
+                (valid, BrokenEngine(None), "failed"),
+            ):
+                with self.subTest(expected_state=expected_state):
+                    events = []
+                    out = io.StringIO()
+                    exit_code = run(
+                        ["--config", str(root / "config.json"), "switch", "Work", "--json"],
+                        dependencies=CliDependencies(
+                            config_loader=lambda path: loaded,
+                            planner_factory=lambda _config, plan=plan: FakePlanner(plan),
+                            engine_factory=lambda _config, engine=engine: engine,
+                            process_probe=FakeProcessProbe(),
+                            launcher=FakeLauncher(events),
+                        ),
+                        stdout=out,
+                        stderr=io.StringIO(),
+                    )
+
+                    payload = json.loads(out.getvalue())
+                    self.assertEqual(1, exit_code)
+                    self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
+                    self.assertEqual(expected_state, payload["state"])
+                    self.assertEqual("needs-attention", payload["progress"])
+                    self.assertEqual("started", payload["launch"])
+
+    def test_claude_reopens_even_when_the_switch_crashes_after_it_closed(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            events = []
+            errors = io.StringIO()
+            with mock.patch("claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")):
+                exit_code = run(
+                    ["--config", str(root / "config.json"), "switch", "Work"],
+                    dependencies=CliDependencies(
+                        config_loader=lambda path: loaded,
+                        planner_factory=lambda _config: FakePlanner(Plan(1, "digest", (), (), (), "plan", 0)),
+                        engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan", 0, 0)),
+                        process_probe=FakeProcessProbe(),
+                        launcher=FakeLauncher(events),
+                    ),
+                    stdout=io.StringIO(),
+                    stderr=errors,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("disk full", errors.getvalue())
+            self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
+
     def test_switch_refuses_to_sync_or_launch_while_managed_app_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

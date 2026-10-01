@@ -495,40 +495,47 @@ def _run_switch(
             return 1
         record_progress(config, "syncing")
         started = dependencies.clock()
-        payload = _switch_chat_result(config, dependencies, started)
-        payload.update(
-            run_adapters(
-                config,
-                dependencies,
-                lambda: bool(_running_processes(config, dependencies)),
-                adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
-                after_account_switch=getattr(arguments, "after_account_switch", False),
+        try:
+            payload = _switch_chat_result(config, dependencies, started)
+            payload.update(
+                run_adapters(
+                    config,
+                    dependencies,
+                    lambda: bool(_running_processes(config, dependencies)),
+                    adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
+                    after_account_switch=getattr(arguments, "after_account_switch", False),
+                )
             )
-        )
-        payload["progress"] = finish_progress(config, payload)
-        if payload["progress"] == "needs-attention":
-            _write(payload, as_json=as_json, stream=output)
+            payload["progress"] = finish_progress(config, payload)
+        finally:
+            # Claude was closed for this switch. It reopens even when the sync
+            # failed, so a failed sync never leaves Claude closed.
+            launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
+        if launch_failed:
+            _write(
+                {"state": "launch_failed", "reason": "launch-command-failed"},
+                as_json=as_json,
+                stream=output,
+            )
             return 1
         if not arguments.no_launch:
-            from .launcher import LaunchError, Launcher
-
-            try:
-                (dependencies.launcher or Launcher()).launch(profile.launch_command)
-            except LaunchError:
-                _write(
-                    {"state": "launch_failed", "reason": "launch-command-failed"},
-                    as_json=as_json,
-                    stream=output,
-                )
-                return 1
-        _write(
-            payload,
-            as_json=as_json,
-            stream=output,
-        )
-        return 0
+            payload["launch"] = "started"
+        _write(payload, as_json=as_json, stream=output)
+        return 0 if payload["progress"] == "finished" else 1
     finally:
         handoff.release()
+
+
+def _launch(profile: Any, dependencies: CliDependencies) -> bool:
+    """Start the profile's Claude. False when the launch command failed."""
+
+    from .launcher import LaunchError, Launcher
+
+    try:
+        (dependencies.launcher or Launcher()).launch(profile.launch_command)
+    except LaunchError:
+        return False
+    return True
 
 
 def _find_profile(config: Config, requested_name: str) -> Any:

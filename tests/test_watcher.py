@@ -259,7 +259,7 @@ class WatcherTests(unittest.TestCase):
     def test_restart_request_quits_syncs_and_reopens_once(self):
         self.live_scenario(request_restart=True)
 
-    def test_failed_restart_sync_does_not_reopen_or_repeat(self):
+    def test_a_failed_restart_sync_reopens_claude_reports_it_and_does_not_repeat(self):
         self.live_scenario(request_restart=True, fail_sync=True)
 
     def test_blocked_restart_check_leaves_claude_open(self):
@@ -307,9 +307,9 @@ class WatcherTests(unittest.TestCase):
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "if sys.argv[1] == 'switch':\n"
                 f" assert subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], stdout=subprocess.DEVNULL).returncode == 1, 'sync ran before app exited'\n"
-                f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention'}})); raise SystemExit(1)\n"
                 f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
-                " print(json.dumps({'state': 'noop', 'progress': 'finished'}))\n"
+                f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started'}})); raise SystemExit(1)\n"
+                " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
                 "else:\n"
                 f" if {request_during_sync!r} and len(calls.read_text().splitlines()) == 1: time.sleep(3)\n"
                 f" if {claude_open_waits!r}: print(json.dumps({{'state': 'waiting', 'reason': 'claude-open', 'progress': 'waiting-for-Claude'}})); raise SystemExit(0)\n"
@@ -398,8 +398,10 @@ class WatcherTests(unittest.TestCase):
                     self.assertEqual("needs-attention" if fail_sync or block_preflight else "finished", phase)
                     if block_preflight:
                         self.assertTrue(app_running(), "a blocked check must leave Claude open")
-                    elif not fail_sync:
-                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen after the sync")
+                    else:
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen, even after a failed sync")
+                    if fail_sync:
+                        self.assertEqual("needs-attention", json.loads(json.loads(status.read_text())["output"])["progress"])
                 self.assertTrue(
                     all(item[0] != "switch" for item in entries()) or request_restart or change_account
                 )

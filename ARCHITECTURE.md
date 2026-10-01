@@ -27,8 +27,9 @@ profile's launch command. Because the termination watcher may start the same
 work, the adapter waits briefly for the single writer and replans after a
 concurrent commit. A distinct nonblocking handoff lock spans the final process
 check, synchronization, and launch, preventing two simultaneous profile
-launches. A launch fails only when the launch command cannot start or exits
-with an error. It adds no synchronization policy.
+launches. It runs the launch command even when the sync failed, and still
+reports the failure. A launch fails only when the launch command cannot start
+or exits with an error. It adds no synchronization policy.
 
 In automatic target mode, the native watcher observes the default profile's
 account UUID marker. A stable account change asks Claude to quit normally, runs

@@ -329,7 +329,7 @@ private final class SessionSyncWatcher: NSObject {
             return
           }
           self.noteRestartSkipped("claude-not-open")
-          self.showStatus("Claude is not open. It will show every chat when it starts.", banner: true)
+          self.showStatus("Claude is not open, so it was not restarted.", banner: true)
           return
         }
         let approvedPIDs: Set<pid_t>
@@ -475,7 +475,10 @@ private final class SessionSyncWatcher: NSObject {
       restartMode = nil
     }
     if restarting && (exitStatus != 0 || progress != "finished") {
-      restartFailed("Sync needs attention. Claude was not automatically reopened.")
+      // The switch command reopens Claude even when its sync fails.
+      restartFailed(result?["launch"] as? String == "started"
+        ? "Sync needs attention. Claude is reopening."
+        : "Sync needs attention. Claude was not reopened.")
       runPendingIfNeeded()
       return
     }
@@ -507,7 +510,7 @@ private final class SessionSyncWatcher: NSObject {
     } else if exitStatus == 0 && progress == "finished" {
       lastFailureKey = nil
       if restarting {
-        notify("Sync finished. Claude reopened.")
+        notify("Sync finished. Claude is reopening.")
       } else {
         showStatus("Sync finished")
       }

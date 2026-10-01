@@ -178,7 +178,7 @@ be clicked while the previous account is still shutting down. After exit,
 first; a separate handoff lock ensures simultaneous wrapper clicks cannot
 launch two profiles. The wait uses a wall-clock deadline and a bounded process
 probe, so slow process inspection cannot silently extend the advertised limit.
-It launches the selected profile only after synchronization succeeds.
+It launches the selected profile after synchronization, even when the sync failed.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
 returns success with `state=waiting` and `reason=claude-open`. A busy writer
 returns success with `state=skipped` and `reason=busy`. `sync` reports the same
@@ -193,9 +193,11 @@ unchanged content through its hash cache, applies new copies with a recovery
 journal, and writes an aggregate status receipt. It does not sync at sign-out
 because Claude is still running and may still be writing its private stores.
 
-After the sync, `switch` runs the profile's launch command. It returns
-`state=launch_failed` only when that command cannot start or exits with an
-error. A command still running after 10 seconds counts as launched, because a
+After the sync, `switch` runs the profile's launch command, even when the sync
+failed, so a switch never leaves Claude closed. A failed sync still exits
+nonzero with its result and `launch=started`. `switch` returns
+`state=launch_failed` only when the launch command cannot start or exits with
+an error. A command still running after 10 seconds counts as launched, because a
 profile can launch the Claude executable itself. A failed or slow launch leaves
 nothing behind that blocks the next switch. Older versions could leave a
 `launch-pending.json` file after a slow launch. `setup` removes it.
@@ -320,8 +322,8 @@ keeps a SHA-256 fingerprint of it. It never reads cookies, copies credentials,
 or writes Claude's account config. A switch asks Claude to quit normally, runs
 `switch <profile> --after-account-switch --json` with Claude closed, and
 reopens Claude. Claude quitting runs `auto`. Saving a chat does not start a
-sync. A failed restart check or sync leaves Claude open or closed and reports
-why. It never force-kills Claude.
+sync. A failed sync still reopens Claude and reports why. A failed restart
+check leaves Claude open. It never force-kills Claude.
 
 Each sync reads every login line at the end of Claude's `main.log` and records
 each account's first login on this Mac in the private chat state, so a rotated
