@@ -268,6 +268,9 @@ class WatcherTests(unittest.TestCase):
     def test_a_restart_requested_during_a_sync_waits_for_it(self):
         self.live_scenario(request_restart=True, request_during_sync=True)
 
+    def test_a_restart_requested_while_a_sync_waits_for_claude_still_runs(self):
+        self.live_scenario(request_restart=True, request_during_sync=True, claude_open_waits=True)
+
     def test_an_adoption_request_reaches_the_closed_claude_sync(self):
         self.live_scenario(request_restart=True, request_text="adopt-current-sidebar\n")
 
@@ -362,7 +365,7 @@ class WatcherTests(unittest.TestCase):
                     self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
                     time.sleep(4)
                     self.assertEqual(1, len(switches()), "no restart loop")
-                if claude_open_waits:
+                if claude_open_waits and not request_restart:
                     time.sleep(4)
                     self.assertEqual(1, len(entries()), "a sync waiting for Claude must not retry while it runs")
                     self.assertTrue(app_running(), "waiting must never quit Claude")

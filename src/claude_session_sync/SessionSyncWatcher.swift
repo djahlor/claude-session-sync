@@ -496,7 +496,7 @@ private final class SessionSyncWatcher: NSObject {
     }) {
       retryDeadline = nil
       showStatus(restartPhase == "needs-attention" ? "Sync needs attention" : readyMessage)
-      runPendingIfNeeded()
+      runQueuedWork(restarting: restarting)
       return
     }
     if reason == "busy" || (reason == "claude-open" && retryDeadline != nil) {
@@ -522,8 +522,13 @@ private final class SessionSyncWatcher: NSObject {
     if exitStatus != 0 {
       NSLog("claude-session-sync auto failed with exit status %d", exitStatus)
     }
+    runQueuedWork(restarting: restarting)
+  }
+
+  // A restart queued during a sync runs next. It syncs everything itself, so
+  // a queued sync is not needed.
+  private func runQueuedWork(restarting: Bool) {
     if restartPending && !restarting {
-      // The restart syncs everything itself, so a queued sync is not needed.
       restartPending = false
       pending = false
       let mode = pendingRestartMode
