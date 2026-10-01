@@ -27,7 +27,7 @@ def main() -> None:
             source.write_bytes(content)
             operations.append(
                 Operation(
-                    kind="copy",
+                    kind="create",
                     session_id=session_id,
                     source=source,
                     destination=destinations / source.name,
@@ -37,10 +37,7 @@ def main() -> None:
                 )
             )
         plan = Plan(
-            version=1,
-            config_digest="benchmark",
             operations=tuple(operations),
-            conflicts=(),
             invalid_replicas=(),
             plan_id="benchmark-700",
             total_bytes=sum(operation.size for operation in operations),

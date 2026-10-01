@@ -17,6 +17,8 @@ from claude_session_sync.layout import (
     LOCAL_SLICE_KEY,
     LayoutError,
     LayoutBusyError,
+    LayoutChoiceError,
+    LayoutReceipt,
     LayoutRecoveryError,
     LayoutSnapshot,
     LayoutSynchronizer,
@@ -50,6 +52,18 @@ def scope(*groups, assignments=None):
             ]
             for entry in entries
         },
+    }
+
+
+def recovery_record(target, before, after):
+    """One version 2 recovery record, as the record journal writes it."""
+
+    return {
+        "target": target,
+        "before": base64.b64encode(before).decode("ascii"),
+        "after": base64.b64encode(after).decode("ascii"),
+        "before_sha256": hashlib.sha256(before).hexdigest(),
+        "after_sha256": hashlib.sha256(after).hexdigest(),
     }
 
 
@@ -109,44 +123,6 @@ class LayoutTransformTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(LayoutError):
                 _decode_record(value, "record")
 
-    def test_stale_order_entries_are_filtered_without_changing_assignments(self):
-        current_scope = scope(
-            "Focus",
-            "Backlog",
-            assignments={
-                "code:keep-one": "id-focus",
-                "code:keep-two": "id-focus",
-                "code:moved": "id-backlog",
-                "code:backlog": "id-backlog",
-            },
-        )
-        current_scope["order"] = {
-            "id-focus": [
-                "code:keep-two",
-                "code:moved",
-                "code:missing",
-                "code:keep-one",
-            ],
-            "id-backlog": ["code:backlog"],
-        }
-        result = transform_layout_records(
-            records({"a/w": current_scope}, active="a/w"),
-            {"a/w": set(current_scope["assignments"])},
-            timestamp_ms=10,
-        )
-        transformed = decoded(result.records[DFRAME_STORE_KEY])["state"][
-            "customGroupsByScope"
-        ]["a/w"]
-
-        self.assertEqual(current_scope["assignments"], transformed["assignments"])
-        self.assertEqual(
-            ["code:keep-two", "code:keep-one"], transformed["order"]["id-focus"]
-        )
-        self.assertEqual(
-            ["code:backlog", "code:moved"],
-            transformed["order"]["id-backlog"],
-        )
-
     def test_adopt_current_sidebar_preserves_source_and_seeds_future_scopes(self):
         source = scope(
             "Focus 🚀",
@@ -194,10 +170,7 @@ class LayoutTransformTests(unittest.TestCase):
         self.assertEqual(
             ["code:keep", "code:dangling"], copied["order"]["id-focus 🚀"]
         )
-        self.assertEqual(
-            {"Focus 🚀": ("code:keep", "code:dangling"), "Backlog": ("code:moved",)},
-            adopted.snapshot.group_order,
-        )
+        self.assertEqual(LayoutSnapshot("a/w"), adopted.snapshot)
 
         next_targets = dict(targets, **{"c/w": {"code:keep", "code:moved"}})
         repeated = transform_layout_records(
@@ -237,7 +210,7 @@ class LayoutTransformTests(unittest.TestCase):
         current = dict(adopted.records)
         current[DFRAME_STORE_KEY] = _encode_record(switched)
 
-        with self.assertRaisesRegex(LayoutError, "differs from the adopted"):
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
             transform_layout_records(
                 current,
                 {"a/w": {"code:keep"}, "b/w": {"code:keep"}},
@@ -295,133 +268,7 @@ class LayoutTransformTests(unittest.TestCase):
         self.assertEqual(source, state["customGroupsByScope"]["target/w"])
         self.assertEqual("target/w", restored.canonical_upload_scope)
 
-    def test_stale_non_target_scope_cannot_override_a_valid_placement(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus", "Backlog"),
-            assignments={"code:local_one": "Focus"},
-            pinned_order=(), home_projects_pinned_order=(),
-        )
-        stale = scope("Backlog", assignments={"code:local_one": "id-backlog"})
-        current = records({
-            "a/w": scope("Focus", assignments={"code:local_one": "id-focus"}),
-            "stale/w": stale,
-        }, active="stale/w")
-        targets = {key: {"code:local_one"} for key in ("a/w", "b/w")}
-        for baseline in (None, snapshot):
-            with self.subTest(snapshot=baseline is not None):
-                result = transform_layout_records(current, targets, snapshot=baseline)
-                self.assertEqual(0, result.ambiguous_assignments)
-                self.assertEqual({"code:local_one": "Focus"}, result.snapshot.assignments)
-                scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
-                self.assertEqual(stale, scopes["stale/w"])
-                for key in targets:
-                    target = scopes[key]
-                    names = {group["id"]: group["name"] for group in target["groups"]}
-                    self.assertEqual("Focus", names[target["assignments"]["code:local_one"]])
-                    if baseline is None:
-                        self.assertNotIn("Backlog", names.values())
-                    else:
-                        self.assertIn("Backlog", names.values())
-
-    def test_stale_chat_in_a_target_scope_cannot_override_a_valid_placement(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus", "Backlog"),
-            assignments={"code:local_one": "Focus"},
-            pinned_order=(), home_projects_pinned_order=(),
-        )
-        current = records({
-            "a/w": scope("Focus", assignments={"code:local_one": "id-focus"}),
-            "b/w": scope("Backlog", assignments={
-                "code:local_one": "id-backlog", "code:other": "id-backlog",
-            }),
-        }, active="b/w")
-        targets = {
-            "a/w": {"code:local_one"},
-            "b/w": {"code:other"},
-            "c/w": {"code:local_one", "code:other"},
-        }
-        for baseline in (None, snapshot):
-            with self.subTest(snapshot=baseline is not None):
-                result = transform_layout_records(current, targets, snapshot=baseline)
-                self.assertEqual(0, result.ambiguous_assignments)
-                self.assertEqual(
-                    {"code:local_one": "Focus", "code:other": "Backlog"},
-                    result.snapshot.assignments,
-                )
-                scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
-                for key, sessions in targets.items():
-                    target = scopes[key]
-                    self.assertTrue(sessions.issubset(set(target["assignments"])))
-                    names = {group["id"]: group["name"] for group in target["groups"]}
-                    for session in sessions:
-                        self.assertEqual(
-                            result.snapshot.assignments[session],
-                            names[target["assignments"][session]],
-                        )
-
-    def test_one_folder_move_since_snapshot_reaches_all_accounts(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus", "Backlog"),
-            assignments={"code:local_one": "Focus"},
-            pinned_order=(),
-            home_projects_pinned_order=(),
-        )
-        for active in ("a/w", "b/w"):
-            with self.subTest(active=active):
-                result = transform_layout_records(
-                    records({
-                        "a/w": scope("Focus", "Backlog", assignments={"code:local_one": "id-focus"}),
-                        "b/w": scope("Focus", "Backlog", assignments={"code:local_one": "id-backlog"}),
-                    }, active=active),
-                    {key: {"code:local_one"} for key in ("a/w", "b/w", "c/w")},
-                    snapshot=snapshot,
-                    timestamp_ms=10,
-                )
-                self.assertEqual(0, result.ambiguous_assignments)
-                self.assertEqual("Backlog", result.snapshot.assignments["code:local_one"])
-                for target in decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"].values():
-                    names = {group["id"]: group["name"] for group in target["groups"]}
-                    self.assertEqual("Backlog", names[target["assignments"]["code:local_one"]])
-                repeated = transform_layout_records(
-                    result.records,
-                    {key: {"code:local_one"} for key in ("a/w", "b/w", "c/w")},
-                    snapshot=result.snapshot,
-                    timestamp_ms=20,
-                )
-                self.assertEqual(result.records, repeated.records)
-
-    def test_two_different_moves_remain_conflicted_until_current_sidebar_is_selected(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus", "Backlog", "Later"),
-            assignments={"code:local_one": "Focus"},
-            pinned_order=(), home_projects_pinned_order=(),
-        )
-        current = records({
-            "a/w": scope("Focus", "Backlog", "Later", assignments={"code:local_one": "id-backlog"}),
-            "b/w": scope("Focus", "Backlog", "Later", assignments={"code:local_one": "id-later"}),
-        }, active="a/w")
-        targets = {key: {"code:local_one"} for key in ("a/w", "b/w", "c/w")}
-        for baseline in (None, snapshot):
-            with self.subTest(snapshot=baseline is not None):
-                conflicted = transform_layout_records(current, targets, snapshot=baseline)
-                self.assertEqual(1, conflicted.ambiguous_assignments)
-                self.assertNotIn("code:local_one", conflicted.snapshot.assignments)
-                scopes = decoded(conflicted.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
-                self.assertEqual("id-backlog", scopes["a/w"]["assignments"]["code:local_one"])
-                self.assertEqual("id-later", scopes["b/w"]["assignments"]["code:local_one"])
-                self.assertEqual({}, scopes["c/w"]["assignments"])
-                resolved = transform_layout_records(
-                    current, targets, snapshot=baseline, prefer_current_sidebar=True,
-                )
-                self.assertEqual(0, resolved.ambiguous_assignments)
-                self.assertEqual("Backlog", resolved.snapshot.assignments["code:local_one"])
-                for target in decoded(resolved.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"].values():
-                    names = {group["id"]: group["name"] for group in target["groups"]}
-                    self.assertEqual("Backlog", names[target["assignments"]["code:local_one"]])
-                repeated = transform_layout_records(resolved.records, targets, snapshot=resolved.snapshot)
-                self.assertEqual(resolved.records, repeated.records)
-
-    def test_current_sidebar_resolution_rejects_missing_empty_or_unapproved_scope(self):
+    def test_adopting_the_current_sidebar_rejects_missing_empty_or_unapproved_scope(self):
         for active, scopes in (
             (None, {"a/w": scope("Focus")}),
             ("a/w", {}),
@@ -429,28 +276,11 @@ class LayoutTransformTests(unittest.TestCase):
             ("other/w", {"other/w": scope("Focus")}),
         ):
             with self.subTest(active=active, scopes=scopes):
-                with self.assertRaisesRegex(LayoutError, "current sidebar"):
+                with self.assertRaisesRegex(LayoutError, "approved sync target"):
                     transform_layout_records(
                         records(scopes, active=active), {"a/w": set()},
-                        prefer_current_sidebar=True,
+                        adopt_current_sidebar=True,
                     )
-
-    def test_current_sidebar_resolution_does_not_guess_for_missing_or_ungrouped_chats(self):
-        current = records({
-            "a/w": scope("Focus", "Backlog", assignments={"code:missing": "id-focus"}),
-            "b/w": scope("Focus", "Backlog", assignments={"code:missing": "id-backlog", "code:ungrouped": "id-focus"}),
-            "c/w": scope("Focus", "Backlog", assignments={"code:missing": "id-focus", "code:ungrouped": "id-backlog"}),
-        }, active="a/w")
-        result = transform_layout_records(
-            current, {
-                "a/w": {"code:ungrouped"},
-                "b/w": {"code:missing", "code:ungrouped"},
-                "c/w": {"code:missing", "code:ungrouped"},
-            },
-            prefer_current_sidebar=True,
-        )
-        self.assertEqual(2, result.ambiguous_assignments)
-        self.assertEqual({}, result.snapshot.assignments)
 
     def test_recovery_comparison_preserves_unknown_json_types(self):
         before = encoded({"timestamp": 1, "value": {}, "unknown": True})
@@ -482,168 +312,6 @@ class LayoutTransformTests(unittest.TestCase):
         self.assertFalse(same_recovery_payload(marker, b"\x01a/w|migrate", b"\x01other/w|migrate"))
         self.assertFalse(same_recovery_payload(marker, None, b"\x01a/w|migrate"))
 
-    def test_first_sync_unions_groups_and_populates_every_target_scope(self):
-        first = scope(
-            "Focus",
-            assignments={"code:local_one": "id-focus"},
-        )
-        second = scope(
-            "Backlog",
-            assignments={"code:local_two": "id-backlog"},
-        )
-        current = records({"a/w": first, "b/w": second}, active="a/w")
-
-        result = transform_layout_records(
-            current,
-            {
-                "a/w": {"code:local_one", "code:local_two"},
-                "b/w": {"code:local_one", "code:local_two"},
-                "c/w": {"code:local_one", "code:local_two"},
-            },
-            timestamp_ms=10,
-        )
-
-        self.assertEqual(("Focus", "Backlog"), result.snapshot.groups)
-        store = decoded(result.records[DFRAME_STORE_KEY])
-        scopes = store["state"]["customGroupsByScope"]
-        self.assertEqual({"a/w", "b/w", "c/w"}, set(scopes))
-        for current_scope in scopes.values():
-            self.assertEqual(
-                ["Focus", "Backlog"],
-                [group["name"] for group in current_scope["groups"]],
-            )
-            names = {group["id"]: group["name"] for group in current_scope["groups"]}
-            assigned = {
-                session: names[group_id]
-                for session, group_id in current_scope["assignments"].items()
-            }
-            self.assertEqual(
-                {
-                    "code:local_one": "Focus",
-                    "code:local_two": "Backlog",
-                },
-                assigned,
-            )
-
-    def test_ambiguous_assignment_is_not_copied_to_a_new_scope(self):
-        first = scope("Focus", "Backlog", assignments={"code:local_one": "id-focus"})
-        second = scope("Focus", "Backlog", assignments={"code:local_one": "id-backlog"})
-        result = transform_layout_records(
-            records({"a/w": first, "b/w": second}, active="a/w"),
-            {
-                "a/w": {"code:local_one"},
-                "b/w": {"code:local_one"},
-                "c/w": {"code:local_one"},
-            },
-            timestamp_ms=10,
-        )
-
-        self.assertEqual(1, result.ambiguous_assignments)
-        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"][
-            "customGroupsByScope"
-        ]
-        self.assertTrue(scopes["a/w"]["assignments"])
-        self.assertTrue(scopes["b/w"]["assignments"])
-        self.assertEqual({}, scopes["c/w"]["assignments"])
-
-    def test_snapshot_restores_groups_and_pins_after_an_empty_account_state(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus",),
-            assignments={"code:local_one": "Focus"},
-            pinned_order=("code:local_one",),
-            home_projects_pinned_order=(),
-        )
-        result = transform_layout_records(
-            records({}, active="new/w", pins=[]),
-            {"new/w": {"code:local_one"}},
-            snapshot=snapshot,
-            timestamp_ms=10,
-        )
-
-        store = decoded(result.records[DFRAME_STORE_KEY])["state"]
-        local = decoded(result.records[LOCAL_SLICE_KEY])["value"]
-        self.assertEqual(["code:local_one"], store["pinnedOrder"])
-        self.assertEqual(store["pinnedOrder"], local["pinnedOrder"])
-        self.assertEqual(
-            ["Focus"],
-            [
-                group["name"]
-                for group in store["customGroupsByScope"]["new/w"]["groups"]
-            ],
-        )
-
-    def test_snapshot_groups_survive_an_active_scope_update(self):
-        snapshot = LayoutSnapshot(
-            groups=("Focus", "Backlog"),
-            assignments={},
-            pinned_order=(),
-            home_projects_pinned_order=(),
-        )
-        current = records(
-            {
-                "a/w": scope("Focus", "New"),
-                "b/w": scope("Focus", "Backlog"),
-            },
-            active="a/w",
-        )
-
-        result = transform_layout_records(
-            current,
-            {"a/w": set(), "b/w": set()},
-            snapshot=snapshot,
-            timestamp_ms=10,
-        )
-
-        self.assertEqual(("Focus", "New", "Backlog"), result.snapshot.groups)
-        repeated = transform_layout_records(
-            result.records,
-            {"a/w": set(), "b/w": set()},
-            snapshot=result.snapshot,
-            timestamp_ms=20,
-        )
-        self.assertEqual(result.records, repeated.records)
-
-    def test_unrelated_store_fields_are_preserved(self):
-        current = records(
-            {"a/w": scope("Focus")}, active="a/w", extra={"keep": [1, 2, 3]}
-        )
-        result = transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
-
-        self.assertEqual(
-            {"keep": [1, 2, 3]},
-            decoded(result.records[DFRAME_STORE_KEY])["state"]["unrelated"],
-        )
-
-    def test_one_sided_group_record_update_is_merged(self):
-        current = records({"a/w": scope("Focus", "New")}, active="a/w")
-        group_record = decoded(current[GROUP_SCOPES_KEY])
-        group_record["value"] = {"a/w": scope("Focus")}
-        current[GROUP_SCOPES_KEY] = encoded(group_record)
-
-        result = transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
-
-        store = decoded(result.records[DFRAME_STORE_KEY])["state"][
-            "customGroupsByScope"
-        ]
-        persisted = decoded(result.records[GROUP_SCOPES_KEY])["value"]
-        self.assertEqual(store, persisted)
-        self.assertEqual(
-            ["Focus", "New"],
-            [group["name"] for group in store["a/w"]["groups"]],
-        )
-
-    def test_conflicting_group_ids_stop_without_a_replacement(self):
-        current = records({"a/w": scope("Focus")}, active="a/w")
-        group_record = decoded(current[GROUP_SCOPES_KEY])
-        conflicting = scope("Focus")
-        conflicting["groups"][0]["id"] = "different-id"
-        conflicting["order"] = {"different-id": []}
-        group_record["value"] = {"a/w": conflicting}
-        current[GROUP_SCOPES_KEY] = encoded(group_record)
-
-        with self.assertRaisesRegex(LayoutError, "conflicting ids"):
-            transform_layout_records(current, {"a/w": set()}, timestamp_ms=10)
-
 
 class LayoutRecoveryTests(unittest.TestCase):
     def config(self, root):
@@ -668,20 +336,21 @@ class LayoutRecoveryTests(unittest.TestCase):
             database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
             database_path.mkdir(parents=True)
             before = b"before"
+            synchronizer = LayoutSynchronizer(
+                config, helper=root / "helper", process_probe=lambda: ()
+            )
             journal_path = journal_root / "run.json"
             journal_path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
-                        "run_id": "run",
+                        "version": 2,
                         "state": "PREPARED",
-                        "database": str(database_path),
                         "records": [
-                            {
-                                "key": DFRAME_STORE_KEY.hex(),
-                                "before": before.hex(),
-                                "after_sha256": hashlib.sha256(b"after").hexdigest(),
-                            }
+                            recovery_record(
+                                synchronizer._record_target(database_path, DFRAME_STORE_KEY),
+                                before,
+                                b"after",
+                            )
                         ],
                     }
                 ),
@@ -695,9 +364,6 @@ class LayoutRecoveryTests(unittest.TestCase):
                 def get(self, key):
                     return before
 
-            synchronizer = LayoutSynchronizer(
-                config, helper=root / "helper", process_probe=lambda: ()
-            )
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 synchronizer._recover_pending()
 
@@ -706,7 +372,7 @@ class LayoutRecoveryTests(unittest.TestCase):
                 json.loads(journal_path.read_text(encoding="utf-8"))["state"],
             )
 
-    def test_legacy_mixed_recovery_preserves_independent_layout_changes(self):
+    def test_mixed_recovery_preserves_independent_layout_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
@@ -714,19 +380,17 @@ class LayoutRecoveryTests(unittest.TestCase):
             database_path.mkdir(parents=True)
             journal_root = config.state_dir / "layout-runs"
             journal_root.mkdir(parents=True)
+            synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
             journal_path = journal_root / "run.json"
             journal_path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "state": "PREPARED",
-                        "database": str(database_path),
                         "records": [
-                            {
-                                "key": key.hex(),
-                                "before": b"before".hex(),
-                                "after_sha256": hashlib.sha256(b"after").hexdigest(),
-                            }
+                            recovery_record(
+                                synchronizer._record_target(database_path, key), b"before", b"after"
+                            )
                             for key in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY)
                         ],
                     }
@@ -746,7 +410,6 @@ class LayoutRecoveryTests(unittest.TestCase):
                     writes.append(records)
                     values.update(records)
 
-            synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 with self.assertRaisesRegex(LayoutRecoveryError, "independently"):
                     synchronizer._recover_pending()
@@ -780,6 +443,9 @@ class LayoutRecoveryTests(unittest.TestCase):
 
                 def get(self, key):
                     return data[key]
+
+                def get_optional(self, key):
+                    return data.get(key)
 
             synchronizer = LayoutSynchronizer(
                 config, helper=helper, process_probe=lambda: ()
@@ -831,32 +497,6 @@ class LayoutRecoveryTests(unittest.TestCase):
         synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
         return synchronizer, FakeDatabase, FakeDatabase(None, database_path), values
 
-    def test_restored_groups_are_marked_for_account_settings_migration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            synchronizer, fake, database, values = self.transaction_fixture(root)
-            values.clear()
-            values.update(records({"a/w": scope("Focus")}, active="a/w"))
-            prefix = layout_module.ORIGIN_PREFIX
-            values[prefix + b"ccd-sync-owner"] = b"\x01a"
-            values[prefix + b"ccd-sync-active"] = b"\x011"
-            marker = prefix + b"ccd-sync-pending:ccd/dframe-store"
-            snapshot = LayoutSnapshot(("Focus", "Backlog"), {"code:local_one": "Backlog"}, (), ())
-            (synchronizer.config.state_dir / "sidebar-layout-0.json").write_text(json.dumps(snapshot.as_dict()))
-            synchronizer.helper = root / "helper"
-            synchronizer.helper.write_bytes(b"fixture")
-            os.chmod(synchronizer.helper, 0o700)
-            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
-                synchronizer, "_target_sessions", return_value={"a/w": {"code:local_one"}}
-            ):
-                synchronizer.sync()
-                self.assertEqual(b"\x01a/w|migrate", values.get(marker))
-                repeated = synchronizer.sync()
-            self.assertEqual("noop", repeated.state)
-            journal = max(synchronizer._journal_root().glob("*.json"), key=lambda p: p.stat().st_mtime)
-            targets = {item["target"] for item in json.loads(journal.read_text())["records"]}
-            self.assertIn(synchronizer._record_target(database.database, marker), targets)
-
     def test_group_upload_marker_checks_identity_and_preserves_pending_edits(self):
         with tempfile.TemporaryDirectory() as directory:
             synchronizer, _fake, database, values = self.transaction_fixture(Path(directory))
@@ -866,27 +506,17 @@ class LayoutRecoveryTests(unittest.TestCase):
                 layout_module.SYNC_OWNER_KEY: b"\x01a",
                 layout_module.SYNC_ACTIVE_KEY: b"\x011",
             }
-            for pending in (None, b"\x01a/w|migrate"):
-                with self.subTest(pending=pending):
-                    values.clear()
-                    values.update(baseline)
-                    if pending is not None:
-                        values[layout_module.GROUP_UPLOAD_KEY] = pending
-                    result = synchronizer._group_upload_marker(database, before, after, {"a/w": set()})
-                    self.assertEqual((pending, pending or b"\x01a/w|migrate"), result)
-                    self.assertEqual(None, synchronizer._group_upload_marker(database, after, after, {"a/w": set()}))
             values.clear()
             values.update(baseline)
             self.assertEqual(
                 (None, b"\x01a/w"),
-                synchronizer._group_upload_marker(
-                    database,
-                    before,
-                    after,
-                    {"a/w": set()},
-                    canonical_upload_scope="a/w",
-                ),
+                synchronizer._group_upload_marker(database, before, after, canonical_upload_scope="a/w"),
             )
+            self.assertIsNone(synchronizer._group_upload_marker(database, after, after, canonical_upload_scope="a/w"))
+            self.assertIsNone(synchronizer._group_upload_marker(database, before, after))
+            values[layout_module.GROUP_UPLOAD_KEY] = b"\x01a/w|migrate"
+            with self.assertRaisesRegex(LayoutBusyError, "another account sidebar update is pending"):
+                synchronizer._group_upload_marker(database, before, after, canonical_upload_scope="a/w")
             for changed in (
                 {layout_module.GROUP_UPLOAD_KEY: b"\x01a/w"},
                 {layout_module.SYNC_OWNER_KEY: b"\x01other"},
@@ -901,12 +531,11 @@ class LayoutRecoveryTests(unittest.TestCase):
                     values.update(baseline)
                     values.update(changed)
                     with self.assertRaises(LayoutError):
-                        synchronizer._group_upload_marker(database, before, after, {"a/w": set()})
+                        synchronizer._group_upload_marker(database, before, after, canonical_upload_scope="a/w")
             for active in (None, b"\x010"):
                 values.clear()
                 values[layout_module.SYNC_ACTIVE_KEY] = active
-                self.assertIsNone(synchronizer._group_upload_marker(database, before, after, {"a/w": set()}))
-            self.assertIsNone(synchronizer._group_upload_marker(database, before, after, {"other/w": set()}))
+                self.assertIsNone(synchronizer._group_upload_marker(database, before, after, canonical_upload_scope="a/w"))
 
     def test_pending_group_delete_or_rename_defers_records_and_snapshot(self):
         renamed = scope("Focus", "Backlog")
@@ -916,72 +545,67 @@ class LayoutRecoveryTests(unittest.TestCase):
                 root = Path(directory)
                 synchronizer, fake, _database, values = self.transaction_fixture(root)
                 values.clear()
-                values.update(records({"a/w": edited}, active="a/w"))
+                values.update(records({"a/w": edited, "b/w": scope("Focus", "Backlog")}, active="a/w"))
                 values.update({
                     layout_module.SYNC_OWNER_KEY: b"\x01a",
                     layout_module.SYNC_ACTIVE_KEY: b"\x011",
                     layout_module.GROUP_UPLOAD_KEY: b"\x01a/w",
                 })
-                snapshot = LayoutSnapshot(("Focus", "Backlog"), {}, (), ())
                 snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
-                snapshot_path.write_text(json.dumps(snapshot.as_dict()))
+                snapshot_path.write_text(json.dumps(LayoutSnapshot("b/w").as_dict()))
                 snapshot_before = snapshot_path.read_bytes()
                 records_before = values.copy()
                 synchronizer.helper = root / "helper"
                 synchronizer.helper.write_bytes(b"fixture")
                 os.chmod(synchronizer.helper, 0o700)
                 with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
-                    synchronizer, "_target_sessions", return_value={"a/w": set()}
+                    synchronizer, "_target_sessions", return_value={"a/w": set(), "b/w": set()}
                 ), patch.object(fake, "write", side_effect=AssertionError("must not write")):
                     with self.assertRaisesRegex(LayoutError, "user edit is pending"):
-                        synchronizer.sync()
+                        synchronizer.sync(after_account_switch=True)
                 self.assertEqual(records_before, values)
                 self.assertEqual(snapshot_before, snapshot_path.read_bytes())
                 self.assertFalse(synchronizer._journal_root().exists())
 
     def test_inactive_scope_changes_still_validate_account_metadata(self):
-        for active_in_targets in (False, True):
-            for changed_record in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY):
-                with self.subTest(active_in_targets=active_in_targets, changed_record=changed_record), tempfile.TemporaryDirectory() as directory:
-                    synchronizer, _fake, database, values = self.transaction_fixture(Path(directory))
-                    before = records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w")
-                    after = dict(before)
-                    updated = records({"a/w": scope("Focus"), "b/w": scope("Focus")}, active="a/w")
-                    after[changed_record] = updated[changed_record]
-                    targets = {"b/w": set()}
-                    if active_in_targets:
-                        targets["a/w"] = set()
-                    baseline = {
-                        layout_module.SYNC_OWNER_KEY: b"\x01a",
-                        layout_module.SYNC_ACTIVE_KEY: b"\x011",
-                    }
-                    for changed in (
-                        {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w"},
-                        {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w|migrate"},
-                        {layout_module.GROUP_UPLOAD_KEY: b"\x01unknown"},
-                        {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
-                        {layout_module.SYNC_OWNER_KEY: b"\x01b"},
-                        {layout_module.SYNC_OWNER_KEY: None},
-                    ):
-                        with self.subTest(changed=changed):
-                            values.clear()
-                            values.update(baseline)
-                            values.update(changed)
-                            with self.assertRaises(LayoutError):
-                                synchronizer._group_upload_marker(database, before, after, targets)
-                    for pending in (None, b"\x01a/w", b"\x01a/w|migrate"):
+        for changed_record in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY):
+            with self.subTest(changed_record=changed_record), tempfile.TemporaryDirectory() as directory:
+                synchronizer, _fake, database, values = self.transaction_fixture(Path(directory))
+                before = records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w")
+                after = dict(before)
+                updated = records({"a/w": scope("Focus"), "b/w": scope("Focus")}, active="a/w")
+                after[changed_record] = updated[changed_record]
+                baseline = {
+                    layout_module.SYNC_OWNER_KEY: b"\x01a",
+                    layout_module.SYNC_ACTIVE_KEY: b"\x011",
+                }
+                for changed in (
+                    {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w"},
+                    {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w|migrate"},
+                    {layout_module.GROUP_UPLOAD_KEY: b"\x01unknown"},
+                    {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
+                    {layout_module.SYNC_OWNER_KEY: b"\x01b"},
+                    {layout_module.SYNC_OWNER_KEY: None},
+                ):
+                    with self.subTest(changed=changed):
                         values.clear()
                         values.update(baseline)
-                        if pending is not None:
-                            values[layout_module.GROUP_UPLOAD_KEY] = pending
-                        self.assertIsNone(synchronizer._group_upload_marker(database, before, after, targets))
-                        self.assertEqual(pending, values.get(layout_module.GROUP_UPLOAD_KEY))
+                        values.update(changed)
+                        with self.assertRaises(LayoutError):
+                            synchronizer._group_upload_marker(database, before, after)
+                for pending in (None, b"\x01a/w", b"\x01a/w|migrate"):
+                    values.clear()
+                    values.update(baseline)
+                    if pending is not None:
+                        values[layout_module.GROUP_UPLOAD_KEY] = pending
+                    self.assertIsNone(synchronizer._group_upload_marker(database, before, after))
+                    self.assertEqual(pending, values.get(layout_module.GROUP_UPLOAD_KEY))
 
     def test_inactive_scope_metadata_failure_preserves_records_and_snapshot(self):
         for changed in (
             {layout_module.GROUP_UPLOAD_KEY: b"\x01b/w"},
             {layout_module.SYNC_QUARANTINE_KEY: b"\x011"},
-            {layout_module.SYNC_OWNER_KEY: b"\x01b"},
+            {layout_module.SYNC_OWNER_KEY: None},
         ):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -991,14 +615,14 @@ class LayoutRecoveryTests(unittest.TestCase):
                 values.update({layout_module.SYNC_OWNER_KEY: b"\x01a", layout_module.SYNC_ACTIVE_KEY: b"\x011"})
                 values.update(changed)
                 snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
-                snapshot.write_text(json.dumps(LayoutSnapshot(("Focus",), {}, (), ()).as_dict()))
+                snapshot.write_text(json.dumps(LayoutSnapshot("a/w").as_dict()))
                 snapshot_before = snapshot.read_bytes()
                 records_before = values.copy()
                 synchronizer.helper = root / "helper"
                 synchronizer.helper.write_bytes(b"fixture")
                 os.chmod(synchronizer.helper, 0o700)
                 with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
-                    synchronizer, "_target_sessions", return_value={"b/w": set()}
+                    synchronizer, "_target_sessions", return_value={"a/w": set(), "b/w": set()}
                 ), patch.object(fake, "write") as write:
                     with self.assertRaises(LayoutError):
                         synchronizer.sync()
@@ -1040,10 +664,8 @@ class LayoutRecoveryTests(unittest.TestCase):
         store["state"]["collapsedGroups"] = []
         before[DFRAME_STORE_KEY] = encoded(store)
         targets = {"a/w": {"code:local_one"}, "b/w": {"code:local_one"}}
-        snapshot_before = LayoutSnapshot(("Focus",), {"code:local_one": "Focus"}, (), ())
         transformed = transform_layout_records(
-            before, targets, timestamp_ms=10,
-            snapshot=LayoutSnapshot(("Focus", "Backlog"), {}, (), ()) if marker is not None else None,
+            before, targets, timestamp_ms=10, adopt_current_sidebar=True,
         )
         after = dict(transformed.records)
         values.clear()
@@ -1059,7 +681,8 @@ class LayoutRecoveryTests(unittest.TestCase):
         journal = synchronizer._journal()
         journal.root.mkdir()
         snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
-        old_snapshot = json.dumps(snapshot_before.as_dict()).encode()
+        # An older install had not adopted an account yet.
+        old_snapshot = json.dumps({"version": 1, "adopted_scope": None}).encode()
         new_snapshot = json.dumps(transformed.snapshot.as_dict()).encode()
         if marker is None:
             old_snapshot = new_snapshot
@@ -1306,6 +929,7 @@ class FollowAccountTests(unittest.TestCase):
 
     config = LayoutRecoveryTests.config
     transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets_ab = {"a/w": {"code:x"}, "b/w": {"code:x"}}
 
     def adopted(self, source, other, targets):
         return transform_layout_records(
@@ -1362,6 +986,31 @@ class FollowAccountTests(unittest.TestCase):
             self.assertEqual(["Focus"], [group["name"] for group in scopes[key]["groups"]])
         self.assertIsNone(result.canonical_upload_scope)
 
+    def test_a_chat_moved_in_the_signed_in_account_moves_in_every_account(self):
+        targets = {key: {"code:x"} for key in ("a/w", "b/w", "c/w")}
+        adopted = self.adopted(
+            scope("Focus", "Backlog", assignments={"code:x": "id-focus"}), scope(), targets
+        )
+        document = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
+        document["state"]["customGroupsByScope"]["a/w"] = scope(
+            "Focus", "Backlog", assignments={"code:x": "id-backlog"}
+        )
+        current = dict(adopted.records)
+        current[DFRAME_STORE_KEY] = _encode_record(document)
+
+        result = transform_layout_records(
+            current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="a"
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        for key in targets:
+            self.assertEqual({"code:x": "id-backlog"}, scopes[key]["assignments"])
+            self.assertEqual({"id-focus": [], "id-backlog": ["code:x"]}, scopes[key]["order"])
+        repeated = transform_layout_records(
+            result.records, targets, snapshot=result.snapshot, timestamp_ms=30, owner_account="a"
+        )
+        self.assertEqual(result.records, repeated.records)
+
     def test_an_account_whose_sidebar_claude_has_not_shown_yet_is_found_by_sign_in(self):
         targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
         latest = scope("Focus", assignments={"code:x": "id-focus"})
@@ -1387,14 +1036,40 @@ class FollowAccountTests(unittest.TestCase):
         )
 
         self.assertEqual(dict(adopted.records), dict(result.records))
-        self.assertEqual(adopted.snapshot, result.snapshot)
+        self.assertIsNone(result.snapshot, "the snapshot file stays as it is")
+
+    def test_deleting_the_last_group_in_the_main_account_changes_nothing_and_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            adopted = self.adopted(scope("Focus"), scope(), self.targets_ab)
+            values.clear()
+            values.update(adopted.records)
+            document = copy.deepcopy(decoded(values[DFRAME_STORE_KEY]))
+            document["state"]["customGroupsByScope"]["a/w"] = scope()
+            values[DFRAME_STORE_KEY] = _encode_record(document)
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            snapshot_path.write_text(json.dumps(adopted.snapshot.as_dict()))
+            before = dict(values)
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets_ab
+            ):
+                receipt = synchronizer.sync()
+
+            self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "main-account-has-no-groups"), receipt)
+            self.assertEqual(before, values)
+            self.assertEqual({"version": 1, "adopted_scope": "a/w"}, json.loads(snapshot_path.read_text()))
 
     def test_a_divergent_account_without_a_switch_is_left_for_a_choice(self):
         targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
         adopted = self.adopted(scope("Focus"), scope(), targets)
         current = self.switched_to_b(adopted, scope("Edited in b"))
 
-        with self.assertRaisesRegex(LayoutError, "adopt-current-sidebar"):
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
             transform_layout_records(
                 current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="b"
             )
@@ -1455,6 +1130,259 @@ class FollowAccountTests(unittest.TestCase):
             self.assertEqual(latest["groups"], scopes["b/w"]["groups"])
             self.assertIsNone(layout_module.read_pending_adoption(synchronizer.config.state_dir))
             self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+
+
+def group_names(records_by_key, keys):
+    scopes = decoded(records_by_key[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+    return {key: [group["name"] for group in scopes[key]["groups"]] for key in keys}
+
+
+class FirstAdoptionTests(unittest.TestCase):
+    """With no adopted account yet, one account's sidebar becomes the source."""
+
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def first_sync(self, scopes, active):
+        return transform_layout_records(
+            records(scopes, active=active), self.targets, timestamp_ms=10
+        )
+
+    def test_the_signed_in_account_with_groups_is_copied_to_the_others(self):
+        result = self.first_sync(
+            {"a/w": scope("Focus", assignments={"code:x": "id-focus"}), "b/w": scope("Other")},
+            active="a/w",
+        )
+
+        self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
+        self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
+        self.assertIsNone(result.canonical_upload_scope, "a's own groups need no upload")
+
+    def test_an_empty_signed_in_account_gets_the_only_account_with_groups(self):
+        result = self.first_sync({"a/w": scope(), "b/w": scope("Focus")}, active="a/w")
+
+        self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
+        self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
+        self.assertEqual("a/w", result.canonical_upload_scope, "a's servers must get the copy")
+
+    def test_no_groups_anywhere_changes_nothing_and_says_so(self):
+        current = records({"a/w": scope(), "b/w": scope()}, active="a/w")
+
+        result = transform_layout_records(current, self.targets, timestamp_ms=10)
+
+        self.assertEqual(current, dict(result.records))
+        self.assertEqual("no-groups-yet", result.reason)
+        self.assertIsNone(result.snapshot, "nothing is adopted yet")
+
+    def test_an_empty_signed_in_account_and_two_grouped_accounts_stop_for_a_choice(self):
+        targets = dict(self.targets, **{"c/w": {"code:x"}})
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
+            transform_layout_records(
+                records({"a/w": scope(), "b/w": scope("Focus"), "c/w": scope("Other")}, active="a/w"),
+                targets,
+                timestamp_ms=10,
+            )
+
+    def test_a_signed_in_account_outside_sync_leaves_every_record_alone(self):
+        current = records({"a/w": scope("Focus"), "stale/w": scope("Stale")}, active="stale/w")
+
+        result = transform_layout_records(current, self.targets, timestamp_ms=10)
+
+        self.assertEqual(current, dict(result.records))
+        self.assertIsNone(result.reason)
+
+
+class FirstSyncTests(unittest.TestCase):
+    """The first closed sync on a fresh or upgraded install, through the synchronizer."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def installed(self, root, scopes, *, active, owner=None):
+        synchronizer, fake, _database, values = self.transaction_fixture(root)
+        values.clear()
+        values.update(records(scopes, active=active))
+        if owner is not None:
+            values[layout_module.SYNC_OWNER_KEY] = b"\x01" + owner.encode("utf-8")
+            values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+        synchronizer.helper = root / "helper"
+        synchronizer.helper.write_bytes(b"fixture")
+        os.chmod(synchronizer.helper, 0o700)
+
+        def sync(**options):
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets
+            ):
+                return synchronizer.sync(**options)
+
+        return synchronizer, values, sync
+
+    def edit(self, values, scope_key, new_scope):
+        """Claude writes a sidebar edit to both group records."""
+        store = decoded(values[DFRAME_STORE_KEY])
+        store["state"]["customGroupsByScope"][scope_key] = new_scope
+        values[DFRAME_STORE_KEY] = encoded(store)
+        persisted = decoded(values[GROUP_SCOPES_KEY])
+        persisted["value"][scope_key] = new_scope
+        values[GROUP_SCOPES_KEY] = encoded(persisted)
+
+    def test_a_group_deleted_in_one_account_stays_deleted_after_the_next_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            both = scope("Focus", "Old idea", assignments={"code:x": "id-focus"})
+            _synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": both, "b/w": both}, active="a/w"
+            )
+
+            sync()
+            self.edit(values, "a/w", scope("Focus", assignments={"code:x": "id-focus"}))
+            sync()
+            repeated = sync()
+
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+            self.assertEqual("noop", repeated.state)
+
+    def test_an_install_from_the_union_model_adopts_at_its_next_closed_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            union = scope("Focus", "Backlog", assignments={"code:x": "id-focus"})
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": union, "b/w": union}, active="b/w", owner="b"
+            )
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            # The shape the union model wrote before this change.
+            snapshot_path.write_text(json.dumps({
+                "version": 1,
+                "groups": ["Focus", "Backlog"],
+                "assignments": {"code:x": "Focus"},
+                "pinned_order": ["code:x"],
+                "home_projects_pinned_order": [],
+                "group_order": {"Backlog": [], "Focus": ["code:x"]},
+                "group_records": [{"id": "id-focus", "name": "Focus"}, {"id": "id-backlog", "name": "Backlog"}],
+                "adopted_scope": None,
+            }, indent=2, sort_keys=True) + "\n")
+
+            sync()
+            self.assertEqual({"version": 1, "adopted_scope": "b/w"}, json.loads(snapshot_path.read_text()))
+            self.edit(values, "b/w", scope("Focus", assignments={"code:x": "id-focus"}))
+            sync()
+
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+
+    def test_a_choice_made_at_install_is_copied_into_the_signed_in_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = scope("Focus", assignments={"code:x": "id-focus"})
+            # b is signed in, but Claude has not shown b's Code sidebar yet.
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": latest, "b/w": scope("Old")}, active="a/w", owner="b"
+            )
+            layout_module.request_adoption(synchronizer.config.state_dir, "a/w")
+
+            receipt = sync()
+
+            self.assertEqual("synced", receipt.state)
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+            self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+            snapshot = json.loads((synchronizer.config.state_dir / "sidebar-layout-0.json").read_text())
+            self.assertEqual("b/w", snapshot["adopted_scope"])
+            self.assertIsNone(layout_module.read_pending_adoption(synchronizer.config.state_dir))
+
+    def test_no_groups_anywhere_is_reported_and_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": scope(), "b/w": scope()}, active="a/w"
+            )
+            before = dict(values)
+
+            receipt = sync()
+
+            self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "no-groups-yet"), receipt)
+            self.assertEqual(before, values)
+            self.assertFalse((synchronizer.config.state_dir / "sidebar-layout-0.json").exists())
+
+
+class DoctorTests(unittest.TestCase):
+    """doctor plans the next closed sync with the inputs sync uses."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def switched_to_b(self, root):
+        """a was synced last; b is signed in and Claude reloaded b's old groups."""
+        synchronizer, fake, _database, values = self.transaction_fixture(root)
+        values.clear()
+        values.update(records(
+            {"a/w": scope("Focus", assignments={"code:x": "id-focus"}), "b/w": scope("Old")},
+            active="b/w",
+        ))
+        values[layout_module.SYNC_OWNER_KEY] = b"\x01b"
+        values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+        # The snapshot the adoption code wrote before this change.
+        (synchronizer.config.state_dir / "sidebar-layout-0.json").write_text(json.dumps({
+            "version": 1,
+            "groups": ["Focus"],
+            "assignments": {"code:x": "Focus"},
+            "pinned_order": [],
+            "home_projects_pinned_order": [],
+            "group_order": {"Focus": ["code:x"]},
+            "group_records": [{"id": "id-focus", "name": "Focus"}],
+            "adopted_scope": "a/w",
+        }))
+        synchronizer.helper = root / "helper"
+        synchronizer.helper.write_bytes(b"fixture")
+        os.chmod(synchronizer.helper, 0o700)
+        patches = (
+            patch("claude_session_sync.layout.LevelDatabase", fake),
+            patch.object(synchronizer, "_target_sessions", return_value=self.targets),
+        )
+        return synchronizer, values, patches
+
+    def test_after_a_switch_doctor_accepts_the_account_the_user_chose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, (database, targets) = self.switched_to_b(Path(directory))
+            layout_module.request_adoption(synchronizer.config.state_dir, "a/w")
+
+            with database, targets:
+                probed = synchronizer.probe()
+                synced = synchronizer.sync()
+
+            self.assertEqual(
+                {"state": "compatible", "profile_count": 1, "group_count": 1,
+                 "pin_count": 0, "assignment_count": 1},
+                probed,
+            )
+            self.assertEqual(("synced", 1), (synced.state, synced.group_count))
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+
+    def test_after_a_switch_without_a_choice_doctor_never_advises_the_reloaded_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, (database, targets) = self.switched_to_b(Path(directory))
+
+            with database, targets:
+                with self.assertRaises(LayoutChoiceError) as raised:
+                    synchronizer.probe()
+                with self.assertRaises(LayoutChoiceError):
+                    synchronizer.sync()
+
+            self.assertIn("keep-sidebar --dry-run", str(raised.exception))
+            self.assertNotIn("adopt-current-sidebar", str(raised.exception))
+
+    def test_a_needed_choice_is_reported_as_one(self):
+        from claude_session_sync.adapters import run_adapters
+
+        class Undecided:
+            def probe(self):
+                raise LayoutChoiceError("which one?")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            dependencies = type("Dependencies", (), {"layout_factory": lambda self, _config: Undecided()})()
+
+            result = run_adapters(config, dependencies, lambda: False, probe_only=True)
+
+        self.assertEqual(
+            {"layout": {"state": "skipped", "reason": "choose-main-account", "detail": "which one?"}},
+            result,
+        )
 
 
 if __name__ == "__main__":

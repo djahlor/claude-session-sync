@@ -3,22 +3,15 @@ import json
 import os
 import subprocess
 import tempfile
-import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import ApprovedTarget, Config
 from claude_session_sync.installer import InstallAction, InstallReport
-from claude_session_sync.model import (
-    InvalidReplica,
-    Operation,
-    Plan,
-    Profile,
-    RecoveryReceipt,
-    RunReceipt,
-)
+from claude_session_sync.model import Profile, RecoveryReceipt
 
 
 def config(root: Path) -> Config:
@@ -44,25 +37,7 @@ def config(root: Path) -> Config:
     )
 
 
-class FakePlanner:
-    def __init__(self, plan):
-        self.result = plan
-        self.requests = []
-
-    def plan(self, request):
-        self.requests.append(request)
-        return self.result
-
-
 class FakeEngine:
-    def __init__(self, receipt):
-        self.receipt = receipt
-        self.applied = []
-
-    def apply(self, plan):
-        self.applied.append(plan)
-        return self.receipt
-
     def rollback(self, run_id):
         self.rolled_back = run_id
         return RecoveryReceipt(run_id, "rolled_back", 3, 1)
@@ -75,7 +50,6 @@ class FakeLayoutReceipt:
     group_count = 4
     assignment_count = 12
     pin_count = 3
-    ambiguous_assignments = 1
 
 
 class FakeLayout:
@@ -140,170 +114,7 @@ class ManualClock:
         self.value += seconds
 
 
-class CliPlanTests(unittest.TestCase):
-    def test_plan_json_reports_safe_aggregate_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            operation = Operation(
-                kind="create",
-                session_id="private-session-id",
-                source=root / "acct-raw" / "chat-content.json",
-                destination=root / "other-account" / "chat-content.json",
-                source_digest="a" * 64,
-                destination_digest_or_none=None,
-                size=125,
-            )
-            planned = Plan(1, "digest", (operation,), (), (), "plan-safe", 125)
-            planner = FakePlanner(planned)
-            out = io.StringIO()
-            err = io.StringIO()
-            ticks = iter((5.0, 5.012))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: planner,
-                clock=lambda: next(ticks),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "plan", "--json"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=err,
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(err.getvalue(), "")
-            payload = json.loads(out.getvalue())
-            self.assertEqual(
-                payload,
-                {
-                    "bytes": 125,
-                    "counts": {
-                        "conflicts": 0,
-                        "invalid_replicas": 0,
-                        "operations": 1,
-                    },
-                    "duration_ms": 12,
-                    "plan_id": "plan-safe",
-                    "state": "planned",
-                },
-            )
-            self.assertNotIn("private-session-id", out.getvalue())
-            self.assertNotIn("acct-raw", out.getvalue())
-            self.assertIs(planner.requests[0].config, loaded)
-
-    def test_plan_reports_safe_recovery_action_for_new_target(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            private_path = root / "private-account" / "private-workspace"
-            planned = Plan(
-                1,
-                "digest",
-                (),
-                (),
-                (
-                    InvalidReplica(
-                        private_path,
-                        "target namespace is not approved",
-                    ),
-                ),
-                "plan-blocked",
-                0,
-            )
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: config(root),
-                planner_factory=lambda _config: FakePlanner(planned),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "plan", "--json"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(out.getvalue())
-            self.assertEqual(1, exit_code)
-            self.assertEqual("blocked_invalid", payload["state"])
-            self.assertEqual(
-                "approve-targets-or-enable-automatic-targets",
-                payload["next_action"],
-            )
-            self.assertNotIn("private-account", out.getvalue())
-
-
 class CliSyncTests(unittest.TestCase):
-    def test_sync_json_applies_plan_and_reports_receipt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-7", 0)
-            planner = FakePlanner(planned)
-            receipt = RunReceipt("run-9", "committed", "plan-7", 2, 450)
-            engine = FakeEngine(receipt)
-            out = io.StringIO()
-            err = io.StringIO()
-            ticks = iter((10.0, 10.005, 10.012))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: planner,
-                engine_factory=lambda _config: engine,
-                clock=lambda: next(ticks),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=err,
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(err.getvalue(), "")
-            self.assertEqual(engine.applied, [planned])
-            self.assertEqual(
-                json.loads(out.getvalue()),
-                {
-                    "bytes": 450,
-                    "counts": {"operations": 2},
-                    "duration_ms": 12,
-                    "plan_id": "plan-7",
-                    "run_id": "run-9",
-                    "state": "committed",
-                    "progress": "finished",
-                },
-            )
-
-    def test_sync_reports_recovery_pending_without_exception_details(self):
-        from claude_session_sync.transaction import RecoveryPendingError
-
-        class RecoveryPlanner:
-            def plan(self, request):
-                raise RecoveryPendingError("private journal path and run id")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            out = io.StringIO()
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=CliDependencies(
-                    config_loader=lambda path: config(root),
-                    planner_factory=lambda loaded: RecoveryPlanner(),
-                    process_probe=FakeProcessProbe(),
-                ),
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-            payload = json.loads(out.getvalue())
-            self.assertEqual(1, exit_code)
-            self.assertEqual("recovery-pending", payload["reason"])
-            self.assertEqual("recovery-pending-error", payload["error_type"])
-            self.assertEqual("run-doctor", payload["next_action"])
-            self.assertNotIn("private", out.getvalue())
-
     def test_sync_reports_process_inspection_permission_failure(self):
         class DeniedProbe(FakeProcessProbe):
             def running(self, **kwargs):
@@ -327,71 +138,7 @@ class CliSyncTests(unittest.TestCase):
             self.assertEqual("process-permission-error", payload["error_type"])
             self.assertNotIn("private", out.getvalue())
 
-    def test_sync_masks_journal_and_process_timeout_details(self):
-        from claude_session_sync.journal import JournalError
-
-        cases = (
-            (JournalError("private manifest path"), "invalid-journal", "journal-error", "run-doctor"),
-            (subprocess.TimeoutExpired(["ps", "private"], 2), "process-inspection-timeout", "process-timeout", "retry-sync"),
-        )
-        for error, reason, error_type, next_action in cases:
-            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                out = io.StringIO()
-
-                class BrokenPlanner:
-                    def plan(self, request):
-                        raise error
-
-                exit_code = run(
-                    ["--config", str(root / "config.json"), "sync", "--json"],
-                    dependencies=CliDependencies(
-                        config_loader=lambda path: config(root),
-                        planner_factory=lambda loaded: BrokenPlanner(),
-                        process_probe=FakeProcessProbe(),
-                    ),
-                    stdout=out,
-                    stderr=io.StringIO(),
-                )
-                payload = json.loads(out.getvalue())
-                self.assertEqual(1, exit_code)
-                self.assertEqual(reason, payload["reason"])
-                self.assertEqual(error_type, payload["error_type"])
-                self.assertEqual(next_action, payload["next_action"])
-                self.assertNotIn("private", out.getvalue())
-
-
 class CliAutomaticTests(unittest.TestCase):
-    def test_auto_reports_end_to_end_sync_duration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-auto", 0)
-            receipt = RunReceipt("run-auto", "committed", "plan-auto", 2, 450)
-            ticks = iter((20.0, 20.012))
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=FakeProcessProbe(),
-                clock=lambda: next(ticks),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "auto"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(
-                out.getvalue(),
-                "bytes=450 counts={'operations': 2} duration_ms=12 "
-                "plan_id=plan-auto run_id=run-auto state=committed progress=finished\n",
-            )
-
     def test_a_sync_waits_without_writing_while_claude_is_open(self):
         for command, expected_exit in (("auto", 0), ("sync", 1)):
             with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
@@ -415,39 +162,6 @@ class CliAutomaticTests(unittest.TestCase):
                     "state=waiting reason=claude-open progress=waiting-for-Claude\n",
                     out.getvalue(),
                 )
-
-    def test_auto_succeeds_with_explicit_skip_when_transaction_is_busy(self):
-        class TransactionBusyError(Exception):
-            pass
-
-        class BusyEngine:
-            def apply(self, plan):
-                raise TransactionBusyError("lock contains private path")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            ticks = iter((1.0, 1.001))
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: BusyEngine(),
-                process_probe=FakeProcessProbe(),
-                clock=lambda: next(ticks),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "auto"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(out.getvalue(), "state=skipped reason=busy progress=waiting-for-sync\n")
-
 
 class CliSwitchTests(unittest.TestCase):
     def test_restart_check_reports_retryable_timeout_without_process_details(self):
@@ -518,46 +232,6 @@ class CliSwitchTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             self.assertIn("must be a finite number", errors.getvalue())
 
-    def test_switch_can_wait_for_a_managed_app_to_finish_exiting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            process_probe = SequencedProcessProbe(((object(),), (object(),), ()))
-            wait_clock = ManualClock()
-            events = []
-            ticks = iter((2.0, 2.001, 2.003))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=process_probe,
-                launcher=FakeLauncher(events),
-                clock=lambda: next(ticks),
-                monotonic=wait_clock,
-                sleeper=wait_clock.sleep,
-            )
-
-            exit_code = run(
-                [
-                    "--config",
-                    str(root / "config.json"),
-                    "switch",
-                    "Personal",
-                    "--wait-for-exit",
-                    "1",
-                ],
-                dependencies=dependencies,
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(process_probe.calls), 3)
-            self.assertEqual(wait_clock.sleeps, [0.1, 0.1])
-            self.assertEqual(events[-1], ("launch", loaded.profiles[1].launch_command))
-
     def test_switch_exit_deadline_includes_slow_process_probes(self):
         class SlowProcessProbe(FakeProcessProbe):
             def __init__(self, wait_clock):
@@ -603,337 +277,6 @@ class CliSwitchTests(unittest.TestCase):
             self.assertLess(process_probe.calls[1]["timeout"], 0.4)
             self.assertEqual(wait_clock.sleeps, [0.1])
 
-    def test_only_one_concurrent_switch_handoff_launches(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            planner_entered = threading.Event()
-            release_planner = threading.Event()
-            launches = []
-            first_result = []
-
-            class BlockingPlanner(FakePlanner):
-                def plan(self, request):
-                    planner_entered.set()
-                    if not release_planner.wait(timeout=2):
-                        raise TimeoutError("test did not release planner")
-                    return super().plan(request)
-
-            first_dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: BlockingPlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(launches),
-                clock=lambda: 2.0,
-            )
-            second_dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: self.fail(
-                    "second planner must not run"
-                ),
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(launches),
-            )
-
-            first = threading.Thread(
-                target=lambda: first_result.append(
-                    run(
-                        [
-                            "--config",
-                            str(root / "config.json"),
-                            "switch",
-                            "Work",
-                        ],
-                        dependencies=first_dependencies,
-                        stdout=io.StringIO(),
-                        stderr=io.StringIO(),
-                    )
-                )
-            )
-            first.start()
-            self.assertTrue(planner_entered.wait(timeout=2))
-            second_out = io.StringIO()
-            second_result = run(
-                [
-                    "--config",
-                    str(root / "config.json"),
-                    "switch",
-                    "Personal",
-                ],
-                dependencies=second_dependencies,
-                stdout=second_out,
-                stderr=io.StringIO(),
-            )
-            release_planner.set()
-            first.join(timeout=2)
-
-            self.assertFalse(first.is_alive())
-            self.assertEqual(first_result, [0])
-            self.assertEqual(second_result, 1)
-            self.assertEqual(
-                second_out.getvalue(),
-                "state=blocked_switch reason=handoff-running\n",
-            )
-            self.assertEqual(len(launches), 1)
-
-    def test_a_failed_launch_command_reports_a_launch_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            work = replace(config(root).profiles[0], launch_command=("/bin/sh", "-c", "exit 3"))
-            loaded = replace(config(root), profiles=(work, config(root).profiles[1]))
-            planner = FakePlanner(Plan(1, "digest", (), (), (), "plan-safe", 0))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: planner,
-                engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan-safe", 0, 0)),
-                process_probe=FakeProcessProbe(),
-            )
-            outputs = []
-            for _attempt in range(2):
-                out = io.StringIO()
-                exit_code = run(
-                    ["--config", str(root / "config.json"), "switch", "Work"],
-                    dependencies=dependencies,
-                    stdout=out,
-                    stderr=io.StringIO(),
-                )
-                outputs.append((exit_code, out.getvalue()))
-
-            self.assertEqual(
-                [(1, "state=launch_failed reason=launch-command-failed\n")] * 2, outputs
-            )
-            self.assertEqual(2, len(planner.requests), "a failed launch must not block the next switch")
-
-    def test_a_claude_that_has_not_shown_up_yet_does_not_block_the_next_switch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            # The command succeeds, but Claude never shows up in the process list.
-            work = replace(config(root).profiles[0], launch_command=("/usr/bin/true",))
-            loaded = replace(config(root), profiles=(work, config(root).profiles[1]))
-            planner = FakePlanner(Plan(1, "digest", (), (), (), "plan-safe", 0))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: planner,
-                engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan-safe", 0, 0)),
-                process_probe=FakeProcessProbe(),
-            )
-            exit_codes = [
-                run(
-                    ["--config", str(root / "config.json"), "switch", "Work"],
-                    dependencies=dependencies,
-                    stdout=io.StringIO(),
-                    stderr=io.StringIO(),
-                )
-                for _attempt in range(2)
-            ]
-
-            self.assertEqual([0, 0], exit_codes)
-            self.assertEqual(2, len(planner.requests))
-
-    def test_switch_waits_for_the_automatic_writer_then_retries(self):
-        class TransactionBusyError(Exception):
-            pass
-
-        class BusyOnceEngine(FakeEngine):
-            def apply(self, plan):
-                self.applied.append(plan)
-                if len(self.applied) == 1:
-                    raise TransactionBusyError("watcher owns the writer lock")
-                return self.receipt
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            engine = BusyOnceEngine(receipt)
-            sleeps = []
-            events = []
-            ticks = iter((2.0, 2.001, 2.003))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: engine,
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(events),
-                clock=lambda: next(ticks),
-                sleeper=sleeps.append,
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(engine.applied), 2)
-            self.assertEqual(sleeps, [0.1])
-            self.assertEqual(events[-1], ("launch", loaded.profiles[0].launch_command))
-
-    def test_switch_replans_if_the_watcher_commits_first(self):
-        class RevalidationError(Exception):
-            pass
-
-        class SequencedPlanner:
-            def __init__(self, plans):
-                self.plans = list(plans)
-                self.requests = []
-
-            def plan(self, request):
-                self.requests.append(request)
-                return self.plans.pop(0)
-
-        class RevalidateOnceEngine:
-            def __init__(self):
-                self.applied = []
-
-            def apply(self, plan):
-                self.applied.append(plan)
-                if len(self.applied) == 1:
-                    raise RevalidationError("watcher changed the destination")
-                return RunReceipt(None, "noop", plan.plan_id, 0, 0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            first = Plan(1, "digest", (), (), (), "plan-before-auto", 0)
-            second = Plan(1, "digest", (), (), (), "plan-after-auto", 0)
-            planner = SequencedPlanner((first, second))
-            engine = RevalidateOnceEngine()
-            events = []
-            ticks = iter((2.0, 2.001, 2.003))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: planner,
-                engine_factory=lambda _config: engine,
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(events),
-                clock=lambda: next(ticks),
-                sleeper=lambda _seconds: None,
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(
-                [plan.plan_id for plan in engine.applied],
-                [
-                    "plan-before-auto",
-                    "plan-after-auto",
-                ],
-            )
-            self.assertEqual(events[-1], ("launch", loaded.profiles[0].launch_command))
-
-    def test_switch_syncs_before_launching_selected_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            events = []
-
-            class OrderedEngine(FakeEngine):
-                def apply(self, plan):
-                    events.append(("apply", plan.plan_id))
-                    return super().apply(plan)
-
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            engine = OrderedEngine(receipt)
-            ticks = iter((2.0, 2.001, 2.003))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: engine,
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(events),
-                clock=lambda: next(ticks),
-            )
-
-            out = io.StringIO()
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Personal", "--json"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(events[0], ("apply", "plan-safe"))
-            self.assertEqual(events[1], ("launch", loaded.profiles[1].launch_command))
-            self.assertEqual("finished", json.loads(out.getvalue())["progress"])
-
-    def test_a_failed_switch_sync_still_reopens_claude_and_reports_it(self):
-        class BrokenEngine(FakeEngine):
-            def apply(self, plan):
-                raise RuntimeError("private engine detail")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            invalid = Plan(1, "digest", (), (), (InvalidReplica(root / "bad", "malformed JSON"),), "plan", 0)
-            valid = Plan(1, "digest", (), (), (), "plan", 0)
-            for plan, engine, expected_state in (
-                (invalid, FakeEngine(None), "blocked_invalid"),
-                (valid, BrokenEngine(None), "failed"),
-            ):
-                with self.subTest(expected_state=expected_state):
-                    events = []
-                    out = io.StringIO()
-                    exit_code = run(
-                        ["--config", str(root / "config.json"), "switch", "Work", "--json"],
-                        dependencies=CliDependencies(
-                            config_loader=lambda path: loaded,
-                            planner_factory=lambda _config, plan=plan: FakePlanner(plan),
-                            engine_factory=lambda _config, engine=engine: engine,
-                            process_probe=FakeProcessProbe(),
-                            launcher=FakeLauncher(events),
-                        ),
-                        stdout=out,
-                        stderr=io.StringIO(),
-                    )
-
-                    payload = json.loads(out.getvalue())
-                    self.assertEqual(1, exit_code)
-                    self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
-                    self.assertEqual(expected_state, payload["state"])
-                    self.assertEqual("needs-attention", payload["progress"])
-                    self.assertEqual("started", payload["launch"])
-
-    def test_claude_reopens_even_when_the_switch_crashes_after_it_closed(self):
-        from unittest import mock
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            events = []
-            errors = io.StringIO()
-            with mock.patch("claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")):
-                exit_code = run(
-                    ["--config", str(root / "config.json"), "switch", "Work"],
-                    dependencies=CliDependencies(
-                        config_loader=lambda path: loaded,
-                        planner_factory=lambda _config: FakePlanner(Plan(1, "digest", (), (), (), "plan", 0)),
-                        engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan", 0, 0)),
-                        process_probe=FakeProcessProbe(),
-                        launcher=FakeLauncher(events),
-                    ),
-                    stdout=io.StringIO(),
-                    stderr=errors,
-                )
-
-            self.assertEqual(1, exit_code)
-            self.assertIn("disk full", errors.getvalue())
-            self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
-
     def test_switch_refuses_to_sync_or_launch_while_managed_app_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -962,7 +305,7 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
     def test_rollback_json_reports_only_recovery_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            engine = FakeEngine(None)
+            engine = FakeEngine()
             out = io.StringIO()
             ticks = iter((4.0, 4.006))
             dependencies = CliDependencies(
@@ -1180,7 +523,7 @@ class CliConfigureTests(unittest.TestCase):
             def default_config_data(self):
                 return self.default_data
 
-            def setup(self, *, dry_run, config_data=None):
+            def setup(self, *, dry_run, config_data=None, before_activation=None):
                 self.calls.append((dry_run, config_data))
                 return InstallReport(
                     "planned" if dry_run else "installed",
@@ -1199,13 +542,6 @@ class CliConfigureTests(unittest.TestCase):
                         "launch_command": ["/usr/bin/true"],
                         "is_default": True,
                     },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": False,
-                        "is_default": False,
-                    },
                 ],
                 "state_dir": str(root / "state"),
                 "retention": 5,
@@ -1221,7 +557,7 @@ class CliConfigureTests(unittest.TestCase):
             exit_code = run(
                 [
                     "--config", str(config_path), "setup",
-                    "--automatic-targets", "--enable-personal",
+                    "--automatic-targets",
                     "--sync-layout", "--sync-routines", "--dry-run",
                 ],
                 dependencies=CliDependencies(installer_factory=lambda path: fake),
@@ -1233,247 +569,173 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(1, len(fake.calls))
             self.assertTrue(fake.calls[0][0])
             desired = json.loads(fake.calls[0][1])
-            self.assertEqual("logins", desired["target_policy"])
-            self.assertTrue(desired["profiles"][1]["enabled"])
-            self.assertTrue(desired["sync_sidebar_layout"])
-            self.assertTrue(desired["sync_code_routines"])
+            self.assertEqual(
+                dict(
+                    document,
+                    target_policy="logins",
+                    acknowledge_cross_account_copy=True,
+                    sync_sidebar_layout=True,
+                    sync_code_routines=True,
+                ),
+                desired,
+            )
+            self.assertEqual(
+                "state=planned counts={'actions': 1, 'backups': 0, 'changes': 4, "
+                "'automatic_targets': 1, 'layout_sync': 1, 'routine_sync': 1} "
+                "bytes=0 duration_ms=0\n",
+                output.getvalue(),
+            )
             self.assertFalse(config_path.exists())
 
-    def test_configure_enables_automatic_targets_and_personal_profile(self):
+    def personal_era_config(self, root: Path, *, personal_enabled: bool) -> dict:
+        """A config from a version that generated a Personal profile."""
+
+        return {
+            "version": 1,
+            "approved_targets": [
+                {"profile": "Personal", "account": "account", "workspace": "workspace"},
+            ],
+            "profiles": [
+                {
+                    "name": "Work",
+                    "data_root": str(root / "Claude"),
+                    "launch_command": ["/usr/bin/true"],
+                    "is_default": True,
+                },
+                {
+                    "name": "Personal",
+                    "data_root": str(root / "Claude-Personal"),
+                    "launch_command": ["/usr/bin/true"],
+                    "enabled": personal_enabled,
+                    "is_default": False,
+                },
+            ],
+            "state_dir": str(root / "state"),
+            "retention": 5,
+            "acknowledge_cross_profile_copy": personal_enabled,
+            "acknowledge_cross_account_copy": False,
+            "target_policy": "approved-only",
+            "claude_executable": "/usr/bin/true",
+        }
+
+    def test_configure_enables_automatic_targets_and_drops_the_old_personal_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
-            document = {
-                "version": 1,
-                "approved_targets": [],
-                "profiles": [
-                    {
-                        "name": "Work",
-                        "data_root": str(root / "Claude"),
-                        "launch_command": ["/usr/bin/true"],
-                        "is_default": True,
-                    },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": False,
-                        "is_default": False,
-                    },
-                ],
-                "state_dir": str(root / "state"),
-                "retention": 5,
-                "acknowledge_cross_profile_copy": False,
-                "acknowledge_cross_account_copy": False,
-                "target_policy": "approved-only",
-                "claude_executable": "/usr/bin/true",
-            }
+            document = self.personal_era_config(root, personal_enabled=False)
             config_path.write_text(json.dumps(document), encoding="utf-8")
+            before = config_path.read_bytes()
 
             self.assertEqual(
                 0,
                 run(
-                    [
-                        "--config",
-                        str(config_path),
-                        "configure",
-                        "--automatic-targets",
-                        "--enable-personal",
-                        "--dry-run",
-                    ],
+                    ["--config", str(config_path), "configure", "--automatic-targets", "--dry-run"],
                     stdout=io.StringIO(),
                     stderr=io.StringIO(),
                 ),
             )
-            self.assertFalse(
-                json.loads(config_path.read_text(encoding="utf-8"))["profiles"][1][
-                    "enabled"
-                ]
-            )
+            self.assertEqual(before, config_path.read_bytes())
 
             output = io.StringIO()
             self.assertEqual(
                 0,
                 run(
-                    [
-                        "--config",
-                        str(config_path),
-                        "configure",
-                        "--automatic-targets",
-                        "--enable-personal",
-                        "--apply",
-                    ],
+                    ["--config", str(config_path), "configure", "--automatic-targets", "--apply"],
                     stdout=output,
                     stderr=io.StringIO(),
                 ),
             )
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("logins", updated["target_policy"])
-            self.assertTrue(updated["acknowledge_cross_account_copy"])
-            self.assertTrue(updated["acknowledge_cross_profile_copy"])
-            self.assertTrue(updated["profiles"][1]["enabled"])
+            self.assertEqual(
+                dict(
+                    document,
+                    approved_targets=[],
+                    profiles=document["profiles"][:1],
+                    target_policy="logins",
+                    acknowledge_cross_account_copy=True,
+                ),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
             self.assertIn("state=configured", output.getvalue())
 
-    def test_configure_disables_personal_and_enables_layout_sync(self):
+    def test_configure_drops_an_enabled_personal_profile_and_enables_layout_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
-            document = {
-                "version": 1,
-                "approved_targets": [],
-                "profiles": [
-                    {
-                        "name": "Work",
-                        "data_root": str(root / "Claude"),
-                        "launch_command": ["/usr/bin/true"],
-                        "is_default": True,
-                    },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": True,
-                        "is_default": False,
-                    },
-                ],
-                "state_dir": str(root / "state"),
-                "retention": 5,
-                "acknowledge_cross_profile_copy": True,
-                "acknowledge_cross_account_copy": True,
-                "target_policy": "all-configured-profiles",
-                "sync_sidebar_layout": False,
-                "claude_executable": "/usr/bin/true",
-            }
+            document = self.personal_era_config(root, personal_enabled=True)
             config_path.write_text(json.dumps(document), encoding="utf-8")
 
             exit_code = run(
-                [
-                    "--config",
-                    str(config_path),
-                    "configure",
-                    "--disable-personal",
-                    "--sync-layout",
-                    "--sync-routines",
-                    "--apply",
-                ],
+                ["--config", str(config_path), "configure", "--sync-layout", "--sync-routines", "--apply"],
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
             )
 
             self.assertEqual(0, exit_code)
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertFalse(updated["profiles"][1]["enabled"])
-            self.assertFalse(updated["acknowledge_cross_profile_copy"])
-            self.assertTrue(updated["sync_sidebar_layout"])
-            self.assertTrue(updated["sync_code_routines"])
-
-
-class CliRoutineTests(unittest.TestCase):
-    def test_sync_reports_routines_without_changing_chat_receipt_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = replace(config(root), sync_code_routines=True)
-            planned = Plan(1, "digest", (), (), (), "plan-routines", 0)
-            receipt = RunReceipt("run-routines", "committed", "plan-routines", 0, 0)
-            output = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                routine_factory=lambda _config: FakeRoutine(),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=output,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(output.getvalue())
-            self.assertEqual(0, exit_code)
-            self.assertEqual("committed", payload["state"])
-            self.assertEqual("synced", payload["routines"]["state"])
-            self.assertEqual(4, payload["routines"]["tasks"])
-
-    def test_routine_failure_does_not_change_committed_chat_result(self):
-        class BrokenRoutine:
-            def sync(self):
-                raise RuntimeError("unexpected routine adapter failure")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = replace(config(root), sync_code_routines=True)
-            planned = Plan(1, "digest", (), (), (), "plan-routines", 0)
-            receipt = RunReceipt("run-routines", "committed", "plan-routines", 0, 0)
-            output = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                routine_factory=lambda _config: BrokenRoutine(),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=output,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(output.getvalue())
-            self.assertEqual(1, exit_code)
-            self.assertEqual("needs-attention", payload["progress"])
-            self.assertEqual("committed", payload["state"])
             self.assertEqual(
-                {"state": "skipped", "reason": "routine-error"},
-                payload["routines"],
+                dict(
+                    document,
+                    approved_targets=[],
+                    profiles=document["profiles"][:1],
+                    sync_sidebar_layout=True,
+                    sync_code_routines=True,
+                ),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
+
+    def test_dropping_the_personal_profile_keeps_a_third_profile_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            document = self.personal_era_config(root, personal_enabled=True)
+            other = {
+                "name": "Other",
+                "data_root": str(root / "Claude-Other"),
+                "launch_command": ["/usr/bin/true"],
+                "is_default": False,
+            }
+            document["profiles"].append(other)
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            errors = io.StringIO()
+
+            exit_code = run(
+                ["--config", str(config_path), "configure", "--apply"],
+                stdout=io.StringIO(),
+                stderr=errors,
+            )
+
+            self.assertEqual((0, ""), (exit_code, errors.getvalue()))
+            self.assertEqual(
+                dict(document, approved_targets=[], profiles=[document["profiles"][0], other]),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
+
+    def test_setup_names_a_malformed_profile_before_it_drops_personal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            document = self.personal_era_config(root, personal_enabled=False)
+            document["profiles"].append("not-a-profile")
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            errors = io.StringIO()
+
+            exit_code = run(
+                ["--config", str(config_path), "setup", "--dry-run"],
+                dependencies=CliDependencies(
+                    installer_factory=lambda _path: SimpleNamespace(
+                        setup=lambda **_options: self.fail("an invalid config must not install")
+                    )
+                ),
+                stdout=io.StringIO(),
+                stderr=errors,
+            )
+
+            self.assertEqual(
+                (1, "claude-session-sync: profile 1 must be a JSON object\n"),
+                (exit_code, errors.getvalue()),
             )
 
 
 class CliLayoutTests(unittest.TestCase):
-    def test_adopt_current_sidebar_option_reaches_only_layout_adapter(self):
-        calls = []
-
-        class RecordingLayout:
-            def sync(self, *, adopt_current_sidebar=False):
-                calls.append(adopt_current_sidebar)
-                return FakeLayoutReceipt()
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            loaded = replace(
-                loaded,
-                profiles=loaded.profiles[:1],
-                sync_sidebar_layout=True,
-                sync_code_routines=True,
-            )
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            deps = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: RecordingLayout(),
-                routine_factory=lambda _config: FakeRoutine(),
-                process_probe=FakeProcessProbe(),
-            )
-            output = io.StringIO()
-            self.assertEqual(
-                0,
-                run(
-                    ["sync", "--adopt-current-sidebar", "--json"],
-                    dependencies=deps,
-                    stdout=output,
-                    stderr=io.StringIO(),
-                ),
-            )
-            self.assertEqual([True], calls)
-            self.assertEqual("synced", json.loads(output.getvalue())["layout"]["state"])
-
     def test_adopt_current_sidebar_requires_one_default_profile_before_any_write(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1510,160 +772,6 @@ class CliLayoutTests(unittest.TestCase):
                     )
                     self.assertEqual([], planner_calls)
                     self.assertIn("exactly one default profile", errors.getvalue())
-
-    def test_explicit_current_sidebar_option_reaches_only_layout_adapter(self):
-        calls = []
-
-        class RecordingLayout:
-            def sync(self, *, prefer_current_sidebar=False):
-                calls.append(prefer_current_sidebar)
-                return FakeLayoutReceipt()
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            loaded = replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=True, sync_code_routines=True)
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            deps = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: RecordingLayout(),
-                routine_factory=lambda _config: FakeRoutine(),
-                process_probe=FakeProcessProbe(),
-            )
-            output = io.StringIO()
-            self.assertEqual(0, run(
-                ["sync", "--prefer-current-sidebar", "--json"],
-                dependencies=deps, stdout=output, stderr=io.StringIO(),
-            ))
-            self.assertEqual([True], calls)
-            self.assertEqual("synced", json.loads(output.getvalue())["routines"]["state"])
-
-    def test_current_sidebar_resolution_requires_one_profile_and_layout_sync_before_any_write(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            for unsafe in (
-                replace(loaded, sync_sidebar_layout=True),
-                replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False),
-            ):
-                with self.subTest(config=unsafe):
-                    planner_calls = []
-                    deps = CliDependencies(
-                        config_loader=lambda path: unsafe,
-                        planner_factory=lambda config: planner_calls.append(config),
-                    )
-                    errors = io.StringIO()
-                    self.assertNotEqual(0, run(
-                        ["sync", "--prefer-current-sidebar"], dependencies=deps,
-                        stdout=io.StringIO(), stderr=errors,
-                    ))
-                    self.assertEqual([], planner_calls)
-                    self.assertIn("exactly one profile", errors.getvalue())
-
-    def test_sync_reports_layout_without_changing_chat_receipt_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = replace(config(root), sync_sidebar_layout=True)
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            output = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: FakeLayout(),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=output,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(output.getvalue())
-            self.assertEqual(0, exit_code)
-            self.assertEqual("committed", payload["state"])
-            self.assertEqual("synced", payload["layout"]["state"])
-            self.assertEqual(1, payload["layout"]["ambiguous_assignments"])
-
-    def test_layout_failure_does_not_change_a_committed_chat_result(self):
-        class BrokenLayout:
-            def sync(self):
-                raise RuntimeError("unexpected adapter failure")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = replace(config(root), sync_sidebar_layout=True)
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            output = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: BrokenLayout(),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=output,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(output.getvalue())
-            self.assertEqual(1, exit_code)
-            self.assertEqual("needs-attention", payload["progress"])
-            self.assertEqual("committed", payload["state"])
-            self.assertEqual(
-                {"state": "skipped", "reason": "layout-error"},
-                payload["layout"],
-            )
-
-    def test_safe_layout_failure_reports_the_specific_check(self):
-        from claude_session_sync.layout import LayoutError
-
-        class UnsafeLayout:
-            def sync(self):
-                raise LayoutError("custom group records contain conflicting ids")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = replace(config(root), sync_sidebar_layout=True)
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            output = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: UnsafeLayout(),
-                process_probe=FakeProcessProbe(),
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "sync", "--json"],
-                dependencies=dependencies,
-                stdout=output,
-                stderr=io.StringIO(),
-            )
-
-            payload = json.loads(output.getvalue())
-            self.assertEqual(1, exit_code)
-            self.assertEqual("needs-attention", payload["progress"])
-            self.assertEqual("committed", payload["state"])
-            self.assertEqual("unsafe-layout", payload["layout"]["reason"])
-            self.assertEqual(
-                "custom group records contain conflicting ids",
-                payload["layout"]["detail"],
-            )
-
 
 class CliInstallTests(unittest.TestCase):
     def test_install_modes_do_not_require_an_existing_config(self):

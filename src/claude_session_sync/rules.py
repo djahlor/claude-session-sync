@@ -2,8 +2,9 @@
 
 Ported from vinlim/claude-desktop-sync (0BSD). Rule numbers follow its DESIGN.md:
 R3 one side changed, R4 both changed, R5 new records, R6 deletes, R7 lost
-records, R8 kept copies, R11 unreadable or future copies. R9, live partitions,
-does not apply here, because every sync runs with Claude closed.
+records, R11 unreadable or future copies. R8, kept copies, is the run journal,
+which keeps every file a run replaces. R9, live partitions, does not apply
+here, because every sync runs with Claude closed.
 Actions for one session are emitted in the order they must happen.
 """
 
@@ -122,13 +123,8 @@ def _plan_record(session_id, snapshots, holders, state, prefer, result, explaine
 
     winning = winner.records[session_id]
     for target in holders:
-        held = target.records[session_id]
-        if held.state_hash != winning.state_hash:
-            # R8: only a copy still as synced and strictly behind holds nothing unique.
-            superseded = target in untouched and winning.last_activity_at > held.last_activity_at
-            result.actions.append(
-                ReplaceRecord(session_id, source=winner.key, target=target.key, keep=not superseded)
-            )
+        if target.records[session_id].state_hash != winning.state_hash:
+            result.actions.append(ReplaceRecord(session_id, source=winner.key, target=target.key))
 
     for target in snapshots:
         if session_id in target.records:
@@ -159,8 +155,6 @@ def _one_sided_winner(session_id, holders, untouched) -> Optional[Snapshot]:
     then lower than what it would replace, and the case falls through to R4.
     """
 
-    if len({s.records[session_id].state_hash for s in holders}) == 1:
-        return holders[0]
     changed = [s for s in holders if s not in untouched]
     if len({s.records[session_id].state_hash for s in changed}) != 1:
         return None

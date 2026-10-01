@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
 
+from .filesystem import normalized_path
+
 
 Runner = Callable[..., subprocess.CompletedProcess]
 DEFAULT_CLAUDE_EXECUTABLE = Path("/Applications/Claude.app/Contents/MacOS/Claude")
@@ -24,19 +26,15 @@ class ManagedProcess:
     user_data_dir: Path
 
 
-def _normalized(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
-
-
 def _user_data_dir(argv: Sequence[str]) -> Tuple[bool, Optional[Path]]:
     for index, argument in enumerate(argv[1:], start=1):
         if argument.startswith("--user-data-dir="):
             value = argument.partition("=")[2]
-            return True, _normalized(Path(value)) if value else None
+            return True, normalized_path(Path(value)) if value else None
         if argument == "--user-data-dir":
             if index + 1 >= len(argv) or not argv[index + 1]:
                 return True, None
-            return True, _normalized(Path(argv[index + 1]))
+            return True, normalized_path(Path(argv[index + 1]))
     return False, None
 
 
@@ -74,8 +72,8 @@ def parse_process_table(
 ) -> Tuple[ManagedProcess, ...]:
     """Parse ``ps -axo pid=,command=`` without substring process matching."""
 
-    expected_executable = os.fspath(_normalized(executable))
-    managed_roots = {_normalized(path) for path in managed_profile_roots}
+    expected_executable = os.fspath(normalized_path(executable))
+    managed_roots = {normalized_path(path) for path in managed_profile_roots}
     matches = []
 
     for line in output.splitlines():
@@ -104,7 +102,7 @@ def parse_process_table(
             argv = tuple(shlex.split(command, posix=True))
         except ValueError:
             continue
-        if not argv or _normalized(Path(argv[0])) != Path(expected_executable):
+        if not argv or normalized_path(Path(argv[0])) != Path(expected_executable):
             continue
         has_profile_argument, profile_root = _user_data_dir(argv)
         if has_profile_argument and profile_root not in managed_roots:
@@ -112,7 +110,7 @@ def parse_process_table(
             if raw_profile_root is not None:
                 profile_root = raw_profile_root
         if not has_profile_argument and default_profile_root is not None:
-            profile_root = _normalized(default_profile_root)
+            profile_root = normalized_path(default_profile_root)
         if profile_root is None or profile_root not in managed_roots:
             continue
         matches.append(ManagedProcess(pid, argv, profile_root))
@@ -159,7 +157,7 @@ class ProcessProbe:
                 current_options["timeout"] = remaining
                 return self._runner(command, **current_options)
 
-        expected_executable = os.fspath(_normalized(executable))
+        expected_executable = os.fspath(normalized_path(executable))
         listing = read(["ps", "-axo", "pid=,comm="])
         candidate_pids = []
         for line in listing.stdout.splitlines():
@@ -180,21 +178,6 @@ class ProcessProbe:
             executable=executable,
             managed_profile_roots=managed_profile_roots,
             default_profile_root=default_profile_root,
-        )
-
-    def any_running(
-        self,
-        *,
-        executable: Path,
-        managed_profile_roots: Iterable[Path],
-        default_profile_root: Optional[Path] = None,
-    ) -> bool:
-        return bool(
-            self.running(
-                executable=executable,
-                managed_profile_roots=managed_profile_roots,
-                default_profile_root=default_profile_root,
-            )
         )
 
 

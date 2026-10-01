@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from . import strict_json as json
 import os
-import shlex
 import shutil
 import stat
 import subprocess
@@ -85,12 +84,13 @@ class InstallLayout:
         )
 
     @property
-    def work_app(self) -> Path:
-        return self.applications_dir / "Claude Work.app"
+    def retired_apps(self) -> Tuple[Path, ...]:
+        """Profile launcher apps older versions installed. Setup backs them up."""
 
-    @property
-    def personal_app(self) -> Path:
-        return self.applications_dir / "Claude Personal Synced.app"
+        return (
+            self.applications_dir / "Claude Work.app",
+            self.applications_dir / "Claude Personal Synced.app",
+        )
 
     @property
     def watcher_binary(self) -> Path:
@@ -127,10 +127,6 @@ class InstallLayout:
     @property
     def watcher_status(self) -> Path:
         return self.support_dir / "state" / "watcher-status.json"
-
-    @property
-    def legacy_launch_agents(self) -> Tuple[Path, ...]:
-        return (self.launch_agents_dir / "com.djahlor.claude-session-sync.plist",)
 
 
 @dataclass(frozen=True)
@@ -171,9 +167,6 @@ class Installer:
         claude_app = Path("/Applications/Claude.app")
         executable = claude_app / "Contents" / "MacOS" / "Claude"
         work_root = self.layout.home / "Library" / "Application Support" / "Claude"
-        personal_root = (
-            self.layout.home / "Library" / "Application Support" / "Claude-Personal"
-        )
         document = {
             "version": 1,
             "approved_targets": [],
@@ -190,16 +183,6 @@ class Installer:
                     "name": "Work",
                     "is_default": True,
                 },
-                {
-                    "data_root": str(personal_root),
-                    "launch_command": [
-                        str(executable),
-                        "--user-data-dir={}".format(personal_root),
-                    ],
-                    "name": "Personal",
-                    "enabled": False,
-                    "is_default": False,
-                },
             ],
             "retention": 10,
             "state_dir": str(self.layout.support_dir / "state"),
@@ -212,32 +195,6 @@ class Installer:
         data = self._config_template()
         self._load_config_bytes(data)
         return data
-
-    def _bundle(self, profile: str, identifier: str) -> Dict[Path, Tuple[bytes, int]]:
-        command = self.layout.cli_command + (
-            "--config",
-            str(self.layout.config_path),
-            "switch",
-            profile,
-            "--wait-for-exit",
-            "15",
-        )
-        launcher = "#!/bin/sh\nexec {}\n".format(shlex.join(command)).encode("utf-8")
-        info = _plist(
-            (
-                ("CFBundleDevelopmentRegion", _string("English")),
-                ("CFBundleExecutable", _string("launcher")),
-                ("CFBundleIdentifier", _string(identifier)),
-                ("CFBundleInfoDictionaryVersion", _string("6.0")),
-                ("CFBundleName", _string("Claude {}".format(profile))),
-                ("CFBundlePackageType", _string("APPL")),
-                ("CFBundleVersion", _string("1")),
-            )
-        )
-        return {
-            Path("Contents/Info.plist"): (info, 0o644),
-            Path("Contents/MacOS/launcher"): (launcher, 0o755),
-        }
 
     def _launch_agent(self, config_data: Optional[bytes] = None) -> bytes:
         configured = None
@@ -395,11 +352,7 @@ class Installer:
 
     def _planned_actions(self, config_data: Optional[bytes] = None) -> List[InstallAction]:
         actions = []
-        for legacy in self.layout.legacy_launch_agents:
-            if legacy.exists():
-                actions.append(InstallAction("disable-legacy", legacy))
         if config_data is not None:
-            configured = self._load_config_bytes(config_data)
             if not self._same_file(self.layout.config_path, config_data, 0o600):
                 actions.append(InstallAction(
                     "replace" if self.layout.config_path.exists() else "create",
@@ -409,20 +362,6 @@ class Installer:
             actions.append(InstallAction("create", self.layout.config_path))
         elif stat.S_IMODE(self.layout.config_path.stat().st_mode) != 0o600:
             actions.append(InstallAction("permission", self.layout.config_path))
-        if config_data is not None:
-            enabled_profiles = {profile.name for profile in configured.profiles}
-        elif self.layout.config_path.exists():
-            enabled_profiles = {
-                profile.name
-                for profile in load_config(self.layout.config_path).profiles
-            }
-        else:
-            template = json.loads(self._config_template().decode("utf-8"))
-            enabled_profiles = {
-                profile["name"]
-                for profile in template["profiles"]
-                if profile.get("enabled", True)
-            }
         runtime_files = self._runtime_files()
         if not self._same_bundle(self.layout.runtime_package, runtime_files):
             actions.append(
@@ -439,27 +378,9 @@ class Installer:
                     self.layout.runtime_cli,
                 )
             )
-        wrapper_profiles = enabled_profiles if len(enabled_profiles) > 1 else set()
-        bundle_specs = (
-            (
-                "Work",
-                self.layout.work_app,
-                self._bundle("Work", "com.claude-session-sync.work"),
-            ),
-            (
-                "Personal",
-                self.layout.personal_app,
-                self._bundle("Personal", "com.claude-session-sync.personal"),
-            ),
-        )
-        for profile_name, path, files in bundle_specs:
-            if profile_name not in wrapper_profiles:
-                if path.exists():
-                    actions.append(InstallAction("remove-disabled", path))
-            elif not self._same_bundle(path, files):
-                actions.append(
-                    InstallAction("replace" if path.exists() else "create", path)
-                )
+        for path in self.layout.retired_apps:
+            if path.exists():
+                actions.append(InstallAction("remove-retired", path))
         if not self._watcher_current():
             actions.append(InstallAction("compile", self.layout.watcher_binary))
         if not self._layout_helper_current():
@@ -596,8 +517,7 @@ class Installer:
     def _transaction_targets(self) -> Tuple[Path, ...]:
         return (
             self.layout.config_path,
-            self.layout.work_app,
-            self.layout.personal_app,
+            *self.layout.retired_apps,
             self.layout.runtime_package,
             self.layout.runtime_cli,
             self.layout.watcher_binary,
@@ -606,7 +526,7 @@ class Installer:
             self.layout.layout_helper_stamp,
             self.layout.launch_agent,
             self.layout.backups_dir,
-        ) + self.layout.legacy_launch_agents
+        )
 
     def _install_transaction(
         self, config_data: Optional[bytes] = None
@@ -624,13 +544,22 @@ class Installer:
             targets=self._transaction_targets(), state_roots=state_roots,
             launch_agent=self.layout.launch_agent,
             recovery_root=self.layout.support_dir / "install-state",
-            runner=self._runner, legacy_agents=self.layout.legacy_launch_agents,
+            runner=self._runner,
         )
 
     def setup(
-        self, *, dry_run: bool, config_data: Optional[bytes] = None
+        self,
+        *,
+        dry_run: bool,
+        config_data: Optional[bytes] = None,
+        before_activation: Optional[Callable[[Path], None]] = None,
     ) -> InstallReport:
-        """Validate and stage a complete setup, then apply it transactionally."""
+        """Validate and stage a complete setup, then apply it transactionally.
+
+        before_activation gets the sidebar helper's path. It runs while the
+        old watcher is stopped and sync is locked, before the new watcher
+        starts, so whatever it records is in place before any sync.
+        """
 
         if dry_run:
             if (self.layout.support_dir / "install-state").exists():
@@ -652,6 +581,8 @@ class Installer:
                 self._validate_staged_plists(staging, config_data)
                 transaction.stop_watcher()
                 self._remove_retired_launch_guard(config_data)
+                if before_activation is not None:
+                    before_activation(helper if helper.exists() else self.layout.layout_helper)
                 report = self._apply_setup(actions, config_data, watcher, helper)
                 remaining = self._planned_actions(config_data)
                 if remaining:
@@ -679,24 +610,14 @@ class Installer:
     def _validate_staged_plists(
         self, staging: Path, config_data: Optional[bytes]
     ) -> None:
-        data = [self._launch_agent(config_data)] + [
-            self._bundle(profile, identifier)[Path("Contents/Info.plist")][0]
-            for profile, identifier in (
-                ("Work", "com.claude-session-sync.work"),
-                ("Personal", "com.claude-session-sync.personal"),
-            )
-        ]
-        for index, content in enumerate(data):
-            candidate = staging / "validate-{}.plist".format(index)
-            candidate.write_bytes(content)
-            self._runner(["/usr/bin/plutil", "-lint", str(candidate)], check=True,
-                         text=True, capture_output=True)
+        candidate = staging / "validate-launch-agent.plist"
+        candidate.write_bytes(self._launch_agent(config_data))
+        self._runner(["/usr/bin/plutil", "-lint", str(candidate)], check=True,
+                     text=True, capture_output=True)
 
     def _apply_setup(self, actions, config_data, watcher, helper) -> InstallReport:
         self._backups = []
         for action in actions:
-            if action.kind == "disable-legacy":
-                continue
             if action.path == self.layout.config_path:
                 if config_data is not None:
                     self._atomic_file(action.path, config_data, 0o600)
@@ -708,16 +629,8 @@ class Installer:
                 self._install_bundle(action.path, self._runtime_files())
             elif action.path == self.layout.runtime_cli:
                 self._atomic_file(action.path, self._runtime_shim(), 0o755)
-            elif action.path in (self.layout.work_app, self.layout.personal_app):
-                profile = "Work" if action.path == self.layout.work_app else "Personal"
-                if action.kind == "remove-disabled":
-                    self._backup(action.path)
-                else:
-                    self._install_bundle(
-                        action.path, self._bundle(
-                            profile, "com.claude-session-sync." + profile.lower()
-                        )
-                    )
+            elif action.kind == "remove-retired":
+                self._backup(action.path)
             elif action.path == self.layout.watcher_binary:
                 self._atomic_file(action.path, watcher.read_bytes(), 0o755)
                 self._atomic_file(self.layout.watcher_stamp,
@@ -729,18 +642,6 @@ class Installer:
             elif action.path == self.layout.launch_agent:
                 self._atomic_file(action.path, self._launch_agent(config_data),
                                   0o644, lint=True)
-        for action in (a for a in actions if a.kind == "disable-legacy"):
-            self._runner(["/bin/launchctl", "bootout",
-                          "gui/{}".format(os.getuid()), str(action.path)],
-                         check=False, text=True, capture_output=True)
-            verification = self._runner(
-                ["/bin/launchctl", "print",
-                 "gui/{}/{}".format(os.getuid(), action.path.stem)],
-                check=False, text=True, capture_output=True)
-            if verification.returncode == 0:
-                raise RuntimeError("legacy session sync service is still loaded: {}"
-                                   .format(action.path.stem))
-            self._backup(action.path)
         self.load_launch_agent()
         return InstallReport("installed" if actions else "noop", tuple(actions),
                              tuple(self._backups))
@@ -767,25 +668,9 @@ class Installer:
             capture_output=True,
         )
 
-    def unload_launch_agent(self) -> None:
-        """Stop the per-user watcher before its plist is removed."""
-
-        self._runner(
-            [
-                "/bin/launchctl",
-                "bootout",
-                "gui/{}".format(os.getuid()),
-                str(self.layout.launch_agent),
-            ],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-
     def uninstall(self, *, dry_run: bool) -> InstallReport:
         targets = (
-            self.layout.work_app,
-            self.layout.personal_app,
+            *self.layout.retired_apps,
             self.layout.launch_agent,
             self.layout.watcher_binary,
             self.layout.layout_helper,

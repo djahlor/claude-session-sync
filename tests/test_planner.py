@@ -203,7 +203,6 @@ class PlannerTests(unittest.TestCase):
 
             plan = self.plan(config)
 
-            self.assertEqual((), plan.conflicts)
             self.assertEqual({"tied"}, {problem.kind for problem in plan.problems})
             self.assertEqual({"tied"}, {problem.session_id for problem in plan.problems})
             self.assertEqual(["other"], [op.session_id for op in plan.operations])
@@ -281,29 +280,7 @@ class PlannerTests(unittest.TestCase):
             plan = self.plan(config)
 
             self.assertEqual((), plan.operations)
-            self.assertEqual((), plan.conflicts)
             self.assertEqual(0, plan.total_bytes)
-
-    def test_plan_id_is_stable_across_creation_order_and_temporary_roots(self) -> None:
-        def build(root: Path, personal_first: bool) -> Plan:
-            config = self.config(root)
-            self.target(root / "standard")
-            self.target(root / "personal")
-            roots = [root / "personal", root / "standard"]
-            if not personal_first:
-                roots.reverse()
-            self.write_session(roots[0], "stable", "same", 5_000_000_000)
-            self.write_session(roots[1], "stable", "same", 5_000_000_000)
-            (self.target(root / "standard") / "local_stable.json").unlink()
-            return self.plan(config)
-
-        with tempfile.TemporaryDirectory() as first_directory:
-            with tempfile.TemporaryDirectory() as second_directory:
-                first = build(Path(first_directory), personal_first=True)
-                second = build(Path(second_directory), personal_first=False)
-
-        self.assertEqual(first.config_digest, second.config_digest)
-        self.assertEqual(first.plan_id, second.plan_id)
 
     def test_new_target_is_blocked_until_separately_approved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

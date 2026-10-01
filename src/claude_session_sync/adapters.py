@@ -34,7 +34,6 @@ ADAPTERS = (
             "groups": "group_count",
             "assignments": "assignment_count",
             "pins": "pin_count",
-            "ambiguous_assignments": "ambiguous_assignments",
         },
     ),
 )
@@ -89,11 +88,13 @@ def read_status(state_dir: Path, filename: str) -> dict:
 
 
 def _failure(name, error) -> dict:
-    from .layout import LayoutBusyError, LayoutError
+    from .layout import LayoutBusyError, LayoutChoiceError, LayoutError
     from .routines import RoutineBusyError, RoutineError
 
     if isinstance(error, (LayoutBusyError, RoutineBusyError)):
         return {"state": "skipped", "reason": "writer-busy"}
+    if isinstance(error, LayoutChoiceError):
+        return {"state": "skipped", "reason": "choose-main-account", "detail": str(error)}
     if isinstance(error, (LayoutError, RoutineError)):
         return {"state": "skipped", "reason": "unsafe-" + name, "detail": str(error)}
     singular = "routine" if name == "routines" else name
@@ -106,7 +107,6 @@ def run_adapters(
     running,
     *,
     probe_only=False,
-    prefer_current_sidebar=False,
     adopt_current_sidebar=False,
     adopt_source_scope=None,
     after_account_switch=False,
@@ -134,8 +134,6 @@ def run_adapters(
                         receipt = adapter.sync(adopt_source_scope=adopt_source_scope)
                     elif name == "layout" and adopt_current_sidebar:
                         receipt = adapter.sync(adopt_current_sidebar=True)
-                    elif name == "layout" and prefer_current_sidebar:
-                        receipt = adapter.sync(prefer_current_sidebar=True)
                     elif name == "layout" and after_account_switch:
                         receipt = adapter.sync(after_account_switch=True)
                     else:
@@ -144,6 +142,8 @@ def run_adapters(
                     result.update(
                         {key: getattr(receipt, attr) for key, attr in fields.items()}
                     )
+                    if getattr(receipt, "reason", None):
+                        result["reason"] = receipt.reason
                     probes[name] = {"state": "compatible", "validated_by": "sync"}
         except Exception as error:
             result = _failure(name, error)

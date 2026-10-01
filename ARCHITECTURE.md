@@ -44,8 +44,8 @@ window display progress without depending on Notification Center.
 - **Target**: one `<account>/<workspace>` session directory inside a profile.
 - **Replica**: one `local_<session-id>.json` file in a target.
 - **Revision**: validated JSON content identified by SHA-256, size, and mtime.
-- **Plan**: a canonical, deterministic set of copy operations or blocking
-  conflicts.
+- **Plan**: the create, replace, and retire steps of one run, and the chats
+  it leaves alone.
 - **Run**: the single-writer consistency boundary for one application or
   rollback transaction.
 
@@ -79,7 +79,7 @@ window display progress without depending on Notification Center.
 8. Logs contain run IDs, phases, counts, bytes, and profile labels, never chat
    titles, contents, or raw account identifiers.
 9. Default-profile process identity is explicit configuration, never inferred
-   from a wrapper's launch command.
+   from the profile's launch command.
 10. Process waits use monotonic wall-clock deadlines and subprocess timeouts;
     probe runtime cannot silently extend a configured handoff limit.
 11. Chat sync changes only validated session registry files. Sidebar sync is a
@@ -102,10 +102,15 @@ window display progress without depending on Notification Center.
 
 Claude stores chats and sidebar layout in separate stores. After chat sync
 commits, the optional layout adapter derives account and workspace scopes from
-the validated session registry. It then unions group names and pin order across
-those scopes. Group assignments copy by group name only when the source scopes
-agree. Ambiguous assignments remain unchanged in their existing scope and are
-not guessed for new scopes.
+the validated session registry. One scope is the source, and a private snapshot
+records which one. With none recorded, the first sync adopts the scope chosen
+at install, else the signed-in scope if it has groups, else the only scope with
+groups. After that the signed-in scope is the source, except right after an
+account switch, when the scope just left is. The adapter copies the source's
+groups, assignments, and group order into every other scope. Pins are one
+shared list and stay as they are. When only the user can say which scope to
+keep, the adapter stops and asks. `doctor` runs the same plan on a disposable
+copy of the database.
 
 The native helper is compiled locally from bundled LevelDB and Snappy sources.
 It exposes only exact-key reads and an atomic write batch. Unknown record shapes,
@@ -132,7 +137,7 @@ are excluded because their space context has different semantics.
 
 ```text
 IDLE -> DISCOVERING -> PLANNED
-  -> NOOP | BLOCKED_APP | BLOCKED_CONFLICT
+  -> NOOP | BLOCKED_APP | BLOCKED_INVALID
   -> LOCKED -> REVALIDATING -> JOURNALING -> STAGING
   -> COMMITTING -> VERIFYING -> COMMITTED
   -> ABORTING -> ROLLED_BACK | RECOVERY_REQUIRED
@@ -143,7 +148,7 @@ IDLE -> DISCOVERING -> PLANNED
 Tests exercise the external interface and CLI against temporary profile roots
 and injected process/launch adapters. Required behaviors include deterministic
 planning, explicit privacy scope, two-profile discovery, malformed and tied
-revision blocking, one-writer concurrency, interruption recovery, app-reopen
+revisions left alone, one-writer concurrency, interruption recovery, app-reopen
 abort, idempotent apply, byte-perfect rollback, and a 5,000-replica performance
 budget. Routine tests cover union, newest-edit selection, deletion propagation,
 new empty targets, malformed manifests, and missing task instructions.

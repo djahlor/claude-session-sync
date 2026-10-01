@@ -60,14 +60,14 @@ def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) 
     }
 
 
-def _validate_config_data(encoded: bytes) -> None:
+def _validate_config_data(encoded: bytes) -> Config:
     descriptor, raw_path = tempfile.mkstemp(prefix="claude-session-sync-config-")
     path = Path(raw_path)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
         os.chmod(str(path), 0o600)
-        load_config(path)
+        return load_config(path)
     finally:
         try:
             path.unlink()
@@ -79,8 +79,6 @@ def _prepare_config_data(
     source: bytes,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
 ) -> tuple[bytes, dict]:
@@ -92,8 +90,6 @@ def _prepare_config_data(
     changes = _apply_config_options(
         document,
         automatic_targets=automatic_targets,
-        enable_personal=enable_personal,
-        disable_personal=disable_personal,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
     )
@@ -106,8 +102,6 @@ def _configure(
     config_path: Path,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
     apply: bool,
@@ -118,8 +112,6 @@ def _configure(
     encoded, payload = _prepare_config_data(
         config_path.read_bytes(),
         automatic_targets=automatic_targets,
-        enable_personal=enable_personal,
-        disable_personal=disable_personal,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
     )
@@ -140,12 +132,10 @@ def _apply_config_options(
     document: dict,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
 ) -> int:
-    changes = 0
+    changes = _drop_personal_profile(document)
 
     if automatic_targets:
         # Sync every folder a real login uses, and let a new login join once
@@ -159,44 +149,6 @@ def _apply_config_options(
                 document[key] = value
                 changes += 1
 
-    if enable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is None:
-            raise ValueError("generated Personal profile is missing")
-        if personal.get("enabled") is not True:
-            personal["enabled"] = True
-            changes += 1
-        for key in (
-            "acknowledge_cross_profile_copy",
-            "acknowledge_cross_account_copy",
-        ):
-            if document.get(key) is not True:
-                document[key] = True
-                changes += 1
-
-    if disable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is not None and personal.get("enabled", True) is not False:
-            personal["enabled"] = False
-            changes += 1
-        if document.get("acknowledge_cross_profile_copy") is not False:
-            document["acknowledge_cross_profile_copy"] = False
-            changes += 1
-
     if sync_layout and document.get("sync_sidebar_layout") is not True:
         document["sync_sidebar_layout"] = True
         changes += 1
@@ -208,17 +160,33 @@ def _apply_config_options(
     return changes
 
 
+def _drop_personal_profile(document: dict) -> int:
+    """Remove the Personal profile older versions generated, with its targets.
+
+    Runs before validation, so it skips entries that are not objects and
+    leaves them for the validator to name.
+    """
+
+    def personal(entry, key: str) -> bool:
+        return isinstance(entry, dict) and entry.get(key) == "Personal"
+
+    profiles = document.get("profiles")
+    if not isinstance(profiles, list) or not any(personal(p, "name") for p in profiles):
+        return 0
+    document["profiles"] = [profile for profile in profiles if not personal(profile, "name")]
+    targets = document.get("approved_targets")
+    if isinstance(targets, list):
+        document["approved_targets"] = [
+            target for target in targets if not personal(target, "profile")
+        ]
+    return 1
+
+
 def _config_summary(document: dict, changes: int) -> dict:
     return {
         "state": "planned" if changes else "noop",
         "counts": {
             "changes": changes,
-            "personal_enabled": int(
-                any(
-                    profile.get("name") == "Personal" and profile.get("enabled") is True
-                    for profile in document.get("profiles", [])
-                )
-            ),
             "automatic_targets": int(
                 document.get("target_policy") in ("all-configured-profiles", "logins")
             ),
