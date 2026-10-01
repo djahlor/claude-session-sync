@@ -508,7 +508,10 @@ def transform_layout_records(
             after_account_switch=after_account_switch,
         )
         if source is None:
-            return _unchanged(records, reason="no-groups-yet")
+            return _unchanged(
+                records,
+                reason="no-groups-yet" if snapshot is None else "main-account-has-no-groups",
+            )
     return _adopt_current_sidebar_records(
         group_record,
         local_record,
@@ -590,22 +593,25 @@ def _source_scope(
     active_is_empty: bool,
     after_account_switch: bool,
 ) -> Optional[str]:
-    """Which account's sidebar to copy, or None when no account has groups yet.
+    """Which account's sidebar to copy, or None when it has no groups to copy.
 
-    An empty sidebar is missing data, never a choice to delete every group.
+    An empty sidebar is missing data, never a choice to delete every group,
+    so it is never copied over another account's groups.
     """
 
-    if snapshot is not None:
-        if active == snapshot.adopted_scope:
-            return active
-        if after_account_switch or active_is_empty:
-            return snapshot.adopted_scope
-        raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
     grouped = [
         key
         for key in sorted(target_sessions)
         if key in store_scopes and _ordered_group_pairs(store_scopes[key])
     ]
+    if snapshot is not None:
+        if active == snapshot.adopted_scope:
+            source = active
+        elif after_account_switch or active_is_empty:
+            source = snapshot.adopted_scope
+        else:
+            raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
+        return source if source in grouped else None
     if active in grouped:
         return active
     if not grouped:

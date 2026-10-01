@@ -922,6 +922,7 @@ class FollowAccountTests(unittest.TestCase):
 
     config = LayoutRecoveryTests.config
     transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets_ab = {"a/w": {"code:x"}, "b/w": {"code:x"}}
 
     def adopted(self, source, other, targets):
         return transform_layout_records(
@@ -1029,6 +1030,32 @@ class FollowAccountTests(unittest.TestCase):
 
         self.assertEqual(dict(adopted.records), dict(result.records))
         self.assertIsNone(result.snapshot, "the snapshot file stays as it is")
+
+    def test_deleting_the_last_group_in_the_main_account_changes_nothing_and_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            adopted = self.adopted(scope("Focus"), scope(), self.targets_ab)
+            values.clear()
+            values.update(adopted.records)
+            document = copy.deepcopy(decoded(values[DFRAME_STORE_KEY]))
+            document["state"]["customGroupsByScope"]["a/w"] = scope()
+            values[DFRAME_STORE_KEY] = _encode_record(document)
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            snapshot_path.write_text(json.dumps(adopted.snapshot.as_dict()))
+            before = dict(values)
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets_ab
+            ):
+                receipt = synchronizer.sync()
+
+            self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "main-account-has-no-groups"), receipt)
+            self.assertEqual(before, values)
+            self.assertEqual({"version": 1, "adopted_scope": "a/w"}, json.loads(snapshot_path.read_text()))
 
     def test_a_divergent_account_without_a_switch_is_left_for_a_choice(self):
         targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}

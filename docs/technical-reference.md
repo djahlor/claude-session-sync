@@ -354,7 +354,10 @@ Claude closed, and the new account must then upload the copy.
   The account just left holds the newest organization, so it is copied into the
   new account, which is then marked for an upload to its servers.
 - **Deletes stick.** A deleted group is gone from every account after the next
-  sync; nothing is merged back from older copies.
+  sync; nothing is merged back from older copies. An account with no groups is
+  never copied over another, so when the main account deletes its last group,
+  nothing changes and the layout result says `reason=main-account-has-no-groups`.
+  The next group it gets is copied as usual.
 - **A choice when unclear.** If you signed in to another account without the
   switch restart, and that account has groups, sync stops with
   `reason=choose-main-account`. The same happens on a first sync when the
