@@ -79,7 +79,7 @@ window display progress without depending on Notification Center.
 8. Logs contain run IDs, phases, counts, bytes, and profile labels, never chat
    titles, contents, or raw account identifiers.
 9. Default-profile process identity is explicit configuration, never inferred
-   from a wrapper's launch command.
+   from the profile's launch command.
 10. Process waits use monotonic wall-clock deadlines and subprocess timeouts;
     probe runtime cannot silently extend a configured handoff limit.
 11. Chat sync changes only validated session registry files. Sidebar sync is a
@@ -137,7 +137,7 @@ are excluded because their space context has different semantics.
 
 ```text
 IDLE -> DISCOVERING -> PLANNED
-  -> NOOP | BLOCKED_APP | BLOCKED_CONFLICT
+  -> NOOP | BLOCKED_APP | BLOCKED_INVALID
   -> LOCKED -> REVALIDATING -> JOURNALING -> STAGING
   -> COMMITTING -> VERIFYING -> COMMITTED
   -> ABORTING -> ROLLED_BACK | RECOVERY_REQUIRED
