@@ -140,10 +140,15 @@ class SidebarAccount:
     # ACCOUNT/WORKSPACE. Never printed whole: it is the only name on disk.
     scope: str
     is_signed_in: bool
-    groups: int
+    # In sidebar order. The user's own data, shown in their own terminal.
+    group_names: Tuple[str, ...]
     # Pinned chats among this account's chats; pins are one shared list.
     pins: int
     chats: int
+
+    @property
+    def groups(self) -> int:
+        return len(self.group_names)
 
 
 def _string_list(value: Any, label: str) -> List[str]:
@@ -670,7 +675,12 @@ def sidebar_accounts(
         SidebarAccount(
             scope=scope_key,
             is_signed_in=scope_key == active,
-            groups=len(_ordered_group_pairs(store_scopes.get(scope_key, {"groups": []}))),
+            group_names=tuple(
+                name
+                for _group_id, name in _ordered_group_pairs(
+                    store_scopes.get(scope_key, {"groups": []})
+                )
+            ),
             pins=len(pins & sessions),
             chats=len(sessions),
         )

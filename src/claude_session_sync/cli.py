@@ -554,7 +554,7 @@ def _account_lines(rows: Sequence[Any]) -> list:
     """One line per account. Accounts have no names on disk, so rows that would
     look the same also show a short ID."""
 
-    looks = [(row.is_signed_in, row.groups, row.pins, row.chats) for row in rows]
+    looks = [(row.is_signed_in, row.group_names, row.pins, row.chats) for row in rows]
     show_id = len(set(looks)) < len(looks)
     lines = []
     for number, row in enumerate(rows, 1):
@@ -564,8 +564,22 @@ def _account_lines(rows: Sequence[Any]) -> list:
             columns.append("{}/{}".format(account[:8], workspace[:8]))
         for count, word in ((row.groups, "group"), (row.pins, "pin"), (row.chats, "chat")):
             columns.append("{:>4} {}".format(count, word if count == 1 else word + "s").ljust(11))
+        columns.append(_group_summary(row.group_names))
         lines.append("  ".join(columns).rstrip())
     return lines
+
+
+def _group_summary(names: Sequence[str]) -> str:
+    """Up to three group names, then how many more."""
+
+    shown = []
+    for name in names[:3]:
+        printable = "".join(character if character.isprintable() else " " for character in name)
+        shown.append(printable if len(printable) <= 30 else printable[:29] + "\u2026")
+    summary = ", ".join(shown)
+    if len(names) > 3:
+        summary += " and {} more".format(len(names) - 3)
+    return summary
 
 
 def _keep_sidebar(

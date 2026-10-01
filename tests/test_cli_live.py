@@ -330,8 +330,8 @@ class LiveCliTests(ChatCliFixture):
             code, out, errors = self.cli("keep-sidebar", "--dry-run")
             self.assertEqual(0, code, errors)
             self.assertEqual(
-                "  1  signed in     2 groups     1 pin        2 chats\n"
-                "  2                1 group      1 pin        1 chat\n"
+                "  1  signed in     2 groups     1 pin        2 chats   Focus, Admin\n"
+                "  2                1 group      1 pin        1 chat    Old\n"
                 "state=planned account=1 next_action=restart-claude\n",
                 out,
             )
@@ -365,12 +365,31 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(0, code, errors)
         self.assertEqual(
-            "  1  signed in     1 group      0 pins       1 chat\n"
-            "  2                2 groups     0 pins       1 chat\n"
+            "  1  signed in     1 group      0 pins       1 chat    Focus\n"
+            "  2                2 groups     0 pins       1 chat    Old, Ideas\n"
             "state=planned account=1 next_action=restart-claude\n",
             out,
         )
         self.assertFalse(state_path(self.config.state_dir).exists(), "listing writes no chat state")
+
+    def test_keep_sidebar_shows_three_group_names_then_how_many_more(self):
+        from dataclasses import replace
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+        long_name = "A very long group name that keeps going"
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Line\nbreak", long_name, "Four", "Five"], (B_ACCOUNT, B_ORG): []},
+            signed_in=A_ACCOUNT,
+        ):
+            code, out, _errors = self.cli("keep-sidebar", "--dry-run")
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "  1  signed in     5 groups     0 pins       0 chats   "
+            "Focus, Line break, A very long group name that k\u2026 and 2 more",
+            out.splitlines()[0],
+        )
+        self.assertEqual("  2                0 groups     0 pins       0 chats", out.splitlines()[1])
 
     def test_keep_sidebar_keeps_another_account_by_its_row_number(self):
         from dataclasses import replace
@@ -399,8 +418,8 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(1, code)
         self.assertEqual(
-            "  1             aaaaaaaa/aaaaaaaa     1 group      0 pins       0 chats\n"
-            "  2             bbbbbbbb/bbbbbbbb     1 group      0 pins       0 chats\n"
+            "  1             aaaaaaaa/aaaaaaaa     1 group      0 pins       0 chats   Focus\n"
+            "  2             bbbbbbbb/bbbbbbbb     1 group      0 pins       0 chats   Focus\n"
             "state=blocked reason=signed-in-account-not-synced\n",
             out,
         )
@@ -480,8 +499,8 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual(
             "\nWhich account is the main one?\n"
             "The other accounts will copy its pins and groups.\n\n"
-            "  1  signed in     2 groups     0 pins       1 chat\n"
-            "  2                1 group      0 pins       1 chat\n\n"
+            "  1  signed in     2 groups     0 pins       1 chat    Focus, Admin\n"
+            "  2                1 group      0 pins       1 chat    Old\n\n"
             "Press Enter for 1, or type a number: "
             "Account 2 is the main one. The others copy its pins and groups "
             "the next time Claude closes.\n\n",
