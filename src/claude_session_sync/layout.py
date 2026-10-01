@@ -65,6 +65,9 @@ NEEDS_MAIN_ACCOUNT = (
 class LayoutError(RuntimeError):
     """Raised when sidebar data cannot be changed without guessing."""
 
+    # What status and doctor report; None reports unsafe-layout.
+    reason: Optional[str] = None
+
 
 class LayoutBusyError(LayoutError):
     """Raised when another synchronization writer owns the lock."""
@@ -76,6 +79,14 @@ class LayoutRecoveryError(LayoutError):
 
 class LayoutChoiceError(LayoutError):
     """Raised when only the user can say which account's sidebar to keep."""
+
+    reason = "choose-main-account"
+
+
+class LayoutDisagreementError(LayoutError):
+    """Raised when Claude's two saved copies of the same sidebar data differ."""
+
+    reason = "sidebar-records-disagree"
 
 
 @dataclass(frozen=True)
@@ -439,6 +450,7 @@ def _adopt_current_sidebar_records(
         )
 
     source = store_scopes[selected_scope]
+    _check_copies_agree(selected_scope, store_scopes, persisted_scopes, store_state, local_record)
     current_pins = _string_list(store_state.get("pinnedOrder", []), "stored pins")
     current_project_pins = _string_list(
         store_state.get("homeProjectsPinnedOrder", []), "stored project pins"
@@ -497,6 +509,37 @@ def _adopt_current_sidebar_records(
             active_scope if selected_scope != active_scope else None
         ),
     )
+
+
+def _check_copies_agree(
+    source_scope: str,
+    store_scopes: Mapping[str, Mapping[str, Any]],
+    persisted_scopes: Mapping[str, Mapping[str, Any]],
+    store_state: Mapping[str, Any],
+    local_record: Mapping[str, Any],
+) -> None:
+    """Stop before a copy when Claude's two saves of the source data differ.
+
+    Claude keeps each account's groups, and the pins, in two records. An
+    interrupted save can leave a change in only one, and the copy would drop it.
+    """
+
+    if source_scope in persisted_scopes and _layout(persisted_scopes[source_scope]) != _layout(
+        store_scopes[source_scope]
+    ):
+        raise LayoutDisagreementError(
+            "Claude's two saved copies of the source account's groups differ, so "
+            "sync wrote nothing; open Claude, check its sidebar, and quit it"
+        )
+    for key in ("pinnedOrder", "homeProjectsPinnedOrder"):
+        local = local_record["value"].get(key)
+        if local is not None and _string_list(local, "local pins") != _string_list(
+            store_state.get(key, []), "stored pins"
+        ):
+            raise LayoutDisagreementError(
+                "Claude's two saved copies of the pins differ, so sync wrote "
+                "nothing; open Claude, check its pins, and quit it"
+            )
 
 
 def transform_layout_records(

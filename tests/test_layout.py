@@ -18,6 +18,7 @@ from claude_session_sync.layout import (
     LayoutError,
     LayoutBusyError,
     LayoutChoiceError,
+    LayoutDisagreementError,
     LayoutReceipt,
     LayoutRecoveryError,
     LayoutSnapshot,
@@ -65,6 +66,18 @@ def recovery_record(target, before, after):
         "before_sha256": hashlib.sha256(before).hexdigest(),
         "after_sha256": hashlib.sha256(after).hexdigest(),
     }
+
+
+def edited(current, scope_key, new_scope):
+    """A sidebar edit as Claude saves it: in both group records."""
+    changed = dict(current)
+    store = decoded(changed[DFRAME_STORE_KEY])
+    store["state"]["customGroupsByScope"][scope_key] = new_scope
+    changed[DFRAME_STORE_KEY] = encoded(store)
+    persisted = decoded(changed[GROUP_SCOPES_KEY])
+    persisted["value"][scope_key] = new_scope
+    changed[GROUP_SCOPES_KEY] = encoded(persisted)
+    return changed
 
 
 def records(scopes, *, active=None, pins=None, extra=None):
@@ -970,12 +983,7 @@ class FollowAccountTests(unittest.TestCase):
         adopted = self.adopted(
             scope("Focus", "Old idea", assignments={"code:x": "id-focus"}), scope(), targets
         )
-        document = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
-        document["state"]["customGroupsByScope"]["a/w"] = scope(
-            "Focus", assignments={"code:x": "id-focus"}
-        )
-        current = dict(adopted.records)
-        current[DFRAME_STORE_KEY] = _encode_record(document)
+        current = edited(adopted.records, "a/w", scope("Focus", assignments={"code:x": "id-focus"}))
 
         result = transform_layout_records(
             current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="a"
@@ -991,12 +999,7 @@ class FollowAccountTests(unittest.TestCase):
         adopted = self.adopted(
             scope("Focus", "Backlog", assignments={"code:x": "id-focus"}), scope(), targets
         )
-        document = copy.deepcopy(decoded(adopted.records[DFRAME_STORE_KEY]))
-        document["state"]["customGroupsByScope"]["a/w"] = scope(
-            "Focus", "Backlog", assignments={"code:x": "id-backlog"}
-        )
-        current = dict(adopted.records)
-        current[DFRAME_STORE_KEY] = _encode_record(document)
+        current = edited(adopted.records, "a/w", scope("Focus", "Backlog", assignments={"code:x": "id-backlog"}))
 
         result = transform_layout_records(
             current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="a"
@@ -1370,23 +1373,75 @@ class DoctorTests(unittest.TestCase):
             self.assertIn("keep-sidebar --dry-run", str(raised.exception))
             self.assertNotIn("adopt-current-sidebar", str(raised.exception))
 
-    def test_a_needed_choice_is_reported_as_one(self):
+    def test_each_stop_is_reported_with_its_own_reason(self):
         from claude_session_sync.adapters import run_adapters
 
-        class Undecided:
-            def probe(self):
-                raise LayoutChoiceError("which one?")
+        for error, reason in (
+            (LayoutChoiceError("which one?"), "choose-main-account"),
+            (LayoutDisagreementError("which one?"), "sidebar-records-disagree"),
+            (LayoutError("which one?"), "unsafe-layout"),
+        ):
+            class Stopped:
+                def probe(self, error=error):
+                    raise error
 
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                config = self.config(Path(directory))
+                dependencies = type("Dependencies", (), {"layout_factory": lambda self, _config: Stopped()})()
+
+                result = run_adapters(config, dependencies, lambda: False, probe_only=True)
+
+                self.assertEqual(
+                    {"layout": {"state": "skipped", "reason": reason, "detail": "which one?"}},
+                    result,
+                )
+
+
+class DisagreeingCopiesTests(unittest.TestCase):
+    """Claude saves groups and pins twice; a copy never drops what only one save holds."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def test_a_group_or_pin_in_only_one_save_stops_the_copy(self):
+        current = records({"a/w": scope("Focus"), "b/w": scope("Old")}, active="a/w", pins=["code:x"])
+        group_only_persisted = dict(current)
+        persisted = decoded(current[GROUP_SCOPES_KEY])
+        persisted["value"]["a/w"] = scope("Focus", "Only here")
+        group_only_persisted[GROUP_SCOPES_KEY] = encoded(persisted)
+        pin_only_local = dict(current)
+        local = decoded(current[LOCAL_SLICE_KEY])
+        local["value"]["pinnedOrder"] = ["code:x", "code:y"]
+        pin_only_local[LOCAL_SLICE_KEY] = encoded(local)
+
+        for label, disagreeing in (("groups", group_only_persisted), ("pins", pin_only_local)):
+            with self.subTest(label), self.assertRaisesRegex(
+                LayoutDisagreementError, "two saved copies of the .*{}".format(label)
+            ):
+                transform_layout_records(disagreeing, self.targets, timestamp_ms=10)
+
+    def test_a_disagreement_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = self.config(Path(directory))
-            dependencies = type("Dependencies", (), {"layout_factory": lambda self, _config: Undecided()})()
+            root = Path(directory)
+            synchronizer, fake, _database, values = self.transaction_fixture(root)
+            values.clear()
+            values.update(records({"a/w": scope("Focus"), "b/w": scope("Old")}, active="a/w"))
+            persisted = decoded(values[GROUP_SCOPES_KEY])
+            persisted["value"]["a/w"] = scope("Focus", "Only here")
+            values[GROUP_SCOPES_KEY] = encoded(persisted)
+            before = dict(values)
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
 
-            result = run_adapters(config, dependencies, lambda: False, probe_only=True)
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets
+            ), self.assertRaises(LayoutDisagreementError):
+                synchronizer.sync()
 
-        self.assertEqual(
-            {"layout": {"state": "skipped", "reason": "choose-main-account", "detail": "which one?"}},
-            result,
-        )
+            self.assertEqual(before, values)
+            self.assertFalse((synchronizer.config.state_dir / "sidebar-layout-0.json").exists())
 
 
 class UnconfirmedUploadTests(unittest.TestCase):
