@@ -81,13 +81,6 @@ class Operation:
 
 
 @dataclass(frozen=True)
-class Conflict:
-    session_id: str
-    reason: str
-    replicas: Tuple[Replica, ...]
-
-
-@dataclass(frozen=True)
 class InvalidReplica:
     path: Path
     reason: str
@@ -108,7 +101,6 @@ class Plan:
     version: int
     config_digest: str
     operations: Tuple[Operation, ...]
-    conflicts: Tuple[Conflict, ...]
     invalid_replicas: Tuple[InvalidReplica, ...]
     plan_id: str
     total_bytes: int

@@ -44,8 +44,8 @@ window display progress without depending on Notification Center.
 - **Target**: one `<account>/<workspace>` session directory inside a profile.
 - **Replica**: one `local_<session-id>.json` file in a target.
 - **Revision**: validated JSON content identified by SHA-256, size, and mtime.
-- **Plan**: a canonical, deterministic set of copy operations or blocking
-  conflicts.
+- **Plan**: the create, replace, and retire steps of one run, and the chats
+  it leaves alone.
 - **Run**: the single-writer consistency boundary for one application or
   rollback transaction.
 

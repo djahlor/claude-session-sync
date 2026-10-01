@@ -288,8 +288,6 @@ def _parser() -> argparse.ArgumentParser:
 def _plan_state(plan: Plan) -> str:
     if plan.invalid_replicas:
         return "blocked_invalid"
-    if plan.conflicts:
-        return "blocked_conflict"
     if not plan.operations:
         return "noop"
     return "planned"
@@ -301,7 +299,6 @@ def _plan_summary(plan: Plan, duration_ms: int) -> dict:
     payload = {
         "bytes": plan.total_bytes,
         "counts": {
-            "conflicts": len(plan.conflicts),
             "invalid_replicas": len(plan.invalid_replicas),
             "operations": len(plan.operations),
         },
@@ -319,8 +316,6 @@ def _plan_summary(plan: Plan, duration_ms: int) -> dict:
             if target_only
             else "run-doctor"
         )
-    elif payload["state"] == "blocked_conflict":
-        payload["next_action"] = "run-doctor"
     return payload
 
 

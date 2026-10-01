@@ -50,7 +50,7 @@ class AppRunningError(TransactionError):
 
 
 class PlanBlockedError(TransactionError):
-    """Raised when a plan contains conflicts or invalid replicas."""
+    """Raised when a plan contains invalid replicas."""
 
 
 class RevalidationError(TransactionError):
@@ -112,10 +112,8 @@ class TransactionEngine:
         before the first write. Any drift from the plan aborts the run.
         """
 
-        if plan.conflicts or plan.invalid_replicas:
-            raise PlanBlockedError(
-                "plan {} has conflicts or invalid replicas".format(plan.plan_id)
-            )
+        if plan.invalid_replicas:
+            raise PlanBlockedError("plan {} has invalid replicas".format(plan.plan_id))
         with self._writer_lock():
             try:
                 pending = pending_recovery_runs(self.state_root)

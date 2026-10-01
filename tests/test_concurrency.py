@@ -27,7 +27,6 @@ def _plan(source: Path, destination: Path, destination_before: bytes):
                 size=len(source_bytes),
             ),
         ),
-        conflicts=(),
         invalid_replicas=(),
         plan_id="concurrent-plan",
     )

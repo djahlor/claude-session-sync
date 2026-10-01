@@ -203,7 +203,6 @@ class PlannerTests(unittest.TestCase):
 
             plan = self.plan(config)
 
-            self.assertEqual((), plan.conflicts)
             self.assertEqual({"tied"}, {problem.kind for problem in plan.problems})
             self.assertEqual({"tied"}, {problem.session_id for problem in plan.problems})
             self.assertEqual(["other"], [op.session_id for op in plan.operations])
@@ -281,7 +280,6 @@ class PlannerTests(unittest.TestCase):
             plan = self.plan(config)
 
             self.assertEqual((), plan.operations)
-            self.assertEqual((), plan.conflicts)
             self.assertEqual(0, plan.total_bytes)
 
     def test_plan_id_is_stable_across_creation_order_and_temporary_roots(self) -> None:

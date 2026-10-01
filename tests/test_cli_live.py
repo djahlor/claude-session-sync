@@ -570,7 +570,7 @@ class ChatCommandTests(ChatCliFixture):
             {
                 "bytes": size,
                 "counts": {
-                    "conflicts": 0, "creates": 1, "ignored_folders": 1, "invalid_replicas": 0,
+                    "creates": 1, "ignored_folders": 1, "invalid_replicas": 0,
                     "operations": 1, "replaces": 0, "retires": 0,
                 },
                 "duration_ms": 12,

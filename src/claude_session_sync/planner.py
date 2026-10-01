@@ -29,7 +29,6 @@ from .enrollment import new_login_targets, select_targets, target_key
 from .hash_cache import HashCache
 from .logins import default_app_log, record_logins
 from .model import (
-    Conflict,
     Discovery,
     InvalidReplica,
     Operation,
@@ -163,13 +162,12 @@ class Planner:
         invalid_tuple = tuple(
             sorted(invalid, key=lambda item: _portable_path(item.path, config))
         )
-        conflicts_tuple: Tuple[Conflict, ...] = ()
         config_digest = _config_digest(config)
         total_bytes = sum(
             operation.size for operation in operations if operation.kind != "retire"
         )
         identity = _plan_identity(
-            config, config_digest, operations, conflicts_tuple, invalid_tuple, total_bytes
+            config, config_digest, operations, invalid_tuple, total_bytes
         )
 
         def rescan() -> List[Snapshot]:
@@ -192,7 +190,6 @@ class Planner:
             PLAN_VERSION,
             config_digest,
             operations,
-            conflicts_tuple,
             invalid_tuple,
             hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest(),
             total_bytes,
@@ -321,7 +318,6 @@ def _plan_identity(
     config: Config,
     config_digest: str,
     operations: Sequence[Operation],
-    conflicts: Sequence[Conflict],
     invalid_replicas: Sequence[InvalidReplica],
     total_bytes: int,
 ) -> Mapping[str, Any]:
@@ -340,21 +336,6 @@ def _plan_identity(
                 "size": operation.size,
             }
             for operation in operations
-        ],
-        "conflicts": [
-            {
-                "session_id": conflict.session_id,
-                "reason": conflict.reason,
-                "replicas": [
-                    {
-                        "path": _portable_path(replica.path, config),
-                        "digest": replica.digest,
-                        "size": replica.size,
-                    }
-                    for replica in conflict.replicas
-                ],
-            }
-            for conflict in conflicts
         ],
         "invalid_replicas": [
             {

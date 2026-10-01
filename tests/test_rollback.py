@@ -38,7 +38,6 @@ def operation(
 def plan(operations: Iterable[object]):
     return SimpleNamespace(
         operations=tuple(operations),
-        conflicts=(),
         invalid_replicas=(),
         plan_id="rollback-plan",
     )
