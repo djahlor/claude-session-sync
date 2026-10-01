@@ -761,6 +761,29 @@ def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
     )
 
 
+# Why a main-account choice cannot apply, with the words to tell the user.
+MAIN_ACCOUNT_BLOCKERS = {
+    "sidebar-sync-off": "pins and groups do not sync, so there is no main account",
+    "needs-one-default-profile": (
+        "a main account works only with exactly one Claude profile enabled, the default one"
+    ),
+}
+
+
+def main_account_blocker(config: Config) -> Optional[str]:
+    """Why sync would refuse a main-account choice for this config, or None.
+
+    The install question, keep-sidebar, and sync all ask this, so a choice is
+    offered and recorded only where sync applies it.
+    """
+
+    if not config.sync_sidebar_layout:
+        return "sidebar-sync-off"
+    if len(config.profiles) != 1 or not config.profiles[0].is_default:
+        return "needs-one-default-profile"
+    return None
+
+
 def request_adoption(state_dir: Path, source_scope: str) -> None:
     """Make one account's pins and groups the source of truth at the next closed-Claude sync."""
 
@@ -1008,10 +1031,10 @@ class LayoutSynchronizer:
     def accounts(self, target_sessions: Mapping[str, Set[str]]) -> List[SidebarAccount]:
         """The default profile's accounts as rows. Works while Claude is open."""
 
-        defaults = [profile for profile in self.config.profiles if profile.is_default]
-        if len(defaults) != 1:
-            raise LayoutError("choose the single default data profile before listing accounts")
-        with self._database_copy(defaults[0].data_root) as database:
+        blocker = main_account_blocker(self.config)
+        if blocker is not None:
+            raise LayoutError(MAIN_ACCOUNT_BLOCKERS[blocker])
+        with self._database_copy(self.config.profiles[0].data_root) as database:
             records = {key: database.get(key) for key in LAYOUT_KEYS}
             owner = _owner_account(database.get_optional(SYNC_OWNER_KEY))
         return sidebar_accounts(records, target_sessions, owner)
@@ -1030,12 +1053,9 @@ class LayoutSynchronizer:
         if not adopt_current_sidebar and adopt_source_scope is None:
             adopt_source_scope = read_pending_adoption(self.config.state_dir)
             pending = adopt_source_scope is not None
-        if (adopt_current_sidebar or adopt_source_scope is not None) and (
-            len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
-        ):
-            raise LayoutError(
-                "choose the single default data profile before adopting its current sidebar"
-            )
+        blocker = main_account_blocker(self.config)
+        if (adopt_current_sidebar or adopt_source_scope is not None) and blocker is not None:
+            raise LayoutError(MAIN_ACCOUNT_BLOCKERS[blocker])
         return adopt_source_scope, pending
 
     def _plan_profile(

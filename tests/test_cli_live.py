@@ -432,7 +432,7 @@ class LiveCliTests(ChatCliFixture):
         self.assertIn("sidebar-sync-off", out)
 
 
-    def install(self, answers, *, tty=True, output_tty=True):
+    def install(self, answers, *, tty=True, output_tty=True, second_profile=False):
         from claude_session_sync.installer import InstallReport
 
         test = self
@@ -447,11 +447,16 @@ class LiveCliTests(ChatCliFixture):
             ],
             "state_dir": str(self.config.state_dir),
             "retention": 5,
-            "acknowledge_cross_profile_copy": False,
+            "acknowledge_cross_profile_copy": second_profile,
             "acknowledge_cross_account_copy": True,
             "target_policy": "logins",
             "claude_executable": str(self.config.claude_executable),
         }
+        if second_profile:
+            document["profiles"].append(
+                {"name": "Personal", "data_root": str(self.root / "Personal"), "launch_command": ["open"],
+                 "is_default": False}
+            )
         config_path = self.root / "config.json"
         config_path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -562,6 +567,29 @@ class LiveCliTests(ChatCliFixture):
             code, out = self.install("2\n")
 
         self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
+    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled(self):
+        from dataclasses import replace
+
+        self.config = replace(
+            self.config,
+            profiles=self.config.profiles + (Profile("Personal", self.root / "Personal", ("open",), False),),
+            acknowledge_cross_profile_copy=True,
+            sync_sidebar_layout=True,
+        )
+        reason = "a main account works only with exactly one Claude profile enabled, the default one"
+        with self.two_grouped_accounts():
+            code, out, _errors = self.cli("keep-sidebar", "--account", "2", "--apply")
+            self.assertEqual(
+                (1, reason + "\nstate=blocked reason=needs-one-default-profile\n"), (code, out)
+            )
+            self.assertIsNone(self.pending())
+
+            code, out = self.install("2\n", second_profile=True)
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertIn("\nSkipped the main-account question: {}.\n".format(reason), out)
         self.assertNotIn("Which account", out)
 
     def test_no_question_once_an_account_was_adopted(self):
