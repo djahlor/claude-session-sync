@@ -63,6 +63,31 @@ Receipts use aggregate counts; diagnostic error details can include local paths.
 
 The standard setup launches Claude normally with no `--user-data-dir`.
 
+## Limits
+
+Sync reads and writes Claude Desktop's private files. Anthropic documents none
+of them and can change any of them in an update. These changes would break
+sync:
+
+- A new key or record shape for pins and groups in Claude's Local Storage
+  database. This is the most likely break, because sync writes three exact
+  records there.
+- A new field, version, or location for routines in `scheduled-tasks.json`.
+- A new folder layout or file name under
+  `claude-code-sessions/<account>/<workspace>/`, or a new shape inside
+  `local_<session>.json`.
+- A new way of naming account and workspace folders, or a new sign-in line in
+  Claude's `main.log`. A new account would then not join sync.
+
+Sync never guesses at a format it does not know. It stops the affected part
+and writes nothing there. An unreadable chat is left alone and reported. A
+folder layout it does not know stops chat sync with `state=blocked_invalid`.
+An unknown pins, groups, or routines record skips that update with
+`reason=unsafe-layout` or `reason=unsafe-routines`. The other parts still
+sync, `status` reports `needs-attention`, and `doctor` shows which part failed.
+The last full check on a copy of real data used Claude Desktop 1.46388.4, in
+September 2026.
+
 ## Install
 
 For the easiest install, download the repository, double-click
