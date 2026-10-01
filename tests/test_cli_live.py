@@ -569,7 +569,7 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual((0, None), (code, self.pending()))
         self.assertNotIn("Which account", out)
 
-    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled(self):
+    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled_until_setup_drops_one(self):
         from dataclasses import replace
 
         self.config = replace(
@@ -586,11 +586,13 @@ class LiveCliTests(ChatCliFixture):
             )
             self.assertIsNone(self.pending())
 
+            # Setup drops the retired second profile before it asks, so the
+            # install question applies and records the choice.
             code, out = self.install("2\n", second_profile=True)
 
-        self.assertEqual((0, None), (code, self.pending()))
-        self.assertIn("\nSkipped the main-account question: {}.\n".format(reason), out)
-        self.assertNotIn("Which account", out)
+        self.assertEqual(0, code)
+        self.assertIsNotNone(self.pending())
+        self.assertIn("Which account is the main one?", out)
 
     def test_no_question_once_an_account_was_adopted(self):
         state_dir = self.config.state_dir
