@@ -15,10 +15,10 @@ read -r choice
 
 case "$choice" in
   1)
-    exec "$script_dir/install.sh" --automatic-targets --sync-layout --sync-routines --disable-personal
+    exec "$script_dir/install.sh" --automatic-targets --sync-layout --sync-routines
     ;;
   2)
-    exec "$script_dir/install.sh" --sync-layout --sync-routines --disable-personal
+    exec "$script_dir/install.sh" --sync-layout --sync-routines
     ;;
   *)
     echo "No changes made. Run the installer again and choose 1 or 2." >&2

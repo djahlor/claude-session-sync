@@ -61,7 +61,6 @@ class ReplaceRecord:
     session_id: str
     source: str
     target: str
-    keep: bool  # the replaced copy holds state found nowhere else
 
 
 @dataclass(frozen=True)

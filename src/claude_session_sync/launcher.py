@@ -3,35 +3,31 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any, Callable, Sequence
+from typing import Sequence
 
 
 LAUNCH_TIMEOUT_SECONDS = 10.0
 
 
 class LaunchError(RuntimeError):
-    """The launch command could not start, or it exited with a failure."""
+    """The launch command could not start, failed, or did not finish in time."""
 
 
 class Launcher:
-    """Small subprocess boundary that accepts an argv sequence, never a shell."""
+    """Run a profile's launch command as an argv list, never through a shell.
 
-    def __init__(
-        self,
-        popen: Callable[..., Any] = subprocess.Popen,
-        timeout: float = LAUNCH_TIMEOUT_SECONDS,
-    ) -> None:
-        self._popen = popen
+    Every launch command is `open`, which returns once macOS has started Claude.
+    """
+
+    def __init__(self, timeout: float = LAUNCH_TIMEOUT_SECONDS) -> None:
         self._timeout = timeout
 
-    def launch(self, command: Sequence[str]) -> Any:
-        if not command or any(
-            not isinstance(part, str) or not part for part in command
-        ):
-            raise ValueError("launch command must be a non-empty argv sequence")
+    def launch(self, command: Sequence[str]) -> None:
         try:
-            process = self._popen(
+            subprocess.run(
                 list(command),
+                check=True,
+                timeout=self._timeout,
                 close_fds=True,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
@@ -40,13 +36,9 @@ class Launcher:
             )
         except OSError as error:
             raise LaunchError("launch command could not start") from error
-        try:
-            status = process.wait(timeout=self._timeout)
-        except subprocess.TimeoutExpired:
-            # `open` returns once macOS has started the app. A profile whose
-            # command is the Claude executable itself never returns, so a
-            # command still running here has launched and is left running.
-            return process
-        if status != 0:
-            raise LaunchError("launch command exited with status {}".format(status))
-        return process
+        except subprocess.CalledProcessError as error:
+            raise LaunchError(
+                "launch command exited with status {}".format(error.returncode)
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise LaunchError("launch command did not finish in time") from error

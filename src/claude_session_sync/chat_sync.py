@@ -6,7 +6,6 @@ vinlim/claude-desktop-sync (0BSD); the writes go through this project's
 journaled transaction engine.
 """
 
-import inspect
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -43,7 +42,9 @@ def plan_chat_sync(
     """Plan without writing anything, including the state file."""
 
     state = _load(config)
-    plan = _plan(planner, config, state, prefer, prefer_session)
+    plan = planner.plan(
+        SyncRequest(config), state=state, prefer=prefer, prefer_session=prefer_session
+    )
     return _summary(plan)
 
 
@@ -59,12 +60,10 @@ def run_chat_sync(
     path = state_path(config.state_dir)
     state = _load(config)
     on_disk = encode_state(state)
-    plan = _plan(planner, config, state, prefer, prefer_session)
+    plan = planner.plan(
+        SyncRequest(config), state=state, prefer=prefer, prefer_session=prefer_session
+    )
     context = plan.context
-    if context is None:
-        # A planner without chat state: apply as the engine always did.
-        receipt = engine.apply(plan) if not plan.invalid_replicas else None
-        return ChatRun(plan, receipt)
     if plan.invalid_replicas:
         return _summary(plan)
 
@@ -133,19 +132,6 @@ def _load(config):
         raise ChatStateError(str(error)) from error
 
 
-def _plan(planner, config, state, prefer, prefer_session) -> Plan:
-    request = SyncRequest(config)
-    try:
-        parameters = inspect.signature(planner.plan).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    if "state" not in parameters:
-        if prefer is not None or prefer_session is not None:
-            raise ValueError("this planner cannot settle ties")
-        return planner.plan(request)
-    return planner.plan(request, state=state, prefer=prefer, prefer_session=prefer_session)
-
-
 def _settle(sync, snapshots):
     from .rules import settle
 
@@ -153,11 +139,9 @@ def _settle(sync, snapshots):
 
 
 def _summary(plan: Plan) -> ChatRun:
-    context = plan.context
     run = ChatRun(plan)
     run.problems = dict(Counter(problem.kind for problem in plan.problems))
-    if context is not None:
-        run.newly_enrolled = len(context.newly_enrolled)
+    run.newly_enrolled = len(plan.context.newly_enrolled)
     return run
 
 

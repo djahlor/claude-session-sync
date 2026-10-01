@@ -17,6 +17,12 @@ class UnsafePathError(OSError):
     """Raised when transaction data is not a regular, non-symlink file."""
 
 
+def normalized_path(path: PathLike) -> Path:
+    """The absolute path with ~ expanded. Symlinks are not resolved."""
+
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
 def ensure_private_directory(path: PathLike) -> Path:
     directory = Path(path)
     missing = []

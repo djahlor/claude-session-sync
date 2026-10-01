@@ -84,6 +84,19 @@ class RecordJournalTests(unittest.TestCase):
         )
         return path
 
+    def test_an_open_journal_in_the_old_format_stops_recovery_and_writes_nothing(self):
+        self.root.mkdir()
+        (self.root / "old.json").write_text(json.dumps({
+            "version": 1,
+            "state": "PREPARED",
+            "records": [{"path": "a", "before": None, "after_sha256": digest(b"new-a")}],
+        }))
+
+        with self.assertRaisesRegex(RecordRecoveryError, "version is unsupported"):
+            self.journal().recover()
+
+        self.assertEqual(([], {"a": b"old-a", "b": b"old-b"}), (self.writes, self.values))
+
     def test_commit_preserves_exact_preimages_and_hashes(self):
         before = {"a": b' {"x": 1} \n', "b": None}
         self.values = {"a": before["a"]}

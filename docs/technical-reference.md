@@ -63,6 +63,31 @@ Receipts use aggregate counts; diagnostic error details can include local paths.
 
 The standard setup launches Claude normally with no `--user-data-dir`.
 
+## Limits
+
+Sync reads and writes Claude Desktop's private files. Anthropic documents none
+of them and can change any of them in an update. These changes would break
+sync:
+
+- A new key or record shape for pins and groups in Claude's Local Storage
+  database. This is the most likely break, because sync writes three exact
+  records there.
+- A new field, version, or location for routines in `scheduled-tasks.json`.
+- A new folder layout or file name under
+  `claude-code-sessions/<account>/<workspace>/`, or a new shape inside
+  `local_<session>.json`.
+- A new way of naming account and workspace folders, or a new sign-in line in
+  Claude's `main.log`. A new account would then not join sync.
+
+Sync never guesses at a format it does not know. It stops the affected part
+and writes nothing there. An unreadable chat is left alone and reported. A
+folder layout it does not know stops chat sync with `state=blocked_invalid`.
+An unknown pins, groups, or routines record skips that update with
+`reason=unsafe-layout` or `reason=unsafe-routines`. The other parts still
+sync, `status` reports `needs-attention`, and `doctor` shows which part failed.
+The last full check on a copy of real data used Claude Desktop 1.46388.4, in
+September 2026.
+
 ## Install
 
 For the easiest install, download the repository, double-click
@@ -72,18 +97,24 @@ syncs chats, Code routines, pins, and groups when the account changes or Claude
 quits. It uses the macOS system Python and does not install Python packages
 globally.
 
+If two or more accounts already have custom groups, the installer then asks
+which account is the main one. The other accounts copy its pins and groups the
+next time Claude closes. `setup --ask-main-account` asks only in a terminal and
+only before any account was adopted. It asks before the watcher starts, so no
+sync can run first.
+
 The same setup can run from Terminal:
 
 ```sh
-./install.sh --automatic-targets --sync-layout --sync-routines --disable-personal
+./install.sh --automatic-targets --sync-layout --sync-routines
 ```
 
 From this directory:
 
 ```sh
 python3 -m pip install .
-claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --dry-run
-claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --apply
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --dry-run
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --apply
 ```
 
 The per-user installer creates:
@@ -149,7 +180,7 @@ attention, and the last successful sync time. A missing or interrupted run is ne
 menu-bar status item and a non-activating status window show progress without
 depending on macOS notification permissions.
 
-Safe mode and non-default profile apps still sync after a manual quit.
+Safe mode still syncs after a manual quit.
 
 Manual commands remain available:
 
@@ -158,27 +189,26 @@ claude-session-sync sync
 claude-session-sync sync --json
 ```
 
-### Existing separate-profile installations
+### Switch from the command line
 
-The installer no longer offers separate Work and Personal apps. Existing
-profiles and these commands remain supported; this change deletes no data.
-For normal account switching, use the workflow above.
+Older versions offered separate Work and Personal apps. `setup` moves those
+apps into the backup folder and removes the Personal profile from the config.
+Its `Claude-Personal` data folder stays on disk and no longer syncs.
+The watcher runs `switch` after an account change. It also runs by hand:
 
 ```sh
 claude-session-sync switch Work
-claude-session-sync switch Personal
-claude-session-sync switch Personal --no-launch
+claude-session-sync switch Work --no-launch
 claude-session-sync switch Work --wait-for-exit 15
 ```
 
 Without `--wait-for-exit`, `switch` refuses to proceed if any managed Claude
-process is open. Installed app wrappers use a bounded 15-second wait so they can
-be clicked while the previous account is still shutting down. After exit,
-`switch` safely waits for an automatic writer and replans if that writer commits
-first; a separate handoff lock ensures simultaneous wrapper clicks cannot
-launch two profiles. The wait uses a wall-clock deadline and a bounded process
-probe, so slow process inspection cannot silently extend the advertised limit.
-It launches the selected profile after synchronization, even when the sync failed.
+process is open. With it, `switch` waits that many seconds for Claude to finish
+quitting. After exit, `switch` waits up to 15 seconds for another writer to
+finish, then plans again and syncs. A separate handoff lock stops two switches
+at once from both launching Claude. The wait uses a wall-clock deadline and a
+bounded process probe, so slow process inspection cannot extend the limit.
+`switch` launches Claude after the sync, even when the sync failed.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
 returns success with `state=waiting` and `reason=claude-open`. If Claude opens
 again after the chats synced but before pins, groups, or routines did, those
@@ -200,8 +230,8 @@ After the sync, `switch` runs the profile's launch command, even when the sync
 failed, so a switch never leaves Claude closed. A failed sync still exits
 nonzero with its result and `launch=started`. `switch` returns
 `state=launch_failed` only when the launch command cannot start or exits with
-an error. A command still running after 10 seconds counts as launched, because a
-profile can launch the Claude executable itself. A failed or slow launch leaves
+an error, or is still running after 10 seconds. The launch command is `open`,
+which returns once macOS has started Claude. A failed or slow launch leaves
 nothing behind that blocks the next switch. Older versions could leave a
 `launch-pending.json` file after a slow launch. `setup` removes it.
 
@@ -210,8 +240,10 @@ notifications and runs one `auto` check at load. If Claude is open then, that
 check writes nothing and the next quit or switch syncs. It coalesces termination bursts,
 uses bounded retries during shutdown, and persists a private aggregate status
 receipt. Completion and attention notifications contain no chat data.
-`status` surfaces watcher failure; `doctor` probes current routine data and a
-private copy of the sidebar database while Claude is closed. Successful adapter
+`status` surfaces watcher failure; `doctor` probes current routine data and,
+while Claude is closed, plans the sidebar sync that runs when Claude closes on
+a private copy of the sidebar database, with the same signed-in account and
+pending choice. Successful adapter
 checks record the installed Desktop build without imposing a version allowlist.
 Planning uses cached content hashes, unchanged syncs are no-ops, and copies are
 staged and atomically replaced. In a copy-only check on the development Mac,
@@ -225,61 +257,36 @@ the remaining processes during its retry window. The finished notification and
 the status receipt show when sync has completed; they do not make Claude shut
 down faster.
 
-The installer detects the legacy `com.djahlor.claude-session-sync` LaunchAgent,
-stops it, and moves its plist into the backup area before activating the new
-watcher. If activation fails, it restores and restarts that legacy agent.
-
 ## Pins and custom groups
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
-store record. It checks their shapes and safely merges a group that appears in
-only one record during Claude shutdown. Conflicting group IDs, names, or
-assignments still stop the layout write.
+store record. It checks their shapes and stops on anything it does not know.
+Pins are one list shared by every account, keyed by chat ID, so they stay as
+they are. Custom groups belong to one account and workspace each, and sync
+copies one account's groups, chat assignments, and group order to the others.
+[Pins and groups across accounts](#pins-and-groups-across-accounts) says which
+account is the source.
 
-On first use, existing group names are combined and added to every discovered
-account/workspace scope. Unambiguous chat assignments are copied by group name.
-Later syncs compare folder placements with the last successful snapshot. Only
-placements from sync targets that still contain the chat can supply a move. A move
-to one different folder is copied to the other accounts, even if the account you
-just signed into still has the old placement. Empty state is treated as missing
-data, not a request to remove a chat from its folder.
-
-If two accounts move the same chat to different folders, or older placements
-disagree without a shared snapshot, those placements stay separate. To resolve
-these conflicts using the folders in your current sidebar, quit Claude and run:
-
-```sh
-claude-session-sync sync --prefer-current-sidebar
-```
-
-This recovery command requires one configured data profile. It uses the current
-sidebar only for conflicting chats present and grouped in that account. Other
-conflicts remain untouched and are counted as `ambiguous_assignments`. Changes
-and the new snapshot use the normal recovery journal. Future single-folder moves
-then sync automatically. A private snapshot also restores pins and groups if a
-new account starts with empty sidebar state.
-
-Claude also syncs the group list through its account settings. Restoring only
-the local records is not enough: on startup, the server's older list can remove
-restored groups and their local chat assignments. When a restore changes the
-active scope's group list, the adapter sets Claude's account-scoped
-`ccd-sync-pending:ccd/dframe-store` migration marker. Claude then merges the
-restored groups into its own settings sync, taking unrelated preferences from
-the server. Group names therefore also reach that signed-in Claude account;
-this step does not upload local chat messages.
+Claude also syncs the group list through its account settings. Copying only
+the local records is not enough. On startup, the server's older list replaces
+copied groups and drops their local chat assignments. When a sync copies groups
+into the signed-in account, the adapter sets Claude's account-scoped
+`ccd-sync-pending:ccd/dframe-store` upload marker. Claude then uploads the copy
+as that account's own groups. Group names therefore also reach that signed-in
+Claude account; this step does not upload local chat messages.
 
 The marker is committed and backed up with the layout records. The adapter
 requires an exact account-owner match and refuses a quarantined or differently
 scoped pending update, including when only an inactive scope changes. If a
-restore would change a scope with pending user edits, it leaves the payload and
+copy would change a scope with pending user edits, it leaves the payload and
 snapshot unchanged until Claude sends those edits. Crash recovery can recognize
-a consumed migration marker without rolling
-back a completed restore, but only when the other records match the completed
-transaction. It never changes identity markers, credentials, or other
-account settings. Clients without enabled account settings sync keep the local
-path. This is a private Claude protocol, verified against the installed Desktop
-build, not a supported public API or a guarantee against future changes.
+a consumed marker without rolling back a completed write, but only when the
+other records match the completed transaction. It never changes identity
+markers, credentials, or other account settings. Clients without enabled
+account settings sync keep the local path. This is a private Claude protocol,
+verified against the installed Desktop build, not a supported public API or a
+guarantee against future changes.
 
 ## How chat sync decides
 
@@ -352,19 +359,46 @@ settings on Anthropic's servers. At sign-in Claude replaces the local list with
 the server list. So pins and groups can only be carried between accounts with
 Claude closed, and the new account must then upload the copy.
 
-- **One source of truth.** After an adoption, one account's organization is the
-  source. The signed-in account wins when Claude closes normally.
+- **One source of truth.** One account's groups are the source, and the other
+  accounts copy them. A private snapshot records which account that was.
+- **The first sync.** It copies the account chosen at install. With no choice,
+  it copies the signed-in account if it has groups, or else the only account
+  that has groups. If no account has groups yet, nothing changes and the
+  layout result says `reason=no-groups-yet`.
+- **The main account at install.** When two or more accounts have groups, the
+  installer lists them and asks which one is the main one. Press Enter to keep
+  the account you are signed into.
+- **After that.** The signed-in account wins when Claude closes normally.
 - **Account switches.** The watcher restarts Claude once after every switch
   and runs `switch <profile> --after-account-switch`.
   The account just left holds the newest organization, so it is copied into the
-  new account, which is then marked for a canonical upload to its servers.
+  new account, which is then marked for an upload to its servers.
 - **Deletes stick.** A deleted group is gone from every account after the next
-  sync; nothing is merged back from older copies.
-- **A choice when unclear.** If the signed-in account's groups changed without
-  a switch restart, sync stops and asks. `claude-session-sync keep-sidebar
-  --apply` marks the signed-in account as the source for the next time Claude
-  closes, and `restart-claude` does that restart.
+  sync; nothing is merged back from older copies. An account with no groups is
+  never copied over another, so when the main account deletes its last group,
+  nothing changes and the layout result says `reason=main-account-has-no-groups`.
+  The next group it gets is copied as usual.
+- **A choice when unclear.** If you signed in to another account without the
+  switch restart, and that account has groups, sync stops with
+  `reason=choose-main-account`. The same happens on a first sync when the
+  signed-in account is empty and two other accounts have groups.
 - **Accounts not yet synced** are left alone.
+
+To see the accounts and choose the main one yourself, run:
+
+```sh
+claude-session-sync keep-sidebar --dry-run
+claude-session-sync keep-sidebar --account 2 --apply
+claude-session-sync restart-claude
+```
+
+`--dry-run` prints one numbered row per account the next sync uses, with
+whether it is signed in and its group, pin, and chat counts. Accounts have no
+names on disk, so a row shows an 8-character ID prefix only when two rows would
+otherwise look the same. It reads a private copy of Claude's database, so it
+works while Claude is open. `--apply` makes that row the source the next time
+Claude closes, and without `--account` it keeps the signed-in account.
+`restart-claude` quits Claude, syncs, and reopens it now.
 
 ## Claude Code routines
 
@@ -400,7 +434,8 @@ Routine and sidebar errors are separate. A malformed routine manifest returns
 `routines={'state': 'skipped', 'reason': 'unsafe-routines', 'detail': '...'}`.
 A malformed or changed sidebar format returns
 `layout={'state': 'skipped', 'reason': 'unsafe-layout', 'detail': '...'}` after
-the chat result. Details name the failed safety check without exposing chat or
+the chat result. When only you can say which account's groups to keep, it
+returns `reason=choose-main-account` and the detail names `keep-sidebar`. Details name the failed safety check without exposing chat or
 account IDs. No affected record is written. If verification fails after a
 write, the tool restores exact preimages. A failed restore creates
 `RECOVERY_REQUIRED` state and stops later writes for that adapter.
@@ -460,9 +495,10 @@ claude-session-sync uninstall --dry-run
 claude-session-sync uninstall --apply
 ```
 
-Uninstall removes only generated wrappers, watcher, and LaunchAgent by moving
-them into the tool's backup area. It preserves the private config, transaction
-state, and the original Claude application for recovery.
+Uninstall removes only the generated runtime, watcher, sidebar helper, and
+LaunchAgent by moving them into the tool's backup area. It preserves the
+private config, transaction state, and the original Claude application for
+recovery.
 
 ## Development
 

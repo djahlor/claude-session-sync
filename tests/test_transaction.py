@@ -33,7 +33,7 @@ def digest(data: bytes) -> str:
 def make_plan(source: Path, destination: Path, destination_before: Optional[bytes]):
     source_bytes = source.read_bytes()
     operation = SimpleNamespace(
-        kind="copy",
+        kind="create" if destination_before is None else "replace",
         session_id="session-1",
         source=source,
         destination=destination,
@@ -45,7 +45,6 @@ def make_plan(source: Path, destination: Path, destination_before: Optional[byte
     )
     return SimpleNamespace(
         operations=(operation,),
-        conflicts=(),
         invalid_replicas=(),
         plan_id="plan-1",
     )
@@ -113,7 +112,6 @@ class TransactionEngineTests(unittest.TestCase):
             root = Path(directory)
             plan = SimpleNamespace(
                 operations=(),
-                conflicts=(),
                 invalid_replicas=(),
                 plan_id="plan-noop",
             )
@@ -263,13 +261,12 @@ class TransactionEngineTests(unittest.TestCase):
             for file_path in private_files:
                 self.assertEqual(stat.S_IMODE(file_path.stat().st_mode), 0o600)
 
-    def test_plan_with_conflicts_is_blocked_without_creating_state(self) -> None:
+    def test_plan_with_invalid_replicas_is_blocked_without_creating_state(self) -> None:
         with tempfile.TemporaryDirectory() as root_string:
             root = Path(root_string)
             blocked_plan = SimpleNamespace(
                 operations=(),
-                conflicts=(SimpleNamespace(reason="divergent"),),
-                invalid_replicas=(),
+                invalid_replicas=(SimpleNamespace(reason="symlink is not allowed"),),
                 plan_id="blocked-plan",
             )
 
@@ -445,7 +442,6 @@ class TransactionEngineTests(unittest.TestCase):
                 operations.append(make_plan(source, destination, None).operations[0])
             bulk_plan = SimpleNamespace(
                 operations=tuple(operations),
-                conflicts=(),
                 invalid_replicas=(),
                 plan_id="bulk-plan",
             )

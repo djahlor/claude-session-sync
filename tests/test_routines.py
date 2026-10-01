@@ -295,12 +295,14 @@ class RoutineSynchronizerTests(unittest.TestCase):
         journal_root = self.config.state_dir / "routine-runs"
         journal_root.mkdir(parents=True)
         journal = {
-            "version": 1,
+            "version": 2,
             "state": "PREPARED",
             "records": [
                 {
-                    "path": str(path),
+                    "target": str(path),
                     "before": base64.b64encode(original).decode("ascii"),
+                    "after": base64.b64encode(after).decode("ascii"),
+                    "before_sha256": hashlib.sha256(original).hexdigest(),
                     "after_sha256": hashlib.sha256(after).hexdigest(),
                 }
                 for path in (first_path, second_path)

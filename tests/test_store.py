@@ -204,21 +204,67 @@ class HashCacheTests(unittest.TestCase):
 
             self.assertEqual([malformed], reads)
 
-    def test_invalidates_when_same_size_file_changes_with_preserved_mtime(self) -> None:
+    def test_a_same_size_rewrite_that_keeps_the_mtime_is_read_again(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = root / "replica.json"
-            path.write_bytes(b'{"sessionId":"one"}')
-            original = path.stat()
+            store_tests = StoreTests()
+            config = store_tests.config(root)
+            written = store_tests.write_session(
+                root / "standard", "account", "workspace", "cached", {"title": "aaaa"}
+            )
+            os.utime(written, ns=(1_000_000_000, 1_000_000_000))
             cache = HashCache(root / "state" / "hashes.sqlite3")
-            first = cache.digest(path)
+            store = SessionStore(cache)
+            first = store.discover(config).replicas[0]
 
-            path.write_bytes(b'{"sessionId":"two"}')
-            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
-            second = cache.digest(path)
+            store_tests.write_session(
+                root / "standard", "account", "workspace", "cached", {"title": "bbbb"}
+            )
+            os.utime(written, ns=(1_000_000_000, 1_000_000_000))
+            second = store.discover(config).replicas[0]
             cache.close()
 
-            self.assertNotEqual(first, second)
+            self.assertEqual(first.size, second.size)
+            self.assertNotEqual(first.state_hash, second.state_hash)
+
+    def test_a_cache_from_an_older_version_is_rebuilt_and_never_trusted(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_tests = StoreTests()
+            config = store_tests.config(root)
+            written = store_tests.write_session(
+                root / "standard", "account", "workspace", "cached", {"title": "real"}
+            )
+            os.utime(written, ns=(1_000_000_000, 1_000_000_000))
+            cache_path = root / "state" / "hashes.sqlite3"
+            cache_path.parent.mkdir(mode=0o700)
+            metadata = written.stat()
+            old = sqlite3.connect(str(cache_path))
+            old.execute(
+                "CREATE TABLE file_hashes (path TEXT NOT NULL, size INTEGER NOT NULL, "
+                "mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, inode INTEGER NOT NULL, "
+                "session_id TEXT, digest TEXT NOT NULL, state_hash TEXT, activity INTEGER, "
+                "normalisation TEXT, PRIMARY KEY (path, size, mtime_ns, ctime_ns, inode))"
+            )
+            from claude_session_sync.fingerprint import normalisation
+
+            old.execute(
+                "INSERT INTO file_hashes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(written), metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+                 metadata.st_ino, "cached", "0" * 64, "stale", 7, normalisation()),
+            )
+            old.execute("PRAGMA user_version = 1")
+            old.commit()
+            old.close()
+
+            cache = HashCache(cache_path)
+            replica = SessionStore(cache).discover(config).replicas[0]
+            cache.close()
+
+            self.assertNotEqual("0" * 64, replica.digest)
+            self.assertNotEqual("stale", replica.state_hash)
 
 
 if __name__ == "__main__":

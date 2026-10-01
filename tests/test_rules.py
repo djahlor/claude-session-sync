@@ -82,24 +82,24 @@ class OneSideChangedTests(unittest.TestCase):
             state(agreed={X: "v1"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
-    def test_a_change_without_new_activity_still_wins_and_the_old_copy_is_kept(self):
+    def test_a_change_without_new_activity_still_wins(self):
         # A rename or an archive moves no activity.
         result = planned(
             [snapshot("A", {X: copy("v1", 50)}), snapshot("B", {X: copy("renamed", 50)})],
             state(agreed={X: "v1"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
-    def test_a_copy_that_went_back_in_time_never_wins_and_is_kept(self):
+    def test_a_copy_that_went_back_in_time_never_wins(self):
         result = planned(
             [snapshot("A", {X: copy("older", 10)}), snapshot("B", {X: copy("v2", 50)})],
             state(agreed={X: "v2"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
     def test_file_time_plays_no_part_so_a_clicked_stale_copy_never_wins(self):
         result = planned(
@@ -107,7 +107,7 @@ class OneSideChangedTests(unittest.TestCase):
             state(agreed={X: "v1"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
     def test_with_three_partitions_every_unchanged_copy_is_replaced(self):
         result = planned(
@@ -122,25 +122,25 @@ class OneSideChangedTests(unittest.TestCase):
         self.assertEqual(
             result.actions,
             [
-                ReplaceRecord(X, source="B", target="A", keep=False),
-                ReplaceRecord(X, source="B", target="C", keep=False),
+                ReplaceRecord(X, source="B", target="A"),
+                ReplaceRecord(X, source="B", target="C"),
             ],
         )
 
 
 class BothSidesChangedTests(unittest.TestCase):
-    def test_the_copy_with_later_activity_wins_and_the_loser_is_kept(self):
+    def test_the_copy_with_later_activity_wins(self):
         result = planned(
             [snapshot("A", {X: copy("v2", 10)}), snapshot("B", {X: copy("v3", 50)})],
             state(agreed={X: "v1"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
     def test_first_contact_with_differing_copies_is_decided_the_same_way(self):
         result = planned([snapshot("A", {X: copy("v1", 90)}), snapshot("B", {X: copy("v2", 50)})])
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B")])
 
     def test_a_tie_is_left_alone_and_reported_for_every_copy(self):
         result = planned(
@@ -174,14 +174,14 @@ class BothSidesChangedTests(unittest.TestCase):
         self.assertEqual(result.actions, [CreateRecord(Y, source="A", target="B")])
         self.assertEqual({problem.session_id for problem in result.problems}, {X})
 
-    def test_prefer_settles_a_tie_and_keeps_the_loser(self):
+    def test_prefer_settles_a_tie(self):
         result = planned(
             [snapshot("A", {X: copy("v2", 50)}), snapshot("B", {X: copy("v3", 50)})],
             state(agreed={X: "v1"}),
             prefer="B",
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
         self.assertEqual(result.problems, [])
 
     def test_prefer_can_be_limited_to_one_session(self):
@@ -195,7 +195,7 @@ class BothSidesChangedTests(unittest.TestCase):
             prefer_session=Y,
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(Y, source="B", target="A", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(Y, source="B", target="A")])
         self.assertEqual({problem.session_id for problem in result.problems}, {X})
 
     def test_prefer_does_not_override_a_clear_winner(self):
@@ -205,7 +205,7 @@ class BothSidesChangedTests(unittest.TestCase):
             prefer="B",
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B")])
 
     def test_among_three_versions_the_latest_activity_replaces_both_others(self):
         result = planned(
@@ -220,8 +220,8 @@ class BothSidesChangedTests(unittest.TestCase):
         self.assertEqual(
             result.actions,
             [
-                ReplaceRecord(X, source="B", target="A", keep=True),
-                ReplaceRecord(X, source="B", target="C", keep=False),
+                ReplaceRecord(X, source="B", target="A"),
+                ReplaceRecord(X, source="B", target="C"),
             ],
         )
 
@@ -235,7 +235,7 @@ class BothSidesChangedTests(unittest.TestCase):
             state(agreed={X: "v1"}),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="C", keep=True)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="C")])
 
 
 class PlacementTests(unittest.TestCase):
@@ -252,8 +252,8 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(
             result.actions,
             [
-                ReplaceRecord(X, source="A", target="B", keep=True),
-                ReplaceRecord(X, source="A", target="C", keep=True),
+                ReplaceRecord(X, source="A", target="B"),
+                ReplaceRecord(X, source="A", target="C"),
             ],
         )
         self.assertEqual(result.problems, [])
@@ -427,7 +427,7 @@ class RecordWinsTests(unittest.TestCase):
         self.assertEqual(
             result.actions,
             [
-                ReplaceRecord(X, source="A", target="B", keep=False),
+                ReplaceRecord(X, source="A", target="B"),
                 RetireTombstone(X, target="A"),
             ],
         )
@@ -451,7 +451,7 @@ class UnknownVersionTests(unittest.TestCase):
             state(synced={"A": {X: "renamed"}}, folders=""),
         )
 
-        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
     def test_a_chat_used_after_a_delete_is_not_recreated_where_it_was_lost(self):
         result = planned(

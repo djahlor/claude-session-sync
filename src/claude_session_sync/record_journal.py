@@ -37,26 +37,11 @@ def digest(value: Optional[bytes]) -> Optional[str]:
     return None if value is None else hashlib.sha256(value).hexdigest()
 
 
-def valid_digest(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
 @dataclass(frozen=True)
 class Record:
     target: str
     before: Optional[bytes]
     after: Optional[bytes]
-    after_sha256: Optional[str]
-    legacy: bool = False
-
-    def matches_after(self, value: Optional[bytes]) -> bool:
-        if self.legacy:
-            return value is not None and digest(value) == self.after_sha256
-        return value == self.after
 
 
 class RecordJournal:
@@ -70,7 +55,6 @@ class RecordJournal:
         validate: Callable[[str], None],
         before_mutation: Callable[[], None],
         retention: int,
-        legacy_loader: Optional[Callable[[Mapping[str, Any]], Sequence[Record]]] = None,
         recovery_equivalent: Optional[
             Callable[[str, Optional[bytes], Optional[bytes]], bool]
         ] = None,
@@ -82,7 +66,6 @@ class RecordJournal:
         self.validate = validate
         self.before_mutation = before_mutation
         self.retention = max(1, retention)
-        self.legacy_loader = legacy_loader
         # Used only to settle an entire unchanged payload without writing data.
         # Partial rollback and normal commits always require exact bytes.
         self.recovery_equivalent = recovery_equivalent
@@ -123,38 +106,28 @@ class RecordJournal:
         atomic_write_bytes(path, content)
 
     def _records(self, document: Mapping[str, Any]) -> Sequence[Record]:
-        if document.get("version") == VERSION:
-            raw_records = document.get("records")
-            if not isinstance(raw_records, list) or not raw_records:
-                raise RecordRecoveryError("recovery records are malformed")
-            records = []
-            for raw in raw_records:
-                try:
-                    before = self._decode(raw["before"])
-                    after = self._decode(raw["after"])
-                    if (
-                        digest(before) != raw["before_sha256"]
-                        or digest(after) != raw["after_sha256"]
-                    ):
-                        raise ValueError("record digest mismatch")
-                    records.append(Record(raw["target"], before, after, digest(after)))
-                except (KeyError, ValueError, TypeError) as error:
-                    raise RecordRecoveryError("recovery record is malformed") from error
-        elif document.get("version") == 1 and self.legacy_loader:
-            try:
-                records = list(self.legacy_loader(document))
-            except (KeyError, ValueError, TypeError) as error:
-                raise RecordRecoveryError(
-                    "legacy recovery record is malformed"
-                ) from error
-        else:
+        if document.get("version") != VERSION:
             raise RecordRecoveryError("recovery version is unsupported")
+        raw_records = document.get("records")
+        if not isinstance(raw_records, list) or not raw_records:
+            raise RecordRecoveryError("recovery records are malformed")
+        records = []
+        for raw in raw_records:
+            try:
+                before = self._decode(raw["before"])
+                after = self._decode(raw["after"])
+                if (
+                    digest(before) != raw["before_sha256"]
+                    or digest(after) != raw["after_sha256"]
+                ):
+                    raise ValueError("record digest mismatch")
+                records.append(Record(raw["target"], before, after))
+            except (KeyError, ValueError, TypeError) as error:
+                raise RecordRecoveryError("recovery record is malformed") from error
         seen = set()
         for record in records:
             if not isinstance(record.target, str) or record.target in seen:
                 raise RecordRecoveryError("recovery targets are malformed")
-            if record.legacy and not valid_digest(record.after_sha256):
-                raise RecordRecoveryError("legacy recovery digest is malformed")
             self.validate(record.target)
             seen.add(record.target)
         if not records:
@@ -184,8 +157,7 @@ class RecordJournal:
         # Preflight every target before touching even the first record.
         current = self._current(records)
         if any(
-            current[record.target] != record.before
-            and not record.matches_after(current[record.target])
+            current[record.target] not in (record.before, record.after)
             for record in records
         ):
             raise RecordRecoveryError("recovery found independently changed data")
@@ -208,9 +180,9 @@ class RecordJournal:
     ) -> Tuple[Optional[str], bool]:
         if all(current[item.target] == item.before for item in records):
             return "ROLLED_BACK", False
-        if all(item.matches_after(current[item.target]) for item in records):
+        if all(current[item.target] == item.after for item in records):
             return "COMMITTED", False
-        if self.recovery_equivalent is not None and not any(item.legacy for item in records):
+        if self.recovery_equivalent is not None:
             for phase, attribute in (("ROLLED_BACK", "before"), ("COMMITTED", "after")):
                 if all(self.recovery_equivalent(
                     item.target, getattr(item, attribute), current[item.target]
@@ -261,7 +233,7 @@ class RecordJournal:
             return
         self.recover()
         records = [
-            Record(target, current[target], after, digest(after))
+            Record(target, current[target], after)
             for target, after in sorted(replacements.items())
         ]
         if self._current(records) != {item.target: item.before for item in records}:
@@ -278,7 +250,7 @@ class RecordJournal:
                     "before": self._encode(item.before),
                     "after": self._encode(item.after),
                     "before_sha256": digest(item.before),
-                    "after_sha256": item.after_sha256,
+                    "after_sha256": digest(item.after),
                 }
                 for item in records
             ],
