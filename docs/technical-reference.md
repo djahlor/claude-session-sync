@@ -193,6 +193,7 @@ claude-session-sync sync --json
 
 Older versions offered separate Work and Personal apps. `setup` moves those
 apps into the backup folder and removes the Personal profile from the config.
+Its `Claude-Personal` data folder stays on disk and no longer syncs.
 The watcher runs `switch` after an account change. It also runs by hand:
 
 ```sh

@@ -284,6 +284,19 @@ class InstallerTests(unittest.TestCase):
                 kept = layout.backups_dir / "upgrade" / app.name / "Contents" / "MacOS" / "launcher"
                 self.assertEqual("#!/bin/sh\nexec old-switch {}\n".format(app.stem), kept.read_text())
 
+    def test_uninstall_still_backs_up_old_launcher_apps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = self.september_install(Path(directory))
+
+            removed = Installer(layout, runner=FakeCommandRunner(), backup_id=lambda: "removed").uninstall(
+                dry_run=False
+            )
+
+            self.assertEqual("uninstalled", removed.state)
+            for app in layout.retired_apps:
+                self.assertFalse(app.exists())
+                self.assertTrue((layout.backups_dir / "removed" / app.name / "Contents" / "MacOS" / "launcher").is_file())
+
     def test_a_dry_run_over_a_september_install_lists_the_old_apps_and_changes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = self.september_install(Path(directory))

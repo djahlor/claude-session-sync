@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import ApprovedTarget, Config
@@ -675,11 +676,62 @@ class CliConfigureTests(unittest.TestCase):
                     document,
                     approved_targets=[],
                     profiles=document["profiles"][:1],
-                    acknowledge_cross_profile_copy=False,
                     sync_sidebar_layout=True,
                     sync_code_routines=True,
                 ),
                 json.loads(config_path.read_text(encoding="utf-8")),
+            )
+
+    def test_dropping_the_personal_profile_keeps_a_third_profile_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            document = self.personal_era_config(root, personal_enabled=True)
+            other = {
+                "name": "Other",
+                "data_root": str(root / "Claude-Other"),
+                "launch_command": ["/usr/bin/true"],
+                "is_default": False,
+            }
+            document["profiles"].append(other)
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            errors = io.StringIO()
+
+            exit_code = run(
+                ["--config", str(config_path), "configure", "--apply"],
+                stdout=io.StringIO(),
+                stderr=errors,
+            )
+
+            self.assertEqual((0, ""), (exit_code, errors.getvalue()))
+            self.assertEqual(
+                dict(document, approved_targets=[], profiles=[document["profiles"][0], other]),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
+
+    def test_setup_names_a_malformed_profile_before_it_drops_personal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            document = self.personal_era_config(root, personal_enabled=False)
+            document["profiles"].append("not-a-profile")
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            errors = io.StringIO()
+
+            exit_code = run(
+                ["--config", str(config_path), "setup", "--dry-run"],
+                dependencies=CliDependencies(
+                    installer_factory=lambda _path: SimpleNamespace(
+                        setup=lambda **_options: self.fail("an invalid config must not install")
+                    )
+                ),
+                stdout=io.StringIO(),
+                stderr=errors,
+            )
+
+            self.assertEqual(
+                (1, "claude-session-sync: profile 1 must be a JSON object\n"),
+                (exit_code, errors.getvalue()),
             )
 
 

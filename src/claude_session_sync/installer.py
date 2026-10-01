@@ -670,6 +670,7 @@ class Installer:
 
     def uninstall(self, *, dry_run: bool) -> InstallReport:
         targets = (
+            *self.layout.retired_apps,
             self.layout.launch_agent,
             self.layout.watcher_binary,
             self.layout.layout_helper,

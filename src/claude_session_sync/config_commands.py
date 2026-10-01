@@ -161,20 +161,24 @@ def _apply_config_options(
 
 
 def _drop_personal_profile(document: dict) -> int:
-    """Remove the Personal profile older versions generated, with its targets."""
+    """Remove the Personal profile older versions generated, with its targets.
 
-    profiles = document.get("profiles", [])
-    kept = [profile for profile in profiles if profile.get("name") != "Personal"]
-    if len(kept) == len(profiles):
+    Runs before validation, so it skips entries that are not objects and
+    leaves them for the validator to name.
+    """
+
+    def personal(entry, key: str) -> bool:
+        return isinstance(entry, dict) and entry.get(key) == "Personal"
+
+    profiles = document.get("profiles")
+    if not isinstance(profiles, list) or not any(personal(p, "name") for p in profiles):
         return 0
-    document["profiles"] = kept
-    if "approved_targets" in document:
+    document["profiles"] = [profile for profile in profiles if not personal(profile, "name")]
+    targets = document.get("approved_targets")
+    if isinstance(targets, list):
         document["approved_targets"] = [
-            target
-            for target in document["approved_targets"]
-            if target.get("profile") != "Personal"
+            target for target in targets if not personal(target, "profile")
         ]
-    document["acknowledge_cross_profile_copy"] = False
     return 1
 
 
