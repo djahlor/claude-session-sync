@@ -128,10 +128,6 @@ class InstallLayout:
     def watcher_status(self) -> Path:
         return self.support_dir / "state" / "watcher-status.json"
 
-    @property
-    def legacy_launch_agents(self) -> Tuple[Path, ...]:
-        return (self.launch_agents_dir / "com.djahlor.claude-session-sync.plist",)
-
 
 @dataclass(frozen=True)
 class InstallAction:
@@ -356,9 +352,6 @@ class Installer:
 
     def _planned_actions(self, config_data: Optional[bytes] = None) -> List[InstallAction]:
         actions = []
-        for legacy in self.layout.legacy_launch_agents:
-            if legacy.exists():
-                actions.append(InstallAction("disable-legacy", legacy))
         if config_data is not None:
             if not self._same_file(self.layout.config_path, config_data, 0o600):
                 actions.append(InstallAction(
@@ -533,7 +526,7 @@ class Installer:
             self.layout.layout_helper_stamp,
             self.layout.launch_agent,
             self.layout.backups_dir,
-        ) + self.layout.legacy_launch_agents
+        )
 
     def _install_transaction(
         self, config_data: Optional[bytes] = None
@@ -551,7 +544,7 @@ class Installer:
             targets=self._transaction_targets(), state_roots=state_roots,
             launch_agent=self.layout.launch_agent,
             recovery_root=self.layout.support_dir / "install-state",
-            runner=self._runner, legacy_agents=self.layout.legacy_launch_agents,
+            runner=self._runner,
         )
 
     def setup(
@@ -625,8 +618,6 @@ class Installer:
     def _apply_setup(self, actions, config_data, watcher, helper) -> InstallReport:
         self._backups = []
         for action in actions:
-            if action.kind == "disable-legacy":
-                continue
             if action.path == self.layout.config_path:
                 if config_data is not None:
                     self._atomic_file(action.path, config_data, 0o600)
@@ -651,18 +642,6 @@ class Installer:
             elif action.path == self.layout.launch_agent:
                 self._atomic_file(action.path, self._launch_agent(config_data),
                                   0o644, lint=True)
-        for action in (a for a in actions if a.kind == "disable-legacy"):
-            self._runner(["/bin/launchctl", "bootout",
-                          "gui/{}".format(os.getuid()), str(action.path)],
-                         check=False, text=True, capture_output=True)
-            verification = self._runner(
-                ["/bin/launchctl", "print",
-                 "gui/{}/{}".format(os.getuid(), action.path.stem)],
-                check=False, text=True, capture_output=True)
-            if verification.returncode == 0:
-                raise RuntimeError("legacy session sync service is still loaded: {}"
-                                   .format(action.path.stem))
-            self._backup(action.path)
         self.load_launch_agent()
         return InstallReport("installed" if actions else "noop", tuple(actions),
                              tuple(self._backups))

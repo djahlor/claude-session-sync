@@ -298,30 +298,6 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(before, layout.config_path.read_bytes())
             self.assertTrue(all(app.exists() for app in layout.retired_apps))
 
-    def test_install_reversibly_disables_known_legacy_agent(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            layout = self.layout(home)
-            legacy = layout.legacy_launch_agents[0]
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text("legacy", encoding="utf-8")
-            runner = FakeCommandRunner()
-            installer = Installer(layout, runner=runner, backup_id=lambda: "legacy")
-
-            report = installer.install(dry_run=False)
-
-            self.assertFalse(legacy.exists())
-            self.assertTrue(
-                any(path.read_text() == "legacy" for path in report.backups)
-            )
-            self.assertTrue(
-                any(
-                    call[0][:2] == ("/bin/launchctl", "bootout")
-                    and str(legacy) in call[0]
-                    for call in runner.calls
-                )
-            )
-
     def test_invalid_existing_config_blocks_all_install_mutations(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -363,39 +339,6 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(layout.watcher_binary.exists())
             self.assertFalse(layout.layout_helper.exists())
             self.assertFalse(layout.launch_agent.exists())
-
-    def test_legacy_service_must_be_confirmed_stopped_before_activation(self):
-        class StubbornLegacyRunner(FakeCommandRunner):
-            def __call__(self, command, **kwargs):
-                result = super().__call__(command, **kwargs)
-                if (
-                    len(command) > 1
-                    and command[1] == "print"
-                    and command[-1].endswith("/com.djahlor.claude-session-sync")
-                ):
-                    return subprocess.CompletedProcess(
-                        command, 0, stdout="still loaded", stderr=""
-                    )
-                return result
-
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            layout = self.layout(home)
-            legacy = layout.legacy_launch_agents[0]
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text("legacy", encoding="utf-8")
-            installer = Installer(layout, runner=StubbornLegacyRunner())
-
-            with self.assertRaisesRegex(RuntimeError, "still loaded"):
-                installer.install(dry_run=False)
-
-            self.assertTrue(legacy.exists())
-            self.assertFalse(
-                any(
-                    call[0][:2] == ("/bin/launchctl", "bootstrap")
-                    for call in installer._runner.calls
-                )
-            )
 
     def test_custom_state_directory_receives_watcher_status(self):
         with tempfile.TemporaryDirectory() as directory:

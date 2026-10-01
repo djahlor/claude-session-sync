@@ -231,10 +231,6 @@ the remaining processes during its retry window. The finished notification and
 the status receipt show when sync has completed; they do not make Claude shut
 down faster.
 
-The installer detects the legacy `com.djahlor.claude-session-sync` LaunchAgent,
-stops it, and moves its plist into the backup area before activating the new
-watcher. If activation fails, it restores and restarts that legacy agent.
-
 ## Pins and custom groups
 
 Claude stores chat history and sidebar layout separately. The layout adapter
