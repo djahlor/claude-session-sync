@@ -397,7 +397,7 @@ class LiveCliTests(unittest.TestCase):
         self.assertIn("sidebar-sync-off", out)
 
 
-    def install(self, answers, *, tty=True):
+    def install(self, answers, *, tty=True, output_tty=True):
         from claude_session_sync.installer import InstallReport
 
         test = self
@@ -429,7 +429,7 @@ class LiveCliTests(unittest.TestCase):
                     before_activation(test.root / "bin" / "layoutdb")
                 return InstallReport("installed", ())
 
-        out = io.StringIO()
+        out = Terminal() if output_tty else io.StringIO()
         dependencies = CliDependencies(
             planner_factory=lambda _config: Planner(app_log=self.app_log),
             installer_factory=lambda _path: Installer(),
@@ -482,11 +482,33 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), self.pending())
 
     def test_no_question_without_a_terminal(self):
-        with self.two_grouped_accounts():
-            code, out = self.install("2\n", tty=False)
+        for tty, output_tty in ((False, True), (True, False)):
+            with self.subTest(tty=tty, output_tty=output_tty), self.two_grouped_accounts():
+                code, out = self.install("2\n", tty=tty, output_tty=output_tty)
 
-        self.assertEqual((0, None), (code, self.pending()))
-        self.assertNotIn("Which account", out)
+                self.assertEqual((0, None), (code, self.pending()))
+                self.assertNotIn("Which account", out)
+
+    def test_a_number_python_cannot_read_asks_again_instead_of_failing_the_install(self):
+        with self.two_grouped_accounts():
+            code, out = self.install("\u00b2\n\n")
+
+        self.assertEqual(0, code)
+        self.assertIn("Choose a number from the list that has groups.\n", out)
+        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), self.pending())
+
+    def test_keys_pressed_before_the_question_do_not_answer_it(self):
+        from claude_session_sync.cli import _discard_typeahead
+
+        main, follower = os.openpty()
+        with open(follower, "r", encoding="utf-8") as terminal:
+            os.write(main, b"\n")  # Enter pressed while setup compiled
+            _discard_typeahead(terminal)
+            os.write(main, b"2\n")
+            answer = terminal.readline()
+        os.close(main)
+
+        self.assertEqual("2\n", answer)
 
     def test_no_question_when_only_one_account_has_groups(self):
         self.write(self.a, X)
@@ -513,7 +535,7 @@ class LiveCliTests(unittest.TestCase):
         code, out = self.install("2\n")  # no sidebar database or helper
 
         self.assertEqual((0, None), (code, self.pending()))
-        self.assertIn("Could not read pins and groups to ask about them: sidebar helper is not installed\n", out)
+        self.assertIn("Skipped the main-account question: sidebar helper is not installed\n", out)
         self.assertIn("state=installed", out)
 
 

@@ -690,15 +690,15 @@ def _ask_main_account(
 ) -> None:
     """At install, ask which account's pins and groups the others copy.
 
-    Asks only on a terminal, before any account was adopted, and when two or
-    more accounts have groups. Enter keeps the signed-in account. The install
-    never fails here: a problem skips the question, and the first sync then
-    follows its own rules.
+    Asks only when both input and output are a terminal, before any account
+    was adopted, and when two or more accounts have groups. Enter keeps the
+    signed-in account. The install never fails here: a problem skips the
+    question, and the first sync then follows its own rules.
     """
 
     from .layout import load_snapshot, request_adoption
 
-    if not stdin.isatty() or not config.sync_sidebar_layout:
+    if not (stdin.isatty() and output.isatty()) or not config.sync_sidebar_layout:
         return
     if sum(profile.is_default for profile in config.profiles) != 1:
         return
@@ -710,24 +710,36 @@ def _ask_main_account(
         if any(load_snapshot(path) is not None for path in snapshots):
             return
         rows = _sidebar_rows(config, deps, helper)
+        if sum(1 for row in rows if row.groups) < 2:
+            return
+        _discard_typeahead(stdin)
+        output.write("\nWhich account is the main one?\n")
+        output.write("The other accounts will copy its pins and groups.\n\n")
+        output.write("".join(line + "\n" for line in _account_lines(rows)))
+        output.write("\n")
+        number = _choose_row(rows, stdin, output)
+        if number is None:
+            output.write("\nNo account chosen. The first sync decides.\n")
+            return
+        request_adoption(config.state_dir, rows[number - 1].scope)
     except Exception as error:
-        output.write("Could not read pins and groups to ask about them: {}\n".format(error))
+        output.write("\nSkipped the main-account question: {}\n".format(error))
         return
-    if sum(1 for row in rows if row.groups) < 2:
-        return
-    output.write("\nWhich account is the main one?\n")
-    output.write("The other accounts will copy its pins and groups.\n\n")
-    output.write("".join(line + "\n" for line in _account_lines(rows)))
-    output.write("\n")
-    number = _choose_row(rows, stdin, output)
-    if number is None:
-        output.write("\nNo account chosen. The first sync decides.\n")
-        return
-    request_adoption(config.state_dir, rows[number - 1].scope)
     output.write(
         "Account {} is the main one. The others copy its pins and groups "
         "the next time Claude closes.\n\n".format(number)
     )
+
+
+def _discard_typeahead(stdin: TextIO) -> None:
+    """Drop keys pressed while setup compiled, so they cannot answer the question."""
+
+    import termios
+
+    try:
+        termios.tcflush(stdin.fileno(), termios.TCIFLUSH)
+    except (OSError, ValueError, termios.error):
+        return  # not a real terminal
 
 
 def _choose_row(rows: Sequence[Any], stdin: TextIO, output: TextIO) -> Optional[int]:
@@ -744,7 +756,7 @@ def _choose_row(rows: Sequence[Any], stdin: TextIO, output: TextIO) -> Optional[
         if not answer:
             return None
         answer = answer.strip()
-        number = int(answer) if answer.isdigit() else None
+        number = int(answer) if answer.isdecimal() else None
         if not answer:
             number = default
         if number is not None and 1 <= number <= len(rows) and rows[number - 1].groups:
