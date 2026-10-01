@@ -21,9 +21,9 @@ copies Claude's whole login database.
 
 ## Privacy boundary
 
-Synchronization can move conversation-session metadata across Claude profiles
-and across account namespaces. That can expose work history to a personal
-profile, or personal history to a work profile. Review your employer's policy
+Synchronization can move conversation-session metadata across Claude accounts
+and workspaces. That can expose work history to a personal account, or
+personal history to a work account. Review your employer's policy
 before enabling it. Routine definitions include local paths. Existing permission
 grants, execution history, and unknown fields stay local to each destination.
 
@@ -120,7 +120,7 @@ claude-session-sync setup --automatic-targets --sync-layout --sync-routines --ap
 The per-user installer creates:
 
 - `~/.config/claude-session-sync/config.json` with mode `0600`;
-- no replacement Claude app in the normal one-profile setup;
+- no replacement Claude app;
 - a private system-Python-compatible runtime and compiled watcher under
   `~/Library/Application Support/ClaudeSessionSync`;
 - `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist`.
@@ -146,8 +146,8 @@ claude-session-sync approve-current-targets --apply
 claude-session-sync install --apply
 ```
 
-To stop routine account or workspace ID changes from blocking a configured
-profile, enable automatic targets:
+To stop routine account or workspace ID changes from blocking sync, enable
+automatic targets:
 
 ```sh
 claude-session-sync configure --automatic-targets --dry-run
@@ -226,7 +226,7 @@ unchanged content through its hash cache, applies new copies with a recovery
 journal, and writes an aggregate status receipt. It does not sync at sign-out
 because Claude is still running and may still be writing its private stores.
 
-After the sync, `switch` runs the profile's launch command, even when the sync
+After the sync, `switch` runs Claude's launch command, even when the sync
 failed, so a switch never leaves Claude closed. A failed sync still exits
 nonzero with its result and `launch=started`. `switch` returns
 `state=launch_failed` only when the launch command cannot start or exits with
@@ -443,7 +443,7 @@ write, the tool restores exact preimages. A failed restore creates
 ## Recovery
 
 Every committed mutation has a run ID. Keep the state directory and installer
-backups until the synchronized profiles have been verified.
+backups until the synchronized accounts have been verified.
 
 ```sh
 claude-session-sync rollback RUN_ID
