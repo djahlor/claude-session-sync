@@ -45,9 +45,7 @@ def _adapter_recovery_pending(config) -> int:
     return count
 
 
-def doctor_summary(
-    config: Config, dependencies, running, launch_guard_failure: int
-) -> dict:
+def doctor_summary(config: Config, dependencies, running) -> dict:
     from .enrollment import auto_enrolled, select_targets
     from .journal import JournalError, pending_recovery_runs
     from .store import SessionStore
@@ -111,7 +109,6 @@ def doctor_summary(
     )
     waiting = any(value.get("reason") == "app-running" for value in probes.values())
     errors += layout_failure + routine_failure
-    errors += launch_guard_failure
     return {
         "bytes": 0,
         "counts": {
@@ -119,7 +116,6 @@ def doctor_summary(
             "abandoned_preparations": abandoned,
             "errors": errors,
             "invalid_replicas": len(discovery.invalid_replicas),
-            "launch_guards": launch_guard_failure,
             "layout_failures": layout_failure,
             "profiles": len(config.profiles),
             "recovery_pending": recovery_pending,

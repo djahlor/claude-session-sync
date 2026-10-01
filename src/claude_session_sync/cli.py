@@ -7,7 +7,6 @@ import contextlib
 import math
 import os
 import subprocess
-import stat
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -32,8 +31,6 @@ LayoutFactory = Callable[[Config], Any]
 RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
-LAUNCH_CONFIRMATION_TIMEOUT_SECONDS = 5.0
-LAUNCH_GUARD_FILENAME = "launch-pending.json"
 SWITCH_WRITER_WAIT_SECONDS = 15.0
 SWITCH_REVALIDATION_RETRIES = 2
 
@@ -97,7 +94,6 @@ class CliDependencies:
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
-    launch_confirmation_timeout: float = LAUNCH_CONFIRMATION_TIMEOUT_SECONDS
     # Live sync needs the built-in planner, which knows the chat state and
     # which folders a running Claude holds. None means: use it when it is built in.
     live_sync: Optional[bool] = None
@@ -281,13 +277,6 @@ def _parser() -> argparse.ArgumentParser:
     setup_mode = setup.add_mutually_exclusive_group(required=True)
     setup_mode.add_argument("--dry-run", action="store_true")
     setup_mode.add_argument("--apply", action="store_true")
-    clear_guard = commands.add_parser(
-        "clear-launch-guard",
-        help="clear a failed launch guard after confirming Claude is stopped",
-    )
-    clear_guard_mode = clear_guard.add_mutually_exclusive_group(required=True)
-    clear_guard_mode.add_argument("--dry-run", action="store_true")
-    clear_guard_mode.add_argument("--apply", action="store_true")
     for name in ("install", "uninstall"):
         installer = commands.add_parser(name, help="{} macOS adapters".format(name))
         mode = installer.add_mutually_exclusive_group(required=True)
@@ -419,169 +408,6 @@ def _normalized_path(path: Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
-def _wait_for_managed_profile_to_start(
-    config: Config,
-    dependencies: CliDependencies,
-    profile: Any,
-    timeout: float,
-) -> str:
-    if timeout <= 0:
-        return "disabled"
-    selected_root = _normalized_path(Path(profile.data_root))
-    deadline = dependencies.monotonic() + timeout
-    while True:
-        remaining = deadline - dependencies.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        try:
-            processes = _running_processes(
-                config,
-                dependencies,
-                timeout=max(
-                    0.001,
-                    min(PROCESS_PROBE_TIMEOUT_SECONDS, remaining),
-                ),
-            )
-        except subprocess.TimeoutExpired:
-            return "probe-timeout"
-        if any(
-            _normalized_path(Path(getattr(process, "user_data_dir"))) == selected_root
-            for process in processes
-            if getattr(process, "user_data_dir", None) is not None
-        ):
-            return "confirmed"
-        if processes:
-            return "wrong-profile"
-        remaining = deadline - dependencies.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-
-
-def _launch_guard_path(config: Config) -> Path:
-    return config.state_dir / LAUNCH_GUARD_FILENAME
-
-
-def _write_launch_guard(config: Config, profile_name: str) -> None:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-
-    ensure_private_directory(config.state_dir)
-    document = {
-        "profile": profile_name,
-        "version": 1,
-    }
-    encoded = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
-    path = _launch_guard_path(config)
-    atomic_write_bytes(path, encoded)
-    os.chmod(str(path), 0o600)
-
-
-def _valid_launch_guard(config: Config) -> Optional[str]:
-    path = _launch_guard_path(config)
-    if not os.path.lexists(str(path)):
-        return None
-    metadata = os.lstat(str(path))
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2_048:
-        raise ValueError("launch guard is invalid")
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(document, dict)
-        or document.get("version") != 1
-        or not isinstance(document.get("profile"), str)
-        or not document["profile"]
-    ):
-        raise ValueError("launch guard is invalid")
-    return document["profile"]
-
-
-def _clear_launch_guard(config: Config) -> None:
-    from .filesystem import durable_unlink
-
-    path = _launch_guard_path(config)
-    if _valid_launch_guard(config) is None:
-        return
-    durable_unlink(path)
-
-
-def _reconcile_launch_guard(
-    config: Config,
-    dependencies: CliDependencies,
-) -> bool:
-    guarded_profile_name = _valid_launch_guard(config)
-    if guarded_profile_name is None:
-        return True
-    guarded_profile = next(
-        (
-            profile
-            for profile in config.profiles
-            if profile.name == guarded_profile_name
-        ),
-        None,
-    )
-    if guarded_profile is None:
-        return False
-    try:
-        running = _running_processes(config, dependencies)
-    except subprocess.TimeoutExpired:
-        return False
-    guarded_root = _normalized_path(Path(guarded_profile.data_root))
-    guarded_running = any(
-        _normalized_path(Path(getattr(process, "user_data_dir"))) == guarded_root
-        for process in running
-        if getattr(process, "user_data_dir", None) is not None
-    )
-    if not guarded_running:
-        return False
-    _clear_launch_guard(config)
-    return True
-
-
-def _launch_guard_failure(config: Config) -> int:
-    try:
-        return int(_valid_launch_guard(config) is not None)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-        return 1
-
-
-def _clear_launch_guard_command(
-    config: Config,
-    dependencies: CliDependencies,
-    *,
-    apply: bool,
-) -> tuple[dict, int]:
-    from .locking import ExclusiveFileLock, LockUnavailableError
-
-    handoff = ExclusiveFileLock(
-        config.state_dir / "switch-handoff.lock",
-        mode="auto",
-        timeout=0,
-    )
-    try:
-        handoff.acquire()
-    except LockUnavailableError:
-        return {"state": "blocked_switch", "reason": "handoff-running"}, 1
-    try:
-        try:
-            if _running_processes(config, dependencies):
-                return {"state": "blocked_app", "reason": "app-running"}, 1
-        except subprocess.TimeoutExpired:
-            return {"state": "blocked_probe", "reason": "process-timeout"}, 1
-        try:
-            pending = _valid_launch_guard(config) is not None
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            return {"state": "blocked_invalid", "reason": "invalid-guard"}, 1
-        if not pending:
-            return {"state": "noop", "counts": {"guards": 0}}, 0
-        if apply:
-            _clear_launch_guard(config)
-        return {
-            "state": "cleared" if apply else "planned",
-            "counts": {"guards": 1},
-        }, 0
-    finally:
-        handoff.release()
-
-
 def _switch_chat_result(
     config: Config, dependencies: CliDependencies, started: float
 ) -> dict:
@@ -656,13 +482,6 @@ def _run_switch(
         return 1
 
     try:
-        if not _reconcile_launch_guard(config, dependencies):
-            _write(
-                {"state": "blocked_switch", "reason": "launch-unconfirmed"},
-                as_json=as_json,
-                stream=output,
-            )
-            return 1
         if not _wait_for_managed_processes_to_exit(
             config,
             dependencies,
@@ -691,33 +510,17 @@ def _run_switch(
             _write(payload, as_json=as_json, stream=output)
             return 1
         if not arguments.no_launch:
-            confirmation_enabled = dependencies.launch_confirmation_timeout > 0
-            if confirmation_enabled:
-                _write_launch_guard(config, profile.name)
-            if dependencies.launcher is None:
-                from .launcher import Launcher
+            from .launcher import LaunchError, Launcher
 
-                Launcher().launch(profile.launch_command)
-            else:
-                dependencies.launcher.launch(profile.launch_command)
-            if confirmation_enabled:
-                confirmation = _wait_for_managed_profile_to_start(
-                    config,
-                    dependencies,
-                    profile,
-                    dependencies.launch_confirmation_timeout,
+            try:
+                (dependencies.launcher or Launcher()).launch(profile.launch_command)
+            except LaunchError:
+                _write(
+                    {"state": "launch_failed", "reason": "launch-command-failed"},
+                    as_json=as_json,
+                    stream=output,
                 )
-                if confirmation != "confirmed":
-                    _write(
-                        {
-                            "state": "launch_unconfirmed",
-                            "reason": confirmation,
-                        },
-                        as_json=as_json,
-                        stream=output,
-                    )
-                    return 1
-                _clear_launch_guard(config)
+                return 1
         _write(
             payload,
             as_json=as_json,
@@ -1211,14 +1014,6 @@ def run(
             return _run_sync(arguments, config, deps, output)
         if arguments.command == "switch":
             return _run_switch(arguments, config, deps, output)
-        if arguments.command == "clear-launch-guard":
-            payload, exit_code = _clear_launch_guard_command(
-                config,
-                deps,
-                apply=arguments.apply,
-            )
-            _write(payload, as_json=False, stream=output)
-            return exit_code
         if arguments.command == "rollback":
             started = deps.clock()
             receipt = deps.engine_factory(config).rollback(arguments.run_id)
@@ -1232,7 +1027,6 @@ def run(
         if arguments.command == "status":
             running = _running_processes(config, deps)
             watcher_error = watcher_failure(config.state_dir)
-            launch_guard_failure = _launch_guard_failure(config)
             layout_failure = adapter_failure(config, "layout")
             routine_failure = adapter_failure(config, "routines")
             abandoned = abandoned_preparation_count(config.state_dir)
@@ -1241,7 +1035,6 @@ def run(
                 app_running=bool(running),
                 live=_live_sync(deps),
                 failures=watcher_error
-                + launch_guard_failure
                 + layout_failure
                 + routine_failure
                 + abandoned,
@@ -1253,7 +1046,6 @@ def run(
                     "bytes": 0,
                     "counts": {
                         "abandoned_preparations": abandoned,
-                        "launch_guards": launch_guard_failure,
                         "layout_failures": layout_failure,
                         "profiles": len(config.profiles),
                         "routine_failures": routine_failure,
@@ -1265,8 +1057,6 @@ def run(
                     "state": (
                         "app-running"
                         if running
-                        else "launch-unconfirmed"
-                        if launch_guard_failure
                         else "layout-failed"
                         if layout_failure
                         else "routines-failed"
@@ -1285,7 +1075,6 @@ def run(
                 config,
                 deps,
                 lambda: bool(_running_processes(config, deps)),
-                _launch_guard_failure(config),
             )
             _write(
                 payload,

@@ -362,6 +362,22 @@ class InstallerTests(unittest.TestCase):
             launch_agent = layout.launch_agent.read_text(encoding="utf-8")
             self.assertIn(str(custom_state / "watcher-status.json"), launch_agent)
 
+    def test_setup_removes_a_launch_guard_an_older_version_left(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            layout = self.layout(home)
+            installer = Installer(layout, runner=FakeCommandRunner())
+            installer.install(dry_run=False)
+            guard = load_config(layout.config_path).state_dir / "launch-pending.json"
+            guard.parent.mkdir(parents=True, exist_ok=True)
+            guard.write_text('{"profile": "Work", "version": 1}\n', encoding="utf-8")
+
+            installer.setup(dry_run=True)
+            self.assertTrue(guard.exists(), "a dry run changes nothing")
+            installer.setup(dry_run=False)
+
+            self.assertFalse(guard.exists())
+
     def test_setup_applies_supplied_config_in_the_same_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
