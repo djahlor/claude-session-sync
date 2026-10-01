@@ -148,10 +148,6 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument("--session", metavar="ID", help="limit --prefer to one chat")
     sidebar_mode = sync.add_mutually_exclusive_group()
     sidebar_mode.add_argument(
-        "--prefer-current-sidebar", action="store_true",
-        help="resolve conflicting chat folders using the current sidebar (one profile only)",
-    )
-    sidebar_mode.add_argument(
         "--adopt-current-sidebar",
         action="store_true",
         help="bootstrap every approved scope from the current sidebar (single default profile only)",
@@ -796,7 +792,6 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         payload.update(
             run_adapters(
                 config, deps, lambda: bool(_running_processes(config, deps)),
-                prefer_current_sidebar=getattr(arguments, "prefer_current_sidebar", False),
                 adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
                 adopt_source_scope=getattr(arguments, "adopt_source_scope", None),
             )
@@ -922,10 +917,6 @@ def run(
             _write(payload, as_json=False, stream=output)
             return 0
         config = deps.config_loader(arguments.config)
-        if getattr(arguments, "prefer_current_sidebar", False) and (
-            not config.sync_sidebar_layout or len(config.profiles) != 1
-        ):
-            raise ValueError("--prefer-current-sidebar requires sidebar sync and exactly one profile")
         if getattr(arguments, "adopt_current_sidebar", False) and (
             not config.sync_sidebar_layout
             or len(config.profiles) != 1

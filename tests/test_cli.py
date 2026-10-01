@@ -75,7 +75,6 @@ class FakeLayoutReceipt:
     group_count = 4
     assignment_count = 12
     pin_count = 3
-    ambiguous_assignments = 1
 
 
 class FakeLayout:
@@ -1511,58 +1510,6 @@ class CliLayoutTests(unittest.TestCase):
                     self.assertEqual([], planner_calls)
                     self.assertIn("exactly one default profile", errors.getvalue())
 
-    def test_explicit_current_sidebar_option_reaches_only_layout_adapter(self):
-        calls = []
-
-        class RecordingLayout:
-            def sync(self, *, prefer_current_sidebar=False):
-                calls.append(prefer_current_sidebar)
-                return FakeLayoutReceipt()
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            loaded = replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=True, sync_code_routines=True)
-            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
-            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
-            deps = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                layout_factory=lambda _config: RecordingLayout(),
-                routine_factory=lambda _config: FakeRoutine(),
-                process_probe=FakeProcessProbe(),
-            )
-            output = io.StringIO()
-            self.assertEqual(0, run(
-                ["sync", "--prefer-current-sidebar", "--json"],
-                dependencies=deps, stdout=output, stderr=io.StringIO(),
-            ))
-            self.assertEqual([True], calls)
-            self.assertEqual("synced", json.loads(output.getvalue())["routines"]["state"])
-
-    def test_current_sidebar_resolution_requires_one_profile_and_layout_sync_before_any_write(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            for unsafe in (
-                replace(loaded, sync_sidebar_layout=True),
-                replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False),
-            ):
-                with self.subTest(config=unsafe):
-                    planner_calls = []
-                    deps = CliDependencies(
-                        config_loader=lambda path: unsafe,
-                        planner_factory=lambda config: planner_calls.append(config),
-                    )
-                    errors = io.StringIO()
-                    self.assertNotEqual(0, run(
-                        ["sync", "--prefer-current-sidebar"], dependencies=deps,
-                        stdout=io.StringIO(), stderr=errors,
-                    ))
-                    self.assertEqual([], planner_calls)
-                    self.assertIn("exactly one profile", errors.getvalue())
-
     def test_sync_reports_layout_without_changing_chat_receipt_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1588,8 +1535,10 @@ class CliLayoutTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertEqual(0, exit_code)
             self.assertEqual("committed", payload["state"])
-            self.assertEqual("synced", payload["layout"]["state"])
-            self.assertEqual(1, payload["layout"]["ambiguous_assignments"])
+            self.assertEqual(
+                {"state": "synced", "profiles": 1, "records": 2, "groups": 4, "assignments": 12, "pins": 3},
+                payload["layout"],
+            )
 
     def test_layout_failure_does_not_change_a_committed_chat_result(self):
         class BrokenLayout:

@@ -34,7 +34,6 @@ ADAPTERS = (
             "groups": "group_count",
             "assignments": "assignment_count",
             "pins": "pin_count",
-            "ambiguous_assignments": "ambiguous_assignments",
         },
     ),
 )
@@ -106,7 +105,6 @@ def run_adapters(
     running,
     *,
     probe_only=False,
-    prefer_current_sidebar=False,
     adopt_current_sidebar=False,
     adopt_source_scope=None,
     after_account_switch=False,
@@ -134,8 +132,6 @@ def run_adapters(
                         receipt = adapter.sync(adopt_source_scope=adopt_source_scope)
                     elif name == "layout" and adopt_current_sidebar:
                         receipt = adapter.sync(adopt_current_sidebar=True)
-                    elif name == "layout" and prefer_current_sidebar:
-                        receipt = adapter.sync(prefer_current_sidebar=True)
                     elif name == "layout" and after_account_switch:
                         receipt = adapter.sync(after_account_switch=True)
                     else:
