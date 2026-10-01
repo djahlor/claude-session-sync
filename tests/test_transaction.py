@@ -33,7 +33,7 @@ def digest(data: bytes) -> str:
 def make_plan(source: Path, destination: Path, destination_before: Optional[bytes]):
     source_bytes = source.read_bytes()
     operation = SimpleNamespace(
-        kind="copy",
+        kind="create" if destination_before is None else "replace",
         session_id="session-1",
         source=source,
         destination=destination,

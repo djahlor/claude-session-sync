@@ -67,8 +67,7 @@ class TmpFile:
 @dataclass(frozen=True)
 class Operation:
     # create: new file, never overwriting; replace: swap an existing file;
-    # retire: remove a file (its bytes stay in the run journal); copy: legacy
-    # create-or-replace.
+    # retire: remove a file (its bytes stay in the run journal).
     kind: str
     session_id: str
     source: Path

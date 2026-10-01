@@ -23,7 +23,7 @@ def operation(
 ):
     source_bytes = source.read_bytes()
     return SimpleNamespace(
-        kind="copy",
+        kind="create" if destination_before is None else "replace",
         session_id=session_id,
         source=source,
         destination=destination,

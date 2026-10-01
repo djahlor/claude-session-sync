@@ -31,7 +31,7 @@ from .model import RecoveryReceipt, RunReceipt
 
 PathLike = Union[str, os.PathLike]
 FaultInjector = Callable[[str, str], None]
-WRITE_KINDS = ("copy", "create", "replace")
+WRITE_KINDS = ("create", "replace")
 # Phases a killed process leaves behind mid-apply. ABORTING (a rollback cut
 # short) and RECOVERY_REQUIRED (a rollback that failed) need a rollback instead.
 APPLY_PHASES = ("JOURNALING", "STAGING", "COMMITTING", "VERIFYING")
@@ -204,7 +204,7 @@ class TransactionEngine:
             self._transition(journal, "STAGING")
             staged_identities = []  # type: List[Dict[str, int]]
             for record in journal.records:
-                if record.get("kind", "copy") not in WRITE_KINDS:
+                if record["kind"] == "retire":
                     continue
                 staged_path = stage_copy(
                     Path(record["source"]), Path(record["destination"])
@@ -229,7 +229,7 @@ class TransactionEngine:
             self._ensure_apps_stopped()
             for record in journal.records:
                 destination = Path(record["destination"])
-                kind = record.get("kind", "copy")
+                kind = record["kind"]
                 if kind == "retire":
                     # Written down first: a crash right after the removal must
                     # still let recovery put the file back.
@@ -245,7 +245,7 @@ class TransactionEngine:
             self._transition(journal, "VERIFYING")
             for record in applied:
                 destination = Path(record["destination"])
-                if record.get("kind", "copy") == "retire":
+                if record["kind"] == "retire":
                     if os.path.lexists(str(destination)):
                         raise RevalidationError(
                             "retired file is still present: {}".format(destination)
@@ -266,7 +266,7 @@ class TransactionEngine:
                 bytes_copied=sum(
                     record["size"]
                     for record in applied
-                    if record.get("kind", "copy") != "retire"
+                    if record["kind"] != "retire"
                 ),
                 applied=tuple(
                     plan.operations[record["operation_index"]] for record in applied
@@ -323,7 +323,7 @@ class TransactionEngine:
         records = []  # type: List[Dict[str, Any]]
         destinations = set()
         for operation_index, operation in enumerate(operations):
-            kind = getattr(operation, "kind", "copy")
+            kind = operation.kind
             if kind not in WRITE_KINDS + ("retire",):
                 raise RevalidationError(
                     "unsupported operation kind: {}".format(kind)
@@ -475,8 +475,8 @@ class TransactionEngine:
         for record in records:
             destination = Path(record["destination"])
             exists = os.path.lexists(str(destination))
-            kind = record.get("kind", "copy")
-            if kind == "retire":
+            # Journals from before steps had kinds hold only writes.
+            if record.get("kind") == "retire":
                 if exists:
                     if self._digest_existing(destination) != record["destination_digest_before"]:
                         raise RecoveryError(
