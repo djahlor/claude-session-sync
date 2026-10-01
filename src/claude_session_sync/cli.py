@@ -23,9 +23,10 @@ from .config_commands import (
     _prepare_config_data,
     _validate_config_data,
 )
+from .filesystem import normalized_path
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
 from .progress import current_progress, finish_progress, record_progress
-from .model import Plan, SyncRequest
+from .model import Plan
 
 
 ConfigLoader = Callable[[Path], Config]
@@ -37,7 +38,6 @@ RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
 SWITCH_WRITER_WAIT_SECONDS = 15.0
-SWITCH_REVALIDATION_RETRIES = 2
 
 
 def _default_planner_factory(_config: Config) -> Any:
@@ -99,15 +99,6 @@ class CliDependencies:
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
-    # Chat sync with state needs the built-in planner, which knows the chat
-    # state. None means: use it when it is built in.
-    live_sync: Optional[bool] = None
-
-
-def _live_sync(deps: "CliDependencies") -> bool:
-    if deps.live_sync is not None:
-        return deps.live_sync
-    return deps.planner_factory is _default_planner_factory
 
 
 def _nonnegative_seconds(value: str) -> float:
@@ -253,23 +244,12 @@ def _parser() -> argparse.ArgumentParser:
     approve_mode.add_argument("--apply", action="store_true")
     configure = commands.add_parser(
         "configure",
-        help="configure automatic targets and optional profile launchers",
+        help="configure automatic targets and which stores sync",
     )
     configure.add_argument(
         "--automatic-targets",
         action="store_true",
         help="trust future account/workspace targets inside configured profiles",
-    )
-    profile_mode = configure.add_mutually_exclusive_group()
-    profile_mode.add_argument(
-        "--enable-personal",
-        action="store_true",
-        help="enable the generated Personal profile",
-    )
-    profile_mode.add_argument(
-        "--disable-personal",
-        action="store_true",
-        help="disable the generated Personal profile",
     )
     configure.add_argument(
         "--sync-layout",
@@ -288,9 +268,6 @@ def _parser() -> argparse.ArgumentParser:
         "setup", help="configure and install macOS adapters atomically"
     )
     setup.add_argument("--automatic-targets", action="store_true")
-    setup_profile = setup.add_mutually_exclusive_group()
-    setup_profile.add_argument("--enable-personal", action="store_true")
-    setup_profile.add_argument("--disable-personal", action="store_true")
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
     setup.add_argument(
@@ -312,8 +289,6 @@ def _parser() -> argparse.ArgumentParser:
 def _plan_state(plan: Plan) -> str:
     if plan.invalid_replicas:
         return "blocked_invalid"
-    if plan.conflicts:
-        return "blocked_conflict"
     if not plan.operations:
         return "noop"
     return "planned"
@@ -325,7 +300,6 @@ def _plan_summary(plan: Plan, duration_ms: int) -> dict:
     payload = {
         "bytes": plan.total_bytes,
         "counts": {
-            "conflicts": len(plan.conflicts),
             "invalid_replicas": len(plan.invalid_replicas),
             "operations": len(plan.operations),
         },
@@ -343,20 +317,7 @@ def _plan_summary(plan: Plan, duration_ms: int) -> dict:
             if target_only
             else "run-doctor"
         )
-    elif payload["state"] == "blocked_conflict":
-        payload["next_action"] = "run-doctor"
     return payload
-
-
-def _receipt_summary(receipt: Any, duration_ms: int) -> dict:
-    return {
-        "bytes": receipt.bytes_copied,
-        "counts": {"operations": receipt.operation_count},
-        "duration_ms": duration_ms,
-        "plan_id": receipt.plan_id,
-        "run_id": receipt.run_id,
-        "state": receipt.status,
-    }
 
 
 def _recovery_summary(receipt: Any, duration_ms: int) -> dict:
@@ -428,56 +389,17 @@ def _wait_for_managed_processes_to_exit(
         dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
 
 
-def _normalized_path(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
-
-
-def _switch_chat_result(
-    config: Config, dependencies: CliDependencies, started: float
-) -> dict:
-    if _live_sync(dependencies):
-        writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
-        while True:
-            try:
-                return _live_chat_payload(None, config, dependencies)
-            except Exception as error:
-                remaining = writer_deadline - dependencies.monotonic()
-                if _busy_reason(error) == "busy" and remaining > 0:
-                    dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-                    continue
-                return _chat_failure(error)
-    try:
-        planner = dependencies.planner_factory(config)
-        engine = dependencies.engine_factory(config)
-        plan = planner.plan(SyncRequest(config))
-        dependencies.clock()
-        writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
-        revalidation_retries = SWITCH_REVALIDATION_RETRIES
-        while True:
-            if _plan_state(plan).startswith("blocked_"):
-                return _plan_summary(
-                    plan, round((dependencies.clock() - started) * 1000)
-                )
-            try:
-                receipt = engine.apply(plan)
-                break
-            except Exception as error:
-                remaining = writer_deadline - dependencies.monotonic()
-                if _busy_reason(error) == "busy" and remaining > 0:
-                    dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-                    continue
-                if (
-                    type(error).__name__ == "RevalidationError"
-                    and revalidation_retries > 0
-                ):
-                    revalidation_retries -= 1
-                    plan = planner.plan(SyncRequest(config))
-                    continue
-                raise
-        duration_ms = round((dependencies.clock() - started) * 1000)
-        return _receipt_summary(receipt, duration_ms)
-    except Exception as error:
-        return _chat_failure(error)
+def _switch_chat_result(config: Config, dependencies: CliDependencies) -> dict:
+    writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
+    while True:
+        try:
+            return _chat_payload(None, config, dependencies)
+        except Exception as error:
+            remaining = writer_deadline - dependencies.monotonic()
+            if _busy_reason(error) == "busy" and remaining > 0:
+                dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
+                continue
+            return _chat_failure(error)
 
 
 def _run_switch(
@@ -518,9 +440,8 @@ def _run_switch(
             )
             return 1
         record_progress(config, "syncing")
-        started = dependencies.clock()
         try:
-            payload = _switch_chat_result(config, dependencies, started)
+            payload = _switch_chat_result(config, dependencies)
             payload.update(
                 run_adapters(
                     config,
@@ -827,10 +748,7 @@ def _write_plan_report(config: Config, run: Any) -> None:
     from .adapters import save_status
 
     plan = run.plan
-    context = plan.context
-    labels = {}
-    if context is not None:
-        labels = {key: _folder_label(target.path) for key, target in context.targets.items()}
+    labels = {key: _folder_label(target.path) for key, target in plan.context.targets.items()}
     save_status(
         config.state_dir,
         "plan-report.json",
@@ -859,7 +777,7 @@ def _write_plan_report(config: Config, run: Any) -> None:
     )
 
 
-def _live_chat_payload(arguments: Any, config: Config, deps: CliDependencies) -> dict:
+def _chat_payload(arguments: Any, config: Config, deps: CliDependencies) -> dict:
     from .chat_sync import ChatStateError, run_chat_sync
 
     started = deps.clock()
@@ -884,9 +802,6 @@ def _live_chat_payload(arguments: Any, config: Config, deps: CliDependencies) ->
 def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) -> int:
     from .locking import ExclusiveFileLock, LockUnavailableError
 
-    live = _live_sync(deps)
-    if not live and getattr(arguments, "prefer", None) is not None:
-        raise ValueError("--prefer needs the built-in planner")
     handoff = ExclusiveFileLock(
         config.state_dir / "switch-handoff.lock", mode="auto", timeout=0
     )
@@ -920,21 +835,8 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         if running:
             return _report_waiting(arguments, config, output, "claude-open")
         record_progress(config, "syncing")
-        started = deps.clock()
         try:
-            if live:
-                payload = _live_chat_payload(arguments, config, deps)
-            else:
-                plan = deps.planner_factory(config).plan(SyncRequest(config))
-                if arguments.command == "sync":
-                    deps.clock()
-                if _plan_state(plan).startswith("blocked_"):
-                    payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
-                else:
-                    receipt = deps.engine_factory(config).apply(plan)
-                    payload = _receipt_summary(
-                        receipt, round((deps.clock() - started) * 1000)
-                    )
+            payload = _chat_payload(arguments, config, deps)
         except Exception as error:
             reason = _busy_reason(error)
             if reason is not None:
@@ -1033,8 +935,6 @@ def run(
             desired, config_payload = _prepare_config_data(
                 source,
                 automatic_targets=arguments.automatic_targets,
-                enable_personal=arguments.enable_personal,
-                disable_personal=arguments.disable_personal,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
             )
@@ -1069,8 +969,6 @@ def run(
             payload = _configure(
                 arguments.config,
                 automatic_targets=arguments.automatic_targets,
-                enable_personal=arguments.enable_personal,
-                disable_personal=arguments.disable_personal,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
                 apply=arguments.apply,
@@ -1106,28 +1004,21 @@ def run(
             except subprocess.TimeoutExpired as error:
                 _write(_chat_failure(error), as_json=True, stream=output)
                 return 1
-            selected_root = _normalized_path(profile.data_root)
-            if any(_normalized_path(process.user_data_dir) != selected_root for process in processes):
+            selected_root = normalized_path(profile.data_root)
+            if any(normalized_path(process.user_data_dir) != selected_root for process in processes):
                 raise ValueError("another managed profile is open; leave Claude open until it is closed")
             _write({"state": "ready", "pids": [process.pid for process in processes]}, as_json=True, stream=output)
             return 0
         if arguments.command == "plan":
-            started = deps.clock()
-            if _live_sync(deps):
-                from .chat_sync import plan_chat_sync
+            from .chat_sync import plan_chat_sync
 
-                chat_run = plan_chat_sync(config, deps.planner_factory(config))
-                plan = chat_run.plan
-                if arguments.report:
-                    _write_plan_report(config, chat_run)
-                payload = _chat_plan_summary(
-                    chat_run, round((deps.clock() - started) * 1000)
-                )
-            else:
-                plan = deps.planner_factory(config).plan(SyncRequest(config))
-                payload = _plan_summary(plan, round((deps.clock() - started) * 1000))
+            started = deps.clock()
+            chat_run = plan_chat_sync(config, deps.planner_factory(config))
+            if arguments.report:
+                _write_plan_report(config, chat_run)
+            payload = _chat_plan_summary(chat_run, round((deps.clock() - started) * 1000))
             _write(payload, as_json=arguments.as_json, stream=output)
-            return 0 if _plan_state(plan) in ("planned", "noop") else 1
+            return 0 if _plan_state(chat_run.plan) in ("planned", "noop") else 1
         if arguments.command == "seed-state":
             from .seeding import seed_from_unenrolled
 

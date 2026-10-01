@@ -1,20 +1,26 @@
-"""Command-line behavior of live chat sync with the built-in planner."""
+"""Command-line behavior of chat sync on real folders with the real planner and engine."""
 
 import io
+import itertools
 import json
 import os
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from claude_session_sync.chat_state import load_state, state_path
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import ApprovedTarget, Config
+from claude_session_sync.locking import ExclusiveFileLock
 from claude_session_sync.model import Profile
 from claude_session_sync.planner import Planner
 from claude_session_sync.transaction import TransactionEngine
+from test_cli import FakeLauncher, FakeLayout, FakeRoutine, ManualClock, SequencedProcessProbe
 
 A_ACCOUNT = "aaaaaaaa-0000-4000-8000-000000000001"
 A_ORG = "aaaaaaaa-0000-4000-8000-0000000000a1"
@@ -42,7 +48,9 @@ class Terminal(io.StringIO):
         return True
 
 
-class LiveCliTests(unittest.TestCase):
+class ChatCliFixture(unittest.TestCase):
+    """Real chat folders, planner and engine. Fakes stand in only for Claude itself."""
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -85,24 +93,30 @@ class LiveCliTests(unittest.TestCase):
         path.write_text(json.dumps(body), encoding="utf-8")
         old = time.time() - 60
         os.utime(path, (old, old))
+        return path
 
     def read(self, folder, session_id):
         path = folder / "local_{}.json".format(session_id)
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
-    def cli(self, *arguments):
+    def engine(self, **options):
+        return lambda config: TransactionEngine(
+            config.state_dir, process_probe=lambda: self.running, retention=config.retention, **options
+        )
+
+    def cli(self, *arguments, **dependencies):
         out = io.StringIO()
         errors = io.StringIO()
-        dependencies = CliDependencies(
-            config_loader=lambda _path: self.config,
-            planner_factory=lambda _config: Planner(app_log=self.app_log),
-            process_probe=FakeProbe(self),
-            engine_factory=lambda config: TransactionEngine(
-                config.state_dir, process_probe=lambda: self.running, retention=config.retention
+        dependencies = replace(
+            CliDependencies(
+                config_loader=lambda _path: self.config,
+                planner_factory=lambda _config: Planner(app_log=self.app_log),
+                process_probe=FakeProbe(self),
+                engine_factory=self.engine(),
+                layout_factory=lambda _config: self.fail("pins and groups must not sync"),
+                routine_factory=lambda _config: self.fail("routines must not sync"),
             ),
-            layout_factory=lambda _config: self.fail("pins and groups must not sync"),
-            routine_factory=lambda _config: self.fail("routines must not sync"),
-            live_sync=True,
+            **dependencies,
         )
         code = run(
             ["--config", str(self.root / "config.json"), *arguments],
@@ -112,6 +126,8 @@ class LiveCliTests(unittest.TestCase):
         )
         return code, out.getvalue(), errors.getvalue()
 
+
+class LiveCliTests(ChatCliFixture):
     def test_nothing_syncs_while_claude_is_open_and_the_next_quit_does(self):
         from dataclasses import replace
 
@@ -537,6 +553,437 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual((0, None), (code, self.pending()))
         self.assertIn("Skipped the main-account question: sidebar helper is not installed\n", out)
         self.assertIn("state=installed", out)
+
+
+class ChatCommandTests(ChatCliFixture):
+    """plan, sync, and auto as the watcher and a user run them."""
+
+    def test_plan_counts_the_steps_without_naming_a_chat_or_a_path(self):
+        size = self.write(self.a, X, title="private title").stat().st_size
+
+        code, out, errors = self.cli("plan", "--json", clock=itertools.count(5.0, 0.012).__next__)
+
+        self.assertEqual((0, ""), (code, errors))
+        payload = json.loads(out)
+        self.assertIsInstance(payload.pop("plan_id"), str)
+        self.assertEqual(
+            {
+                "bytes": size,
+                "counts": {
+                    "creates": 1, "ignored_folders": 1, "invalid_replicas": 0,
+                    "operations": 1, "replaces": 0, "retires": 0,
+                },
+                "duration_ms": 12,
+                "state": "planned",
+            },
+            payload,
+        )
+        for private in ("private title", X, str(self.root)):
+            self.assertNotIn(private, out)
+
+    def test_an_unapproved_folder_blocks_manual_approval_mode_and_says_how_to_go_on(self):
+        self.config = replace(self.config, target_policy="approved-only")
+        self.write(self.a, X)
+
+        code, out, _errors = self.cli("plan", "--json")
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("blocked_invalid", 1, "approve-targets-or-enable-automatic-targets"),
+            (payload["state"], payload["counts"]["invalid_replicas"], payload["next_action"]),
+        )
+        self.assertNotIn(OLD_ACCOUNT[:8], out)
+
+    def test_sync_copies_a_chat_and_reports_the_run(self):
+        size = self.write(self.a, X).stat().st_size
+
+        code, out, errors = self.cli("sync", "--json", clock=itertools.count(10.0, 0.012).__next__)
+
+        self.assertEqual((0, ""), (code, errors))
+        payload = json.loads(out)
+        self.assertIsInstance(payload.pop("plan_id"), str)
+        self.assertRegex(payload.pop("run_id"), "^[0-9a-f]{32}$")
+        self.assertEqual(
+            {
+                "bytes": size,
+                "counts": {"ignored_folders": 1, "operations": 1, "planned": 1},
+                "duration_ms": 12,
+                "state": "committed",
+                "progress": "finished",
+            },
+            payload,
+        )
+        self.assertEqual("local_" + X, self.read(self.b, X)["sessionId"])
+
+    def test_auto_reports_the_chat_sync_in_plain_text(self):
+        size = self.write(self.a, X).stat().st_size
+
+        code, out, errors = self.cli("auto", clock=itertools.count(20.0, 0.012).__next__)
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertRegex(
+            out,
+            r"^bytes={} counts=\{{'operations': 1, 'planned': 1, 'ignored_folders': 1\}} "
+            r"duration_ms=12 plan_id=\S+ run_id=[0-9a-f]{{32}} state=committed progress=finished\n$".format(size),
+        )
+
+    def test_auto_waits_without_writing_while_another_writer_holds_the_lock(self):
+        self.write(self.a, X)
+
+        with ExclusiveFileLock(self.config.state_dir / "transaction.lock"):
+            code, out, errors = self.cli("auto", engine_factory=self.engine(lock_timeout=0))
+
+        self.assertEqual((0, "state=skipped reason=busy progress=waiting-for-sync\n", ""), (code, out, errors))
+        self.assertIsNone(self.read(self.b, X))
+        self.assertFalse(state_path(self.config.state_dir).exists())
+
+    def test_a_run_left_half_rolled_back_stops_sync_without_naming_it(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+        from claude_session_sync.journal import RunJournal
+
+        self.write(self.a, X)
+        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("sync")
+        run_id = next((self.config.state_dir / "runs").iterdir()).name
+        RunJournal.load(self.config.state_dir, run_id).set_phase("ABORTING")
+
+        code, out, _errors = self.cli("sync", "--json")
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            {
+                "state": "failed",
+                "reason": "recovery-pending",
+                "next_action": "run-doctor",
+                "error_type": "recovery-pending-error",
+                "progress": "needs-attention",
+            },
+            json.loads(out),
+        )
+        self.assertNotIn(run_id, out)
+
+    def test_an_unusable_journal_key_stops_sync_without_naming_it(self):
+        self.write(self.a, X)
+        self.config.state_dir.mkdir(mode=0o700)
+        key = self.config.state_dir / "journal.key"
+        key.write_bytes(b"short")
+        key.chmod(0o600)
+
+        code, out, _errors = self.cli("sync", "--json")
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("invalid-journal", "journal-error", "run-doctor"),
+            (payload["reason"], payload["error_type"], payload["next_action"]),
+        )
+        self.assertNotIn("key", out)
+        self.assertIsNone(self.read(self.b, X))
+
+    def test_a_slow_process_check_asks_for_a_retry_without_naming_the_process(self):
+        def slow_probe():
+            raise subprocess.TimeoutExpired(["ps", "private-argument"], 2)
+
+        self.write(self.a, X)
+        code, out, _errors = self.cli(
+            "sync", "--json",
+            engine_factory=lambda config: TransactionEngine(config.state_dir, process_probe=slow_probe),
+        )
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("process-inspection-timeout", "process-timeout", "retry-sync"),
+            (payload["reason"], payload["error_type"], payload["next_action"]),
+        )
+        self.assertNotIn("private", out)
+        self.assertIsNone(self.read(self.b, X))
+
+
+class SwitchTests(ChatCliFixture):
+    """switch: wait for Claude to quit, sync, then reopen Claude."""
+
+    def launched(self, launches):
+        return launches == [("launch", ("open",))]
+
+    def test_a_switch_waits_for_the_other_writer_then_syncs_and_reopens_claude(self):
+        self.write(self.a, X)
+        writer = ExclusiveFileLock(self.config.state_dir / "transaction.lock").acquire()
+        self.addCleanup(writer.release)
+        sleeps, launches = [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            writer.release()
+
+        code, out, errors = self.cli(
+            "switch", "Work", "--json",
+            engine_factory=self.engine(lock_timeout=0),
+            launcher=FakeLauncher(launches),
+            sleeper=sleep,
+        )
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual([0.1], sleeps)
+        self.assertEqual("committed", json.loads(out)["state"])
+        self.assertEqual("local_" + X, self.read(self.b, X)["sessionId"])
+        self.assertTrue(self.launched(launches))
+
+    def test_a_switch_waits_for_claude_to_finish_quitting(self):
+        probe = SequencedProcessProbe(((object(),), (object(),), ()))
+        clock = ManualClock()
+        launches = []
+
+        code, _out, errors = self.cli(
+            "switch", "Work", "--wait-for-exit", "1",
+            process_probe=probe, launcher=FakeLauncher(launches), monotonic=clock, sleeper=clock.sleep,
+        )
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual(3, len(probe.calls))
+        self.assertEqual([0.1, 0.1], clock.sleeps)
+        self.assertTrue(self.launched(launches))
+
+    def test_a_second_switch_during_a_handoff_neither_syncs_nor_launches(self):
+        entered, release = threading.Event(), threading.Event()
+        launches, first = [], []
+
+        class HeldProbe:
+            def running(self, **_options):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("the test did not release the first switch")
+                return ()
+
+        thread = threading.Thread(
+            target=lambda: first.append(
+                self.cli("switch", "Work", process_probe=HeldProbe(), launcher=FakeLauncher(launches))
+            )
+        )
+        thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        second = self.cli(
+            "switch", "Work",
+            planner_factory=lambda _config: self.fail("the second switch must not plan"),
+            launcher=FakeLauncher(launches),
+        )
+        release.set()
+        thread.join(timeout=5)
+
+        self.assertEqual((1, "state=blocked_switch reason=handoff-running\n", ""), second)
+        self.assertEqual(0, first[0][0], first)
+        self.assertTrue(self.launched(launches))
+
+    def test_a_failed_launch_command_is_reported_and_the_next_switch_still_syncs(self):
+        self.config = replace(
+            self.config,
+            profiles=(replace(self.config.profiles[0], launch_command=("/bin/sh", "-c", "exit 3")),),
+        )
+        self.write(self.a, X)
+        first = self.cli("switch", "Work")
+        self.write(self.a, Y)
+        second = self.cli("switch", "Work")
+
+        self.assertEqual([(1, "state=launch_failed reason=launch-command-failed\n", "")] * 2, [first, second])
+        self.assertIsNotNone(self.read(self.b, Y), "a failed launch must not block the next switch")
+
+    def test_a_claude_that_has_not_shown_up_yet_does_not_block_the_next_switch(self):
+        # The command succeeds, but Claude never shows up in the process list.
+        self.config = replace(
+            self.config, profiles=(replace(self.config.profiles[0], launch_command=("/usr/bin/true",)),)
+        )
+        self.write(self.a, X)
+        first = self.cli("switch", "Work")[0]
+        self.write(self.a, Y)
+        second = self.cli("switch", "Work")[0]
+
+        self.assertEqual([0, 0], [first, second])
+        self.assertIsNotNone(self.read(self.b, Y))
+
+    def test_a_switch_copies_chats_before_it_reopens_claude(self):
+        self.write(self.a, X)
+        seen = []
+        launcher = SimpleNamespace(
+            launch=lambda command: seen.append((tuple(command), self.read(self.b, X) is not None))
+        )
+
+        code, out, errors = self.cli("switch", "Work", "--json", launcher=launcher)
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual([(("open",), True)], seen)
+        self.assertEqual("finished", json.loads(out)["progress"])
+
+    def test_a_switch_blocked_by_an_unsafe_chat_file_still_reopens_claude(self):
+        (self.a / "local_{}.json".format(Y)).symlink_to(self.root / "elsewhere.json")
+        launches = []
+
+        code, out, _errors = self.cli("switch", "Work", "--json", launcher=FakeLauncher(launches))
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertTrue(self.launched(launches))
+        self.assertEqual(
+            ("blocked_invalid", "needs-attention", "started"),
+            (payload["state"], payload["progress"], payload["launch"]),
+        )
+
+    def test_a_switch_whose_chat_sync_fails_still_reopens_claude(self):
+        def broken_probe():
+            raise RuntimeError("private engine detail")
+
+        self.write(self.a, X)
+        launches = []
+
+        code, out, _errors = self.cli(
+            "switch", "Work", "--json",
+            engine_factory=lambda config: TransactionEngine(config.state_dir, process_probe=broken_probe),
+            launcher=FakeLauncher(launches),
+        )
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertTrue(self.launched(launches))
+        self.assertEqual(
+            ("failed", "chat-sync-error", "needs-attention", "started"),
+            (payload["state"], payload["reason"], payload["progress"], payload["launch"]),
+        )
+        self.assertNotIn("private", out)
+
+    def test_claude_reopens_even_when_the_switch_crashes_after_claude_closed(self):
+        from unittest import mock
+
+        launches = []
+        with mock.patch("claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")):
+            code, _out, errors = self.cli("switch", "Work", launcher=FakeLauncher(launches))
+
+        self.assertEqual(1, code)
+        self.assertIn("disk full", errors)
+        self.assertTrue(self.launched(launches))
+
+
+class AdapterBesideChatTests(ChatCliFixture):
+    """Routines and pins and groups report beside a committed chat sync and never change it."""
+
+    def sync(self, **dependencies):
+        self.write(self.a, X)
+        code, out, errors = self.cli("sync", "--json", **dependencies)
+        return code, json.loads(out), errors
+
+    def test_routines_report_beside_a_committed_chat_sync(self):
+        self.config = replace(self.config, sync_code_routines=True)
+
+        code, payload, errors = self.sync(routine_factory=lambda _config: FakeRoutine())
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual("committed", payload["state"])
+        self.assertEqual(
+            {"state": "synced", "profiles": 1, "targets": 3, "manifests": 2, "tasks": 4, "writes": 1},
+            payload["routines"],
+        )
+
+    def test_a_routine_failure_leaves_the_committed_chat_result(self):
+        class BrokenRoutine:
+            def sync(self):
+                raise RuntimeError("unexpected routine adapter failure")
+
+        self.config = replace(self.config, sync_code_routines=True)
+
+        code, payload, _errors = self.sync(routine_factory=lambda _config: BrokenRoutine())
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("committed", "needs-attention", {"state": "skipped", "reason": "routine-error"}),
+            (payload["state"], payload["progress"], payload["routines"]),
+        )
+
+    def test_adopt_current_sidebar_reaches_only_the_layout_adapter(self):
+        from test_cli import FakeLayoutReceipt
+
+        calls = []
+
+        class RecordingLayout:
+            def sync(self, *, adopt_current_sidebar=False):
+                calls.append(adopt_current_sidebar)
+                return FakeLayoutReceipt()
+
+        self.config = replace(self.config, sync_sidebar_layout=True, sync_code_routines=True)
+        self.write(self.a, X)
+
+        code, out, errors = self.cli(
+            "sync", "--adopt-current-sidebar", "--json",
+            layout_factory=lambda _config: RecordingLayout(),
+            routine_factory=lambda _config: FakeRoutine(),
+        )
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual([True], calls)
+        self.assertEqual(("committed", "synced"), (json.loads(out)["state"], json.loads(out)["layout"]["state"]))
+
+    def test_pins_and_groups_report_beside_a_committed_chat_sync(self):
+        self.config = replace(self.config, sync_sidebar_layout=True)
+
+        code, payload, errors = self.sync(layout_factory=lambda _config: FakeLayout())
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual("committed", payload["state"])
+        self.assertEqual(
+            {"state": "synced", "profiles": 1, "records": 2, "groups": 4, "assignments": 12, "pins": 3},
+            payload["layout"],
+        )
+
+    def test_sync_says_plainly_when_no_account_has_groups_yet(self):
+        from claude_session_sync.layout import LayoutReceipt
+
+        class EmptyLayout:
+            def sync(self):
+                return LayoutReceipt("noop", 1, 0, 0, 0, 0, "no-groups-yet")
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+
+        code, payload, errors = self.sync(layout_factory=lambda _config: EmptyLayout())
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual("finished", payload["progress"])
+        self.assertEqual(
+            {"state": "noop", "reason": "no-groups-yet", "profiles": 1, "records": 0,
+             "groups": 0, "assignments": 0, "pins": 0},
+            payload["layout"],
+        )
+
+    def test_a_layout_failure_leaves_the_committed_chat_result(self):
+        class BrokenLayout:
+            def sync(self):
+                raise RuntimeError("unexpected adapter failure")
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+
+        code, payload, _errors = self.sync(layout_factory=lambda _config: BrokenLayout())
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("committed", "needs-attention", {"state": "skipped", "reason": "layout-error"}),
+            (payload["state"], payload["progress"], payload["layout"]),
+        )
+
+    def test_an_unsafe_layout_reports_the_check_that_failed(self):
+        from claude_session_sync.layout import LayoutError
+
+        class UnsafeLayout:
+            def sync(self):
+                raise LayoutError("custom group records contain conflicting ids")
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+
+        code, payload, _errors = self.sync(layout_factory=lambda _config: UnsafeLayout())
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            ("committed", "needs-attention", "unsafe-layout", "custom group records contain conflicting ids"),
+            (payload["state"], payload["progress"], payload["layout"]["reason"], payload["layout"]["detail"]),
+        )
 
 
 if __name__ == "__main__":

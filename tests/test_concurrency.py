@@ -18,7 +18,7 @@ def _plan(source: Path, destination: Path, destination_before: bytes):
     return SimpleNamespace(
         operations=(
             SimpleNamespace(
-                kind="copy",
+                kind="replace",
                 session_id="concurrent",
                 source=source,
                 destination=destination,
@@ -27,7 +27,6 @@ def _plan(source: Path, destination: Path, destination_before: bytes):
                 size=len(source_bytes),
             ),
         ),
-        conflicts=(),
         invalid_replicas=(),
         plan_id="concurrent-plan",
     )

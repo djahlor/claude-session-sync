@@ -23,7 +23,7 @@ def operation(
 ):
     source_bytes = source.read_bytes()
     return SimpleNamespace(
-        kind="copy",
+        kind="create" if destination_before is None else "replace",
         session_id=session_id,
         source=source,
         destination=destination,
@@ -38,7 +38,6 @@ def operation(
 def plan(operations: Iterable[object]):
     return SimpleNamespace(
         operations=tuple(operations),
-        conflicts=(),
         invalid_replicas=(),
         plan_id="rollback-plan",
     )

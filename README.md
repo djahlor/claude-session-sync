@@ -98,7 +98,7 @@ data, conflicting edits, or an unknown format. Never delete backups to clear an 
 ## Details
 
 [Commands and recovery](docs/technical-reference.md) ·
-[Tested scope and limits](docs/public-readiness-audit.md) ·
+[Tested scope and limits](docs/technical-reference.md#limits) ·
 [MIT license](LICENSE)
 
 This project is not affiliated with or supported by Anthropic.

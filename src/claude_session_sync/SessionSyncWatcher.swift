@@ -633,11 +633,7 @@ private final class SessionSyncWatcher: NSObject {
         as? NSRunningApplication
     else { return }
     let executableMatches = application.executableURL?.standardizedFileURL.path == claudeExecutable
-    let bundleIdentifier = application.bundleIdentifier ?? ""
-    let knownBundle =
-      bundleIdentifier == "com.anthropic.claudefordesktop"
-      || bundleIdentifier == "com.khiet.claude-personal"
-      || bundleIdentifier.hasPrefix("com.claude-session-sync.")
+    let knownBundle = application.bundleIdentifier == "com.anthropic.claudefordesktop"
     let pid = application.processIdentifier
     queue.async { [weak self] in
       guard let self = self else { return }

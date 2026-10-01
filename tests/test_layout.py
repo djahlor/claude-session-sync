@@ -55,6 +55,18 @@ def scope(*groups, assignments=None):
     }
 
 
+def recovery_record(target, before, after):
+    """One version 2 recovery record, as the record journal writes it."""
+
+    return {
+        "target": target,
+        "before": base64.b64encode(before).decode("ascii"),
+        "after": base64.b64encode(after).decode("ascii"),
+        "before_sha256": hashlib.sha256(before).hexdigest(),
+        "after_sha256": hashlib.sha256(after).hexdigest(),
+    }
+
+
 def records(scopes, *, active=None, pins=None, extra=None):
     pins = list(pins or [])
     state = {
@@ -324,20 +336,21 @@ class LayoutRecoveryTests(unittest.TestCase):
             database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
             database_path.mkdir(parents=True)
             before = b"before"
+            synchronizer = LayoutSynchronizer(
+                config, helper=root / "helper", process_probe=lambda: ()
+            )
             journal_path = journal_root / "run.json"
             journal_path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
-                        "run_id": "run",
+                        "version": 2,
                         "state": "PREPARED",
-                        "database": str(database_path),
                         "records": [
-                            {
-                                "key": DFRAME_STORE_KEY.hex(),
-                                "before": before.hex(),
-                                "after_sha256": hashlib.sha256(b"after").hexdigest(),
-                            }
+                            recovery_record(
+                                synchronizer._record_target(database_path, DFRAME_STORE_KEY),
+                                before,
+                                b"after",
+                            )
                         ],
                     }
                 ),
@@ -351,9 +364,6 @@ class LayoutRecoveryTests(unittest.TestCase):
                 def get(self, key):
                     return before
 
-            synchronizer = LayoutSynchronizer(
-                config, helper=root / "helper", process_probe=lambda: ()
-            )
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 synchronizer._recover_pending()
 
@@ -362,7 +372,7 @@ class LayoutRecoveryTests(unittest.TestCase):
                 json.loads(journal_path.read_text(encoding="utf-8"))["state"],
             )
 
-    def test_legacy_mixed_recovery_preserves_independent_layout_changes(self):
+    def test_mixed_recovery_preserves_independent_layout_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
@@ -370,19 +380,17 @@ class LayoutRecoveryTests(unittest.TestCase):
             database_path.mkdir(parents=True)
             journal_root = config.state_dir / "layout-runs"
             journal_root.mkdir(parents=True)
+            synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
             journal_path = journal_root / "run.json"
             journal_path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "state": "PREPARED",
-                        "database": str(database_path),
                         "records": [
-                            {
-                                "key": key.hex(),
-                                "before": b"before".hex(),
-                                "after_sha256": hashlib.sha256(b"after").hexdigest(),
-                            }
+                            recovery_record(
+                                synchronizer._record_target(database_path, key), b"before", b"after"
+                            )
                             for key in (GROUP_SCOPES_KEY, DFRAME_STORE_KEY)
                         ],
                     }
@@ -402,7 +410,6 @@ class LayoutRecoveryTests(unittest.TestCase):
                     writes.append(records)
                     values.update(records)
 
-            synchronizer = LayoutSynchronizer(config, process_probe=lambda: ())
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 with self.assertRaisesRegex(LayoutRecoveryError, "independently"):
                     synchronizer._recover_pending()

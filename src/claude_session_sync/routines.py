@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import copy
 import os
 import re
@@ -20,7 +19,6 @@ from .filesystem import (
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .record_journal import (
-    Record,
     RecordJournal,
     RecordJournalError,
     RecordRecoveryError,
@@ -587,23 +585,6 @@ class RoutineSynchronizer:
             self._assert_stopped()
             durable_unlink(Path(target))
 
-        def legacy(document: Mapping[str, Any]) -> Sequence[Record]:
-            records = document["records"]
-            if not isinstance(records, list):
-                raise ValueError("invalid routine recovery records")
-            return [
-                Record(
-                    item["path"],
-                    None
-                    if item["before"] is None
-                    else base64.b64decode(item["before"], validate=True),
-                    None,
-                    item["after_sha256"],
-                    legacy=True,
-                )
-                for item in records
-            ]
-
         return RecordJournal(
             self._journal_root(),
             read=lambda target: _read_optional(Path(target)),
@@ -612,7 +593,6 @@ class RoutineSynchronizer:
             validate=validate,
             before_mutation=self._assert_stopped,
             retention=self.config.retention,
-            legacy_loader=legacy,
         )
 
     def _commit(

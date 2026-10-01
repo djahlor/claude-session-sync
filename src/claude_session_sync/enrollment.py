@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Iterable, List, Sequence, Set, Tuple
 
+from .filesystem import normalized_path
 from .logins import Logins
 
 
@@ -68,10 +69,7 @@ def new_login_targets(
 
     if config.target_policy != "logins":
         return []
-    roots = {
-        profile.name: Path(os.path.abspath(os.path.expanduser(os.fspath(profile.data_root))))
-        for profile in config.profiles
-    }
+    roots = {profile.name: normalized_path(profile.data_root) for profile in config.profiles}
     found = []
     for target in targets:
         key = target_key(target)

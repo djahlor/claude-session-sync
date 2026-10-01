@@ -34,7 +34,6 @@ class InstallMenuTests(unittest.TestCase):
             "--automatic-targets",
             "--sync-layout",
             "--sync-routines",
-            "--disable-personal",
         ])
         self.assertNotIn("Advanced:", result.stdout)
         self.assertNotIn("Work and Personal", result.stdout)
@@ -42,8 +41,8 @@ class InstallMenuTests(unittest.TestCase):
     def test_safe_mode_still_requires_explicit_target_approval(self) -> None:
         result = self.run_menu("2")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("SETUP_ARG=--automatic-targets", result.stdout)
-        self.assertIn("SETUP_ARG=--disable-personal", result.stdout)
+        arguments = re.findall(r"SETUP_ARG=([^\r\n]*)", result.stdout)
+        self.assertEqual(arguments, ["--sync-layout", "--sync-routines"])
 
     def test_removed_and_invalid_choices_do_not_start_installation(self) -> None:
         for choice in ("3", "", "invalid"):

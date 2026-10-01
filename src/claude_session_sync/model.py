@@ -67,8 +67,7 @@ class TmpFile:
 @dataclass(frozen=True)
 class Operation:
     # create: new file, never overwriting; replace: swap an existing file;
-    # retire: remove a file (its bytes stay in the run journal); copy: legacy
-    # create-or-replace.
+    # retire: remove a file (its bytes stay in the run journal).
     kind: str
     session_id: str
     source: Path
@@ -78,13 +77,6 @@ class Operation:
     size: int
     artifact: str = "record"  # record, marker, or tmp
     source_state_hash: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class Conflict:
-    session_id: str
-    reason: str
-    replicas: Tuple[Replica, ...]
 
 
 @dataclass(frozen=True)
@@ -105,10 +97,7 @@ class Discovery:
 
 @dataclass(frozen=True)
 class Plan:
-    version: int
-    config_digest: str
     operations: Tuple[Operation, ...]
-    conflicts: Tuple[Conflict, ...]
     invalid_replicas: Tuple[InvalidReplica, ...]
     plan_id: str
     total_bytes: int

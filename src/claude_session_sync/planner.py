@@ -6,13 +6,11 @@ rules leave alone are reported as problems and never block the rest.
 """
 
 import hashlib
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import strict_json as json
 from .chat_model import (
     Copy,
     CreateRecord,
@@ -26,23 +24,19 @@ from .chat_model import (
 from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
+from .filesystem import normalized_path
 from .hash_cache import HashCache
 from .logins import default_app_log, record_logins
 from .model import (
-    Conflict,
     Discovery,
     InvalidReplica,
     Operation,
     Plan,
-    Replica,
     SyncRequest,
     Target,
 )
 from .rules import plan as plan_rules
 from .store import SessionStore
-
-
-PLAN_VERSION = 2
 
 
 @dataclass
@@ -108,7 +102,7 @@ class Planner:
 
     def _select(self, config, found: Discovery, state: ChatState):
         """Record logins and enroll new folders in ``state``, then select."""
-        roots = {profile.name: _normalized(profile.data_root) for profile in config.profiles}
+        roots = {profile.name: normalized_path(profile.data_root) for profile in config.profiles}
         default_roots = {
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
@@ -160,16 +154,8 @@ class Planner:
         decided = plan_rules(snapshots, state.sync, prefer_key, prefer_session)
         operations = tuple(_operation(action, targets, index) for action in decided.actions)
 
-        invalid_tuple = tuple(
-            sorted(invalid, key=lambda item: _portable_path(item.path, config))
-        )
-        conflicts_tuple: Tuple[Conflict, ...] = ()
-        config_digest = _config_digest(config)
         total_bytes = sum(
             operation.size for operation in operations if operation.kind != "retire"
-        )
-        identity = _plan_identity(
-            config, config_digest, operations, conflicts_tuple, invalid_tuple, total_bytes
         )
 
         def rescan() -> List[Snapshot]:
@@ -189,12 +175,9 @@ class Planner:
             rescan=rescan,
         )
         return Plan(
-            PLAN_VERSION,
-            config_digest,
             operations,
-            conflicts_tuple,
-            invalid_tuple,
-            hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest(),
+            tuple(sorted(invalid, key=lambda item: str(item.path))),
+            _run_label(operations),
             total_bytes,
             problems=tuple(decided.problems),
             ignored_targets=len(ignored),
@@ -279,123 +262,14 @@ def _resolve_prefer(prefer: Optional[str], targets: Mapping[str, Target]) -> Opt
     raise ValueError("--prefer names no synced sidebar folder")
 
 
-def _normalized(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+def _run_label(operations: Sequence[Operation]) -> str:
+    """A short label for receipts and journals, from the planned steps. Nothing compares it."""
 
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _config_digest(config: Config) -> str:
-    profiles = [
-        {
-            "name": profile.name,
-            "launch_command": list(profile.launch_command),
-            "is_default": profile.is_default,
-        }
-        for profile in sorted(config.profiles, key=lambda item: item.name)
-    ]
-    portable_config = {
-        "profiles": profiles,
-        "retention": config.retention,
-        "acknowledge_cross_profile_copy": config.acknowledge_cross_profile_copy,
-        "acknowledge_cross_account_copy": config.acknowledge_cross_account_copy,
-        "claude_executable": config.claude_executable.name,
-        "approved_targets": [
-            [target.profile_name, target.account_id, target.workspace_id]
-            for target in sorted(
-                config.approved_targets,
-                key=lambda item: (
-                    item.profile_name,
-                    item.account_id,
-                    item.workspace_id,
-                ),
-            )
-        ],
-    }
-    return hashlib.sha256(_canonical_json(portable_config).encode("utf-8")).hexdigest()
-
-
-def _plan_identity(
-    config: Config,
-    config_digest: str,
-    operations: Sequence[Operation],
-    conflicts: Sequence[Conflict],
-    invalid_replicas: Sequence[InvalidReplica],
-    total_bytes: int,
-) -> Mapping[str, Any]:
-    return {
-        "version": PLAN_VERSION,
-        "config_digest": config_digest,
-        "operations": [
-            {
-                "kind": operation.kind,
-                "artifact": operation.artifact,
-                "session_id": operation.session_id,
-                "source": _portable_path(operation.source, config),
-                "destination": _portable_path(operation.destination, config),
-                "source_digest": operation.source_digest,
-                "destination_digest": operation.destination_digest_or_none,
-                "size": operation.size,
-            }
-            for operation in operations
-        ],
-        "conflicts": [
-            {
-                "session_id": conflict.session_id,
-                "reason": conflict.reason,
-                "replicas": [
-                    {
-                        "path": _portable_path(replica.path, config),
-                        "digest": replica.digest,
-                        "size": replica.size,
-                    }
-                    for replica in conflict.replicas
-                ],
-            }
-            for conflict in conflicts
-        ],
-        "invalid_replicas": [
-            {
-                "path": _portable_path(invalid.path, config),
-                "reason": _portable_reason(invalid.reason, config),
-            }
-            for invalid in invalid_replicas
-        ],
-        "total_bytes": total_bytes,
-    }
-
-
-def _portable_path(path: Path, config: Config) -> str:
-    candidates = sorted(
-        config.profiles, key=lambda profile: len(str(profile.data_root)), reverse=True
+    steps = "\n".join(
+        "{} {} {} {} {}".format(
+            operation.kind, operation.artifact, operation.session_id,
+            operation.source, operation.destination,
+        )
+        for operation in operations
     )
-    for profile in candidates:
-        try:
-            relative = path.relative_to(profile.data_root)
-        except ValueError:
-            continue
-        return "{}/{}".format(profile.name, relative.as_posix())
-    return "<external>/{}".format(path.name)
-
-
-def _portable_reason(reason: str, config: Config) -> str:
-    portable = reason
-    for profile in config.profiles:
-        portable = portable.replace(str(profile.data_root), "<{}>".format(profile.name))
-    portable = portable.replace(str(config.state_dir), "<state-dir>")
-    return portable
-
-
-def _target_key(target: Target) -> Tuple[str, str, str]:
-    return target.profile_name, target.account_id, target.workspace_id
-
-
-def _replica_key(replica: Replica) -> Tuple[str, str, str, str]:
-    return (
-        replica.target.profile_name,
-        replica.target.account_id,
-        replica.target.workspace_id,
-        replica.session_id,
-    )
+    return hashlib.sha256(steps.encode("utf-8")).hexdigest()[:12]

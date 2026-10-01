@@ -22,7 +22,7 @@ class InstallTransaction:
 
     def __init__(self, *, targets: Sequence[Path], state_roots: Iterable[Path],
                  launch_agent: Path, recovery_root: Path,
-                 runner: Callable[..., object], legacy_agents: Sequence[Path] = ()):
+                 runner: Callable[..., object]):
         self.targets = tuple(self._normalize_system_temp(Path(path)) for path in targets)
         self.state_roots = tuple(sorted({
             self._normalize_system_temp(Path(path)) for path in state_roots
@@ -31,14 +31,10 @@ class InstallTransaction:
         self.runner = runner
         self.domain = "gui/{}".format(os.getuid())
         self.label = "com.claude-session-sync.watcher"
-        self.legacy_agents = tuple(
-            self._normalize_system_temp(Path(path)) for path in legacy_agents
-        )
         self.root = self._normalize_system_temp(Path(recovery_root))
         self.snapshot = self.root / "snapshot"
         self.locks = []
         self.was_loaded = False
-        self.legacy_loaded = {}
         self.preparation = None
 
     @staticmethod
@@ -90,24 +86,13 @@ class InstallTransaction:
             ["/bin/launchctl", "print", self.domain + "/" + self.label],
             check=False, text=True, capture_output=True, timeout=10,
         )
-        return self._checked_service_status(result, self.label)
-
-    def _label_loaded(self, label: str) -> bool:
-        result = self.runner(
-            ["/bin/launchctl", "print", self.domain + "/" + label],
-            check=False, text=True, capture_output=True, timeout=10,
-        )
-        return self._checked_service_status(result, label)
-
-    @staticmethod
-    def _checked_service_status(result, label: str) -> bool:
         if result.returncode == 0:
             return True
         if result.returncode == 113:
             return False
         raise RuntimeError(
             "could not verify launch service {} (launchctl exit {})".format(
-                label, result.returncode
+                self.label, result.returncode
             )
         )
 
@@ -152,16 +137,11 @@ class InstallTransaction:
                 if target.exists() or target.is_symlink():
                     self._copy(target, self.snapshot / str(index))
             self.was_loaded = self._loaded()
-            self.legacy_loaded = {
-                path.stem: self._label_loaded(path.stem)
-                for path in self.legacy_agents
-            }
             self._fsync_snapshot()
             manifest = {
                 "version": 1,
                 "phase": "prepared",
                 "was_loaded": self.was_loaded,
-                "legacy_loaded": self.legacy_loaded,
                 "targets": [str(path) for path in self.targets],
                 "snapshot_digests": {
                     str(index): self._digest(self.snapshot / str(index))
@@ -205,10 +185,6 @@ class InstallTransaction:
             if manifest.get("phase") != "prepared":
                 raise ValueError("unsupported recovery phase")
             self.was_loaded = bool(manifest["was_loaded"])
-            self.legacy_loaded = {
-                str(key): bool(value)
-                for key, value in manifest.get("legacy_loaded", {}).items()
-            }
             if not self.snapshot.is_dir():
                 raise ValueError("recovery snapshot is missing")
             actual = {
@@ -328,19 +304,6 @@ class InstallTransaction:
                 raise InstallRecoveryError(
                     "watcher stop failed; recovery snapshot retained at {}".format(self.root)
                 )
-        for path in self.legacy_agents:
-            desired = self.legacy_loaded.get(path.stem, False)
-            loaded = self._label_loaded(path.stem)
-            if desired and not loaded and path.exists():
-                result = self.runner(
-                    ["/bin/launchctl", "bootstrap", self.domain, str(path)],
-                    check=False, text=True, capture_output=True,
-                )
-                if result.returncode != 0 or not self._label_loaded(path.stem):
-                    raise InstallRecoveryError(
-                        "legacy service restore failed; recovery snapshot retained at {}"
-                        .format(self.root)
-                    )
 
     def _release(self) -> None:
         for lock in reversed(self.locks):

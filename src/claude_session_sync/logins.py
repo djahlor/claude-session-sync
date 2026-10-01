@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import strict_json as json
+from .filesystem import normalized_path
 
 
 APP_LOG_TAIL = 16 * 1024 * 1024  # Claude rotates main.log at about 10 MB
@@ -79,7 +80,7 @@ def record_logins(
     login.
     """
 
-    for root in {_normalized(Path(root)) for root in roots}:
+    for root in {normalized_path(root) for root in roots}:
         app_log = app_log_for(root)
         seen = list(logins_in_app_log(app_log, now_ms)) if app_log is not None else []
         signed_in = last_known_account(root)
@@ -88,7 +89,3 @@ def record_logins(
         for account, login_ms in seen:
             known = logins.setdefault(str(root), {})
             known[account] = min(login_ms, known.get(account, login_ms))
-
-
-def _normalized(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))

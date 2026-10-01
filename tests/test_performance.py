@@ -50,7 +50,7 @@ class PerformanceTests(unittest.TestCase):
             warm = planner.plan(SyncRequest(config))
             elapsed = time.monotonic() - started
 
-            self.assertEqual(cold.plan_id, warm.plan_id)
+            self.assertEqual((), warm.operations)
             self.assertLess(
                 elapsed, 3.0, "warm 5,000-replica plan took {:.3f}s".format(elapsed)
             )

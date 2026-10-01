@@ -44,8 +44,8 @@ window display progress without depending on Notification Center.
 - **Target**: one `<account>/<workspace>` session directory inside a profile.
 - **Replica**: one `local_<session-id>.json` file in a target.
 - **Revision**: validated JSON content identified by SHA-256, size, and mtime.
-- **Plan**: a canonical, deterministic set of copy operations or blocking
-  conflicts.
+- **Plan**: the create, replace, and retire steps of one run, and the chats
+  it leaves alone.
 - **Run**: the single-writer consistency boundary for one application or
   rollback transaction.
 
@@ -79,7 +79,7 @@ window display progress without depending on Notification Center.
 8. Logs contain run IDs, phases, counts, bytes, and profile labels, never chat
    titles, contents, or raw account identifiers.
 9. Default-profile process identity is explicit configuration, never inferred
-   from a wrapper's launch command.
+   from the profile's launch command.
 10. Process waits use monotonic wall-clock deadlines and subprocess timeouts;
     probe runtime cannot silently extend a configured handoff limit.
 11. Chat sync changes only validated session registry files. Sidebar sync is a
@@ -137,7 +137,7 @@ are excluded because their space context has different semantics.
 
 ```text
 IDLE -> DISCOVERING -> PLANNED
-  -> NOOP | BLOCKED_APP | BLOCKED_CONFLICT
+  -> NOOP | BLOCKED_APP | BLOCKED_INVALID
   -> LOCKED -> REVALIDATING -> JOURNALING -> STAGING
   -> COMMITTING -> VERIFYING -> COMMITTED
   -> ABORTING -> ROLLED_BACK | RECOVERY_REQUIRED
@@ -148,7 +148,7 @@ IDLE -> DISCOVERING -> PLANNED
 Tests exercise the external interface and CLI against temporary profile roots
 and injected process/launch adapters. Required behaviors include deterministic
 planning, explicit privacy scope, two-profile discovery, malformed and tied
-revision blocking, one-writer concurrency, interruption recovery, app-reopen
+revisions left alone, one-writer concurrency, interruption recovery, app-reopen
 abort, idempotent apply, byte-perfect rollback, and a 5,000-replica performance
 budget. Routine tests cover union, newest-edit selection, deletion propagation,
 new empty targets, malformed manifests, and missing task instructions.
