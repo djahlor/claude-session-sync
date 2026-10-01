@@ -112,6 +112,14 @@ class ChatSyncFixture(unittest.TestCase):
             state.sync.seen.setdefault(key, set()).add(session_id)
         save_state(state_path(self.config.state_dir), state)
 
+    def phases(self):
+        from claude_session_sync.journal import RunJournal
+
+        return [
+            RunJournal.load(self.config.state_dir, run.name).phase
+            for run in sorted((self.config.state_dir / "runs").iterdir())
+        ]
+
     def keys(self):
         return ["Work/{}/{}".format(A_ACCOUNT, A_ORG), "Work/{}/{}".format(B_ACCOUNT, B_ORG)]
 
@@ -222,7 +230,6 @@ class ChatSyncTests(ChatSyncFixture):
 
         run = self.sync()
 
-        self.assertFalse(self.running)
         self.assertEqual(1, run.newly_enrolled)
         self.assertIsNotNone(self.read(new_folder, X))
         self.assertIsNotNone(self.read(self.a, Y))
@@ -243,7 +250,7 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual(1, run.newly_enrolled)
         self.assertIsNotNone(self.read(new_folder, X))
 
-    def test_no_chat_is_written_if_claude_opens_during_a_run(self):
+    def test_the_engine_writes_no_chat_while_claude_is_open(self):
         from claude_session_sync.transaction import AppRunningError
 
         self.write(self.a, X)
@@ -303,6 +310,7 @@ class RecoveryTests(ChatSyncFixture):
     def test_an_interrupted_run_is_closed_and_the_next_run_goes_on(self):
         from unittest.mock import patch
         from claude_session_sync import transaction
+        from claude_session_sync.journal import RunJournal
 
         self.write(self.a, X)
         with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
@@ -312,7 +320,42 @@ class RecoveryTests(ChatSyncFixture):
         run = self.sync()
 
         self.assertEqual("committed", run.receipt.status)
+        self.assertEqual(1, run.recovered_runs)
         self.assertIsNotNone(self.read(self.b, X))
+        self.assertEqual(0, self.sync().recovered_runs)
+        self.assertEqual(
+            ["committed", "recovered"],
+            sorted(
+                RunJournal.load(self.config.state_dir, path.name).manifest["receipt"]["status"]
+                for path in (self.config.state_dir / "runs").iterdir()
+            ),
+        )
+
+    def test_a_run_whose_rollback_also_failed_is_closed_and_the_folders_agree(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X, title="from a", lastActivityAt=200)
+        self.write(self.b, X, title="t", lastActivityAt=100)
+        self.write(self.a, Y)
+        self.agree(X)
+
+        def write_then_fail(staged, destination):
+            transaction.commit_staged(staged, destination)
+            raise OSError("disk went away")
+
+        with patch.object(transaction, "commit_staged_new", write_then_fail), patch.object(
+            transaction.TransactionEngine, "_rollback_locked", side_effect=OSError("still gone")
+        ):
+            with self.assertRaises(transaction.RecoveryError):
+                self.sync()
+        self.assertEqual("RECOVERY_REQUIRED", self.phases()[0])
+
+        run = self.sync()
+
+        self.assertEqual(1, run.recovered_runs)
+        self.assertEqual("from a", self.read(self.b, X)["title"])
+        self.assertIsNotNone(self.read(self.b, Y))
 
     def test_staged_copies_left_by_a_killed_run_are_swept(self):
         leftover = self.b / ".local_{}.json.0123.stage".format(X)

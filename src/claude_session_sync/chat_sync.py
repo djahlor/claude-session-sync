@@ -29,6 +29,8 @@ class ChatRun:
     receipt: Optional[RunReceipt] = None
     problems: Dict[str, int] = field(default_factory=dict)
     newly_enrolled: int = 0
+    # Runs a killed process left open, closed before this run applied.
+    recovered_runs: int = 0
 
 
 def plan_chat_sync(
@@ -75,7 +77,7 @@ def run_chat_sync(
         on_disk = encode_state(state)
 
     sweep_stale_stages((target.path for target in context.targets.values()), time.time())
-    engine.close_interrupted_runs()
+    recovered_runs = engine.close_interrupted_runs()
     receipt = engine.apply(plan)
     _remember_placements(state, context, receipt)
 
@@ -86,6 +88,7 @@ def run_chat_sync(
         save_state(path, state)
     run = _summary(plan)
     run.receipt = receipt
+    run.recovered_runs = recovered_runs
     return run
 
 

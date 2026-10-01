@@ -140,22 +140,23 @@ class TransactionEngine:
                 prune_terminal_runs(self.state_root, self.retention)
             return receipt
 
-    def close_interrupted_runs(self) -> None:
+    def close_interrupted_runs(self) -> int:
         """Close runs a killed process left open, keeping what they wrote.
 
         Each write is one atomic step toward a version the next plan works out
         again, so a run cut short equals a run whose other steps were skipped.
-        The journal keeps every file a run replaced or removed, for a manual
+        The same holds for a run whose automatic rollback also failed. The
+        journal keeps every file a run replaced or removed, for a manual
         rollback. A run whose journal cannot be read stays open, and apply
-        refuses until it is recovered.
+        refuses until it is recovered. Returns how many runs were closed.
         """
 
         with self._writer_lock():
             try:
                 pending = pending_recovery_runs(self.state_root)
             except JournalError:
-                return
-            self._finish_interrupted_runs(pending)
+                return 0
+            return self._finish_interrupted_runs(pending)
 
     @contextmanager
     def _writer_lock(self):
@@ -380,13 +381,16 @@ class TransactionEngine:
             )
         return records
 
-    def _finish_interrupted_runs(self, pending: List[str]) -> None:
+    def _finish_interrupted_runs(self, pending: List[str]) -> int:
+        closed = 0
         for run_id in pending:
             try:
                 journal = RunJournal.load(self.state_root, run_id)
             except JournalError:
                 continue
             self._close_as_recovered(journal)
+            closed += 1
+        return closed
 
     @staticmethod
     def _close_as_recovered(journal: RunJournal) -> None:

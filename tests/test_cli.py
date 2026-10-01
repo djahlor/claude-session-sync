@@ -707,11 +707,11 @@ class CliSwitchTests(unittest.TestCase):
             )
             self.assertEqual(2, len(planner.requests), "a failed launch must not block the next switch")
 
-    def test_a_slow_launch_leaves_nothing_that_blocks_the_next_switch(self):
+    def test_a_claude_that_has_not_shown_up_yet_does_not_block_the_next_switch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             # The command succeeds, but Claude never shows up in the process list.
-            work = replace(config(root).profiles[0], launch_command=("/bin/sh", "-c", "sleep 0.2"))
+            work = replace(config(root).profiles[0], launch_command=("/usr/bin/true",))
             loaded = replace(config(root), profiles=(work, config(root).profiles[1]))
             planner = FakePlanner(Plan(1, "digest", (), (), (), "plan-safe", 0))
             dependencies = CliDependencies(

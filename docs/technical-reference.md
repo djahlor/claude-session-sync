@@ -417,9 +417,10 @@ reports `RECOVERY_REQUIRED`, stop launching Claude and preserve the state
 directory for manual inspection. Never delete a journal to silence an error.
 
 A chat run that a killed process left open, for example by a shutdown right
-after you quit Claude, is closed by the next chat sync. It keeps what it wrote,
-and its journal keeps every file it replaced or removed, so
-`claude-session-sync rollback RUN_ID` can still undo it.
+after you quit Claude, is closed by the next chat sync. That sync counts it as
+`recovered_runs`. The closed run keeps what it wrote, and its journal keeps
+every file it replaced or removed, so `claude-session-sync rollback RUN_ID` can
+still undo it.
 
 During the next sync while Claude is closed, sidebar recovery recognizes an interrupted run whose
 entire payload still matches its before or after state. It ignores only valid

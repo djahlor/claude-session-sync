@@ -131,6 +131,23 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual("committed", json.loads(out)["state"])
         self.assertIsNotNone(self.read(self.a, Y))
 
+    def test_a_sync_reports_a_run_a_killed_process_left_open(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+
+        self.write(self.a, X)
+        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("sync", "--json")
+
+        code, out, errors = self.cli("sync", "--json")
+
+        self.assertEqual(0, code, errors)
+        payload = json.loads(out)
+        self.assertEqual("committed", payload["state"])
+        self.assertEqual(1, payload["counts"]["recovered_runs"])
+        self.assertIsNotNone(self.read(self.b, X))
+
     def test_output_never_names_a_chat_or_a_path(self):
         self.write(self.a, X, title="private title")
 

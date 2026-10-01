@@ -620,6 +620,8 @@ def _chat_run_summary(run: Any, duration_ms: int) -> dict:
         "planned": len(plan.operations),
     }
     counts.update(_problem_counts(run))
+    if run.recovered_runs:
+        counts["recovered_runs"] = run.recovered_runs
     payload = {
         "bytes": receipt.bytes_copied,
         "counts": counts,
