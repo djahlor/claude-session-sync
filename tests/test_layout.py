@@ -1161,7 +1161,11 @@ class FirstAdoptionTests(unittest.TestCase):
         result = self.first_sync({"a/w": scope(), "b/w": scope("Focus")}, active="a/w")
 
         self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
-        self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
+        self.assertEqual(
+            LayoutSnapshot("a/w", {"groups": ["Focus"], "assignments": {}, "order": {"Focus": []}}),
+            result.snapshot,
+            "a counts as the source only once Claude uploads the copy",
+        )
         self.assertEqual("a/w", result.canonical_upload_scope, "a's servers must get the copy")
 
     def test_no_groups_anywhere_changes_nothing_and_says_so(self):
@@ -1383,6 +1387,86 @@ class DoctorTests(unittest.TestCase):
             {"layout": {"state": "skipped", "reason": "choose-main-account", "detail": "which one?"}},
             result,
         )
+
+
+class UnconfirmedUploadTests(unittest.TestCase):
+    """A copied layout counts only after Claude uploads it as the account's own."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+    latest = scope("Focus", assignments={"code:x": "id-focus"})
+
+    def switched_and_relaunched(self, root, *, b_after_relaunch, upload_consumed):
+        """a was the source; the switch to b copied a into b and asked Claude to upload it."""
+        synchronizer, fake, _database, values = self.transaction_fixture(root)
+        values.clear()
+        values.update(records({"a/w": self.latest, "b/w": scope("Old")}, active="b/w"))
+        values[layout_module.SYNC_OWNER_KEY] = b"\x01b"
+        values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+        (synchronizer.config.state_dir / "sidebar-layout-0.json").write_text(
+            json.dumps({"version": 1, "adopted_scope": "a/w"})
+        )
+        synchronizer.helper = root / "helper"
+        synchronizer.helper.write_bytes(b"fixture")
+        os.chmod(synchronizer.helper, 0o700)
+        database = patch("claude_session_sync.layout.LevelDatabase", fake)
+        targets = patch.object(synchronizer, "_target_sessions", return_value=self.targets)
+        with database, targets:
+            synchronizer.sync(after_account_switch=True)
+        self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+        # Claude reopens signed in to b, then quits.
+        if upload_consumed:
+            del values[layout_module.GROUP_UPLOAD_KEY]
+        for key, path in ((DFRAME_STORE_KEY, ("state", "customGroupsByScope")), (GROUP_SCOPES_KEY, ("value",))):
+            document = decoded(values[key])
+            target = document
+            for part in path:
+                target = target[part]
+            target["b/w"] = b_after_relaunch
+            values[key] = encoded(document)
+        return synchronizer, values, database, targets
+
+    def test_old_server_groups_reloaded_before_the_upload_never_overwrite_the_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, database, targets = self.switched_and_relaunched(
+                Path(directory), b_after_relaunch=scope("Old"), upload_consumed=False
+            )
+            before = dict(values)
+
+            with database, targets:
+                with self.assertRaisesRegex(LayoutChoiceError, "before Claude uploaded"):
+                    synchronizer.sync()
+
+            self.assertEqual(before, values, "nothing is written")
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Old"]}, group_names(values, self.targets))
+
+    def test_once_claude_uploaded_the_copy_the_signed_in_account_is_the_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            edited = scope("Focus", "New", assignments={"code:x": "id-new"})
+            synchronizer, values, database, targets = self.switched_and_relaunched(
+                Path(directory), b_after_relaunch=edited, upload_consumed=True
+            )
+
+            with database, targets:
+                receipt = synchronizer.sync()
+
+            self.assertEqual("synced", receipt.state)
+            self.assertEqual({"a/w": ["Focus", "New"], "b/w": ["Focus", "New"]}, group_names(values, self.targets))
+            snapshot = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            self.assertEqual({"version": 1, "adopted_scope": "b/w"}, json.loads(snapshot.read_text()))
+
+    def test_an_account_still_holding_the_copy_is_left_alone_until_the_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, database, targets = self.switched_and_relaunched(
+                Path(directory), b_after_relaunch=copy.deepcopy(self.latest), upload_consumed=False
+            )
+
+            with database, targets:
+                receipt = synchronizer.sync()
+
+            self.assertEqual("noop", receipt.state)
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
 
 
 if __name__ == "__main__":

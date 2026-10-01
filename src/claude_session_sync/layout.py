@@ -51,6 +51,11 @@ SYNC_METADATA_KEYS = (SYNC_OWNER_KEY, SYNC_ACTIVE_KEY, SYNC_QUARANTINE_KEY, GROU
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
 ADOPT_PENDING_FILENAME = "sidebar-adopt-pending.json"
+COPY_NOT_UPLOADED = (
+    "an account's groups changed before Claude uploaded the copy synced into it, "
+    "so they may be its old server groups; list the accounts with keep-sidebar "
+    "--dry-run, then keep one with keep-sidebar --account N --apply"
+)
 NEEDS_MAIN_ACCOUNT = (
     "it is unclear which account's pins and groups to keep; list the accounts "
     "with keep-sidebar --dry-run, then keep one with keep-sidebar --account N --apply"
@@ -81,9 +86,16 @@ class LayoutSnapshot:
     """
 
     adopted_scope: str
+    # The layout last copied into adopted_scope, kept while Claude has not
+    # consumed the marker that uploads it as that account's own. Until then
+    # that account is the source only while it still holds this layout.
+    unconfirmed_copy: Optional[Mapping[str, Any]] = None
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"version": SNAPSHOT_VERSION, "adopted_scope": self.adopted_scope}
+        document = {"version": SNAPSHOT_VERSION, "adopted_scope": self.adopted_scope}
+        if self.unconfirmed_copy is not None:
+            document["unconfirmed_copy"] = copy.deepcopy(dict(self.unconfirmed_copy))
+        return document
 
 
 @dataclass(frozen=True)
@@ -291,7 +303,37 @@ def _load_snapshot_document(document: Any) -> Optional[LayoutSnapshot]:
         return None
     if not isinstance(adopted_scope, str) or "/" not in adopted_scope:
         raise LayoutError("snapshot adopted scope has an unknown shape")
-    return LayoutSnapshot(adopted_scope)
+    unconfirmed = document.get("unconfirmed_copy")
+    if unconfirmed is not None and (
+        not isinstance(unconfirmed, dict)
+        or set(unconfirmed) != {"groups", "assignments", "order"}
+    ):
+        raise LayoutError("snapshot unconfirmed copy has an unknown shape")
+    return LayoutSnapshot(adopted_scope, unconfirmed)
+
+
+def _layout(scope: Mapping[str, Any]) -> Dict[str, Any]:
+    """A scope's groups, chat assignments, and group order by name, for comparison."""
+
+    names = dict(_ordered_group_pairs(scope))
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    return {
+        "groups": list(names.values()),
+        "assignments": {session: names[group] for session, group in sorted(assignments.items())},
+        "order": {name: list(sessions) for name, sessions in _scope_order_by_name(scope).items()},
+    }
+
+
+def _upload_scope(marker: Optional[bytes]) -> Optional[str]:
+    """The scope whose sidebar upload Claude has not consumed yet, if any."""
+
+    if marker is None or not marker.startswith(b"\x01"):
+        return None
+    try:
+        value = marker[1:].decode("utf-8")
+    except UnicodeError:
+        return None
+    return value[: -len("|migrate")] if value.endswith("|migrate") else value
 
 
 def _snapshot_bytes(path: Path) -> Optional[bytes]:
@@ -370,8 +412,13 @@ def _adopt_current_sidebar_records(
     timestamp_ms: Optional[int],
     source_scope: Optional[str],
     active_scope: Optional[str],
+    unconfirmed_copy: Optional[Mapping[str, Any]] = None,
 ) -> LayoutTransform:
-    """Copy one account's groups into every sync target; pins stay one shared list."""
+    """Copy one account's groups into every sync target; pins stay one shared list.
+
+    A copy into the signed-in account stays unconfirmed until Claude uploads
+    it; otherwise unconfirmed_copy is carried over as given.
+    """
 
     store_state = store_record["state"]
     store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
@@ -439,7 +486,10 @@ def _adopt_current_sidebar_records(
         },
         # The account in use now holds the copy, so it is the source of
         # truth from here: its later edits win until the next switch.
-        snapshot=LayoutSnapshot(active_scope),
+        snapshot=LayoutSnapshot(
+            active_scope,
+            _layout(source) if selected_scope != active_scope else unconfirmed_copy,
+        ),
         group_count=len(_ordered_group_pairs(source)),
         assignment_count=len(source.get("assignments", {})),
         pin_count=len(current_pins),
@@ -459,6 +509,7 @@ def transform_layout_records(
     adopt_source_scope: Optional[str] = None,
     after_account_switch: bool = False,
     owner_account: Optional[str] = None,
+    upload_pending_scope: Optional[str] = None,
 ) -> LayoutTransform:
     """Return exact allowlisted record replacements for one Claude data root.
 
@@ -486,12 +537,20 @@ def transform_layout_records(
         raise LayoutError("current sidebar modes cannot be combined")
     store_state = store_record["state"]
     active = _signed_in_scope(store_state, target_sessions, owner_account)
+    unconfirmed = confirmed = None
+    if snapshot is not None and snapshot.unconfirmed_copy is not None:
+        if upload_pending_scope == snapshot.adopted_scope:
+            unconfirmed = snapshot.unconfirmed_copy
+        else:
+            # Claude uploaded the copy; the snapshot file forgets it either way.
+            snapshot = confirmed = LayoutSnapshot(snapshot.adopted_scope)
     if adopt_current_sidebar:
         source = active
     elif adopt_source_scope is not None:
         source = adopt_source_scope
     elif active is None:
-        return _unchanged(records)  # the signed-in account does not sync yet
+        # The signed-in account does not sync yet.
+        return _unchanged(records, snapshot=confirmed)
     else:
         store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
         persisted_scopes = _validated_scopes(group_record["value"])
@@ -509,7 +568,14 @@ def transform_layout_records(
             return _unchanged(
                 records,
                 reason="no-groups-yet" if snapshot is None else "main-account-has-no-groups",
+                snapshot=confirmed,
             )
+        if (
+            unconfirmed is not None
+            and source == snapshot.adopted_scope
+            and _layout(store_scopes[source]) != unconfirmed
+        ):
+            raise LayoutChoiceError(COPY_NOT_UPLOADED)
     return _adopt_current_sidebar_records(
         group_record,
         local_record,
@@ -518,6 +584,9 @@ def transform_layout_records(
         timestamp_ms=timestamp_ms,
         source_scope=source,
         active_scope=active,
+        unconfirmed_copy=(
+            unconfirmed if snapshot is not None and active == snapshot.adopted_scope else None
+        ),
     )
 
 
@@ -676,11 +745,14 @@ def _owner_account(value: Optional[bytes]) -> Optional[str]:
 
 
 def _unchanged(
-    records: Mapping[bytes, bytes], reason: Optional[str] = None
+    records: Mapping[bytes, bytes],
+    reason: Optional[str] = None,
+    snapshot: Optional[LayoutSnapshot] = None,
 ) -> LayoutTransform:
+    """Write no record. A snapshot, when given, still replaces the file."""
     return LayoutTransform(
         records={key: records[key] for key in LAYOUT_KEYS},
-        snapshot=None,
+        snapshot=snapshot,
         group_count=0,
         assignment_count=0,
         pin_count=0,
@@ -931,6 +1003,7 @@ class LayoutSynchronizer:
             adopt_source_scope=adopt_source_scope,
             after_account_switch=after_account_switch,
             owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
+            upload_pending_scope=_upload_scope(database.get_optional(GROUP_UPLOAD_KEY)),
         )
         planned = dict(transformed.records)
         marker = self._group_upload_marker(
