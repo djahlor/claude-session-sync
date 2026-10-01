@@ -63,12 +63,11 @@ private final class ProcessCompletion {
   }
 }
 
-// Chats sync when Claude quits and when the signed-in account changes, never
-// on every save. Syncing while Claude runs popped failure banners mid-work.
-// Pins and groups live in Claude's own database, which it locks while open, and
-// Claude reloads each account's groups from its servers at sign-in. So when
-// pin and group sync is on, an account switch quits Claude once, copies the
-// organization from the account just left, and reopens Claude.
+// Chats, pins, groups, and routines sync only with Claude closed, when Claude
+// quits and when the signed-in account changes. A switch quits Claude once,
+// syncs, copies pins and groups from the account just left, and reopens Claude.
+// Claude locks its own database while open and reloads each account's groups
+// from its servers at sign-in, so nothing can be carried over while it runs.
 private final class SessionSyncWatcher: NSObject {
   private let command: [String]
   private let claudeExecutable: String
@@ -89,11 +88,9 @@ private final class SessionSyncWatcher: NSObject {
   private var restartAttempt: UUID?
   private var quittingPIDs = Set<pid_t>()
   private var restartPhase = "ready"
-  private var restartSuggested = 0
   private var restartPending = false
   private var pendingRestartMode: String?
   private var restartMode: String?
-  private let restartOnSwitch: Bool
   private var lastFailureKey: String?
   private var statusItem: NSStatusItem?
   private var noticePanel: NSPanel?
@@ -101,9 +98,8 @@ private final class SessionSyncWatcher: NSObject {
   private var lastMessage = ""
 
   init(command: [String], claudeExecutable: String, statusURL: URL,
-       accountURL: URL?, profile: String?, restartOnSwitch: Bool) {
+       accountURL: URL?, profile: String?) {
     self.command = command
-    self.restartOnSwitch = restartOnSwitch && profile != nil
     self.claudeExecutable = URL(fileURLWithPath: claudeExecutable).standardizedFileURL.path
     self.statusURL = statusURL
     self.accountURL = accountURL
@@ -148,8 +144,12 @@ private final class SessionSyncWatcher: NSObject {
       timer.resume()
       accountTimer = timer
     }
-    showStatus(restartPhase == "needs-attention" ? "Sync needs attention" :
-      accountURL != nil ? "Sync is on. Chats sync when Claude quits or you switch accounts." : "Sync ready. Quit Claude to sync.", banner: true)
+    showStatus(restartPhase == "needs-attention" ? "Sync needs attention" : readyMessage, banner: true)
+  }
+
+  private var readyMessage: String {
+    accountURL != nil ? "Sync is on. Chats sync when Claude quits or you switch accounts."
+      : "Sync ready. Quit Claude to sync."
   }
 
   private func privateData(_ url: URL) throws -> Data {
@@ -278,25 +278,13 @@ private final class SessionSyncWatcher: NSObject {
     accountHash = hash
     candidateHash = nil
     candidateSince = nil
-    restartSuggested = 0
     if restartPhase != "needs-attention" { restartPhase = "ready" }
     do { try saveRestartState() } catch {
       restartFailed("Could not save account-switch status.")
       return
     }
-    if restartOnSwitch {
-      // Pins and groups can only be carried over with Claude closed.
-      showStatus("Account changed. Restarting Claude once to bring your pins and groups.", banner: true)
-      requestRestart(mode: "after-account-switch")
-      return
-    }
-    // Chats were kept up to date while Claude was open, so a sync is enough.
-    showStatus("Account changed. Syncing chats.")
-    startAutoIfNeeded()
-  }
-
-  @objc private func restartClicked(_ sender: Any?) {
-    queue.async { [weak self] in self?.requestRestart(mode: nil) }
+    showStatus("Account changed. Restarting Claude once to sync.", banner: true)
+    requestRestart(mode: "after-account-switch")
   }
 
   // A request made while a sync runs waits for it instead of being dropped.
@@ -311,7 +299,8 @@ private final class SessionSyncWatcher: NSObject {
     beginRestart(mode: mode)
   }
 
-  // Quit Claude once, sync everything, and reopen it. Only on request.
+  // Quit Claude once, sync everything, and reopen it. Runs on an account switch
+  // or a restart request, never on its own.
   // A busy moment is retried a few times instead of dropping the request.
   private func beginRestart(attempt: Int = 1, mode: String? = nil) {
     guard !restartRequested, profile != nil else { return }
@@ -377,7 +366,7 @@ private final class SessionSyncWatcher: NSObject {
         self.restartAttempt = attempt
         self.quittingPIDs = Set(targets.map { $0.processIdentifier })
         self.writeStatus(exitStatus: 0, output: Data("{\"progress\":\"quitting-Claude\"}".utf8), launchFailed: false)
-        self.notify("Restarting Claude to load new chats.")
+        self.notify("Restarting Claude to sync.")
         // Request a normal quit only for the configured executable, never force-kill.
         DispatchQueue.main.async {
           for application in targets { _ = application.terminate() }
@@ -480,8 +469,6 @@ private final class SessionSyncWatcher: NSObject {
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
     let reason = result?["reason"] as? String
     let progress = result?["progress"] as? String
-    let suggested = result?["restart_suggested"] as? Int ?? 0
-    let hadSuggestion = restartSuggested > 0
     running = false
     if restarting {
       restartRequested = false
@@ -493,7 +480,6 @@ private final class SessionSyncWatcher: NSObject {
       return
     }
     if exitStatus == 0 && progress == "finished" {
-      restartSuggested = restarting ? 0 : max(0, suggested)
       restartPhase = "finished"
       if restarting, let hash = readAccountHash() { accountHash = hash }
       do { try saveRestartState() } catch {
@@ -506,7 +492,7 @@ private final class SessionSyncWatcher: NSObject {
       $0.executableURL?.standardizedFileURL.path == claudeExecutable
     }) {
       retryDeadline = nil
-      showStatus(restartPhase == "needs-attention" ? "Sync needs attention" : "Sync ready, Claude open")
+      showStatus(restartPhase == "needs-attention" ? "Sync needs attention" : readyMessage)
       runPendingIfNeeded()
       return
     }
@@ -522,9 +508,6 @@ private final class SessionSyncWatcher: NSObject {
       lastFailureKey = nil
       if restarting {
         notify("Sync finished. Claude reopened.")
-      } else if restartSuggested > 0 {
-        let chats = restartSuggested == 1 ? "1 new chat" : "\(restartSuggested) new chats"
-        showStatus("\(chats) will show after Claude restarts.", banner: !hadSuggestion)
       } else {
         showStatus("Sync finished")
       }
@@ -563,7 +546,6 @@ private final class SessionSyncWatcher: NSObject {
     if ProcessInfo.processInfo.environment["CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS"] == "1" {
       return
     }
-    let offerRestart = restartSuggested > 0 && profile != nil
     if message == lastMessage && !banner { return }
     lastMessage = message
     DispatchQueue.main.async { [weak self] in
@@ -572,17 +554,11 @@ private final class SessionSyncWatcher: NSObject {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
       }
       self.statusItem?.button?.title = message.contains("attention") ? "Sync !" :
-        offerRestart ? "Sync ↻" : message.contains("finished") ? "Sync ✓" : "Sync"
+        message.contains("finished") ? "Sync ✓" : "Sync"
       self.statusItem?.button?.toolTip = message
       let menu = NSMenu()
       let item = NSMenuItem(title: message, action: nil, keyEquivalent: "")
       menu.addItem(item)
-      if offerRestart {
-        let restart = NSMenuItem(title: "Restart Claude now", action: #selector(SessionSyncWatcher.restartClicked(_:)),
-          keyEquivalent: "")
-        restart.target = self
-        menu.addItem(restart)
-      }
       self.statusItem?.menu = menu
       guard banner else { return }
       self.noticeGeneration += 1
@@ -594,7 +570,7 @@ private final class SessionSyncWatcher: NSObject {
       panel.level = .floating
       panel.hidesOnDeactivate = false
       panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-      let label = NSTextField(wrappingLabelWithString: offerRestart ? message + " Use the Sync menu to restart." : message)
+      let label = NSTextField(wrappingLabelWithString: message)
       label.frame = NSRect(x: 18, y: 12, width: 334, height: 60)
       label.font = .systemFont(ofSize: 14)
       panel.contentView?.addSubview(label)
@@ -624,9 +600,7 @@ private final class SessionSyncWatcher: NSObject {
       "output": outputText, "state": exitStatus == 0 ? "ok" : "failed",
       "timestamp": ISO8601DateFormatter().string(from: Date()),
       "restart_phase": restartPhase,
-      "restart_suggested": restartSuggested,
-      "automatic_restart": false,
-      "live_sync": accountURL != nil,
+      "automatic_restart": accountURL != nil,
     ]
     do {
       let directory = statusURL.deletingLastPathComponent()
@@ -659,8 +633,6 @@ private final class SessionSyncWatcher: NSObject {
       guard let self = self else { return }
       if executableMatches || knownBundle || self.quittingPIDs.contains(pid) {
         self.quittingPIDs.remove(pid)
-        // Claude reads every folder again at start, so a restart suggestion is spent.
-        if !self.restartRequested { self.restartSuggested = 0 }
         self.requestAuto(afterQuit: true)
       }
     }
@@ -679,7 +651,6 @@ var claudeExecutable: String?
 var statusPath: String?
 var accountPath: String?
 var profile: String?
-var restartOnSwitch = false
 var index = 0
 while index < watcherArguments.count {
   guard index + 1 < watcherArguments.count else {
@@ -691,7 +662,6 @@ while index < watcherArguments.count {
   case "--status": statusPath = watcherArguments[index + 1]
   case "--account-file": accountPath = watcherArguments[index + 1]
   case "--profile": profile = watcherArguments[index + 1]
-  case "--restart-on-switch": restartOnSwitch = watcherArguments[index + 1] == "1"
   default:
     fputs("SessionSyncWatcher received an unknown option\n", stderr)
     exit(64)
@@ -711,8 +681,7 @@ application.setActivationPolicy(.accessory)
 private let watcher = SessionSyncWatcher(
   command: command, claudeExecutable: configuredExecutable,
   statusURL: URL(fileURLWithPath: configuredStatusPath),
-  accountURL: accountPath.map { URL(fileURLWithPath: $0) }, profile: profile,
-  restartOnSwitch: restartOnSwitch
+  accountURL: accountPath.map { URL(fileURLWithPath: $0) }, profile: profile
 )
 NSWorkspace.shared.notificationCenter.addObserver(
   watcher, selector: #selector(SessionSyncWatcher.applicationTerminated(_:)),

@@ -45,6 +45,13 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(str(Path(document["profiles"][0]["data_root"]) / "config.json"), automatic[automatic.index("--account-file") + 1])
             self.assertEqual("Work", automatic[automatic.index("--profile") + 1])
             self.assertLess(automatic.index("--profile"), automatic.index("--"))
+            document["sync_sidebar_layout"] = True
+            with_layout = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            self.assertEqual(
+                automatic[: automatic.index("--")],
+                with_layout[: with_layout.index("--")],
+                "a switch restarts Claude whether or not pins and groups sync",
+            )
 
     def test_dry_run_describes_install_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
