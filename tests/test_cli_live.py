@@ -14,6 +14,7 @@ from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import ApprovedTarget, Config
 from claude_session_sync.model import Profile
 from claude_session_sync.planner import Planner
+from claude_session_sync.transaction import TransactionEngine
 
 A_ACCOUNT = "aaaaaaaa-0000-4000-8000-000000000001"
 A_ORG = "aaaaaaaa-0000-4000-8000-0000000000a1"
@@ -89,6 +90,11 @@ class LiveCliTests(unittest.TestCase):
             config_loader=lambda _path: self.config,
             planner_factory=lambda _config: Planner(app_log=self.app_log),
             process_probe=FakeProbe(self),
+            engine_factory=lambda config: TransactionEngine(
+                config.state_dir, process_probe=lambda: self.running, retention=config.retention
+            ),
+            layout_factory=lambda _config: self.fail("pins and groups must not sync"),
+            routine_factory=lambda _config: self.fail("routines must not sync"),
             live_sync=True,
         )
         code = run(
@@ -99,30 +105,30 @@ class LiveCliTests(unittest.TestCase):
         )
         return code, out.getvalue(), errors.getvalue()
 
-    def test_sync_runs_while_claude_is_open_and_suggests_a_restart(self):
+    def test_nothing_syncs_while_claude_is_open_and_the_next_quit_does(self):
+        from dataclasses import replace
+
+        self.config = replace(self.config, sync_sidebar_layout=True, sync_code_routines=True)
         self.running = True
         self.write(self.b, Y)
-        state_file = state_path(self.config.state_dir)
-        state_file.parent.mkdir(parents=True)
-        state_file.write_text(
-            json.dumps(
-                {
-                    "version": 2,
-                    "logins": {
-                        str(self.data_root): [A_ACCOUNT, int(time.time() * 1000) - 600_000]
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
 
         code, out, errors = self.cli("auto", "--json")
 
-        payload = json.loads(out)
         self.assertEqual(0, code, errors)
-        self.assertEqual("committed", payload["state"])
-        self.assertEqual("finished", payload["progress"])
-        self.assertEqual(1, payload["restart_suggested"])
+        self.assertEqual(
+            {"state": "waiting", "reason": "claude-open", "progress": "waiting-for-Claude"},
+            json.loads(out),
+        )
+        self.assertIsNone(self.read(self.a, Y))
+        self.assertFalse(state_path(self.config.state_dir).exists())
+        self.assertFalse((self.config.state_dir / "runs").exists())
+
+        self.running = False
+        self.config = replace(self.config, sync_sidebar_layout=False, sync_code_routines=False)
+        code, out, errors = self.cli("auto", "--json")
+
+        self.assertEqual(0, code, errors)
+        self.assertEqual("committed", json.loads(out)["state"])
         self.assertIsNotNone(self.read(self.a, Y))
 
     def test_output_never_names_a_chat_or_a_path(self):

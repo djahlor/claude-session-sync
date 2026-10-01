@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
@@ -124,18 +125,7 @@ class TransactionEngine:
             raise PlanBlockedError(
                 "plan {} has conflicts or invalid replicas".format(plan.plan_id)
             )
-        ensure_private_directory(self.state_root)
-        lock = ExclusiveFileLock(
-            self.state_root / "transaction.lock",
-            mode=self.lock_mode,
-            timeout=self.lock_timeout,
-        )
-        try:
-            lock.acquire()
-        except LockUnavailableError as error:
-            raise TransactionBusyError(str(error)) from error
-
-        try:
+        with self._writer_lock():
             try:
                 pending = pending_recovery_runs(self.state_root)
             except JournalError as error:
@@ -152,10 +142,37 @@ class TransactionEngine:
             if self.retention is not None and receipt.status in ("committed", "partial"):
                 prune_terminal_runs(self.state_root, self.retention)
             return receipt
-        finally:
-            lock.release()
 
     def rollback(self, run_id: str) -> RecoveryReceipt:
+        with self._writer_lock():
+            try:
+                journal = RunJournal.load(self.state_root, run_id)
+            except JournalError as error:
+                raise RecoveryError(str(error), recovery_error=error) from error
+            receipt = self._rollback_locked(journal)
+            if self.retention is not None:
+                prune_terminal_runs(self.state_root, self.retention)
+            return receipt
+
+    def close_interrupted_runs(self) -> None:
+        """Close runs a killed process left open, keeping what they wrote.
+
+        Each write is one atomic step toward a version the next plan works out
+        again, so a run cut short equals a run whose other steps were skipped.
+        The journal keeps every file a run replaced or removed, for a manual
+        rollback. A run whose journal cannot be read stays open, and apply
+        refuses until it is recovered.
+        """
+
+        with self._writer_lock():
+            try:
+                pending = pending_recovery_runs(self.state_root)
+            except JournalError:
+                return
+            self._finish_interrupted_runs(pending)
+
+    @contextmanager
+    def _writer_lock(self):
         ensure_private_directory(self.state_root)
         lock = ExclusiveFileLock(
             self.state_root / "transaction.lock",
@@ -167,14 +184,7 @@ class TransactionEngine:
         except LockUnavailableError as error:
             raise TransactionBusyError(str(error)) from error
         try:
-            try:
-                journal = RunJournal.load(self.state_root, run_id)
-            except JournalError as error:
-                raise RecoveryError(str(error), recovery_error=error) from error
-            receipt = self._rollback_locked(journal)
-            if self.retention is not None:
-                prune_terminal_runs(self.state_root, self.retention)
-            return receipt
+            yield
         finally:
             lock.release()
 
@@ -466,13 +476,7 @@ class TransactionEngine:
         return records, skipped, blocked
 
     def _finish_interrupted_live_runs(self, pending: List[str]) -> List[str]:
-        """Close runs a crash left open in live mode, keeping what they wrote.
-
-        Every write in a live run is one atomic step toward a planned version,
-        and a partly applied run is the same as one whose other steps were
-        skipped: the next plan finishes the job. Removed files stay in the
-        journal. Runs made without live mode still need an explicit recovery.
-        """
+        """Close runs a crash left open in live mode, keeping what they wrote."""
 
         remaining = []
         for run_id in pending:
@@ -484,16 +488,28 @@ class TransactionEngine:
             if not journal.manifest.get("lenient"):
                 remaining.append(run_id)
                 continue
-            journal.finish(
-                "COMMITTED",
-                {
-                    "kind": "apply",
-                    "run_id": run_id,
-                    "status": "recovered",
-                    "plan_id": journal.manifest.get("plan_id"),
-                },
-            )
+            self._close_as_recovered(journal)
         return remaining
+
+    def _finish_interrupted_runs(self, pending: List[str]) -> None:
+        for run_id in pending:
+            try:
+                journal = RunJournal.load(self.state_root, run_id)
+            except JournalError:
+                continue
+            self._close_as_recovered(journal)
+
+    @staticmethod
+    def _close_as_recovered(journal: RunJournal) -> None:
+        journal.finish(
+            "COMMITTED",
+            {
+                "kind": "apply",
+                "run_id": journal.run_id,
+                "status": "recovered",
+                "plan_id": journal.manifest.get("plan_id"),
+            },
+        )
 
     def _verify_destinations_unchanged(
         self, records: Iterable[Mapping[str, Any]]

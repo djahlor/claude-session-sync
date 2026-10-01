@@ -543,7 +543,7 @@ def _busy_reason(error: Exception) -> Optional[str]:
     if name in ("TransactionBusyError", "BlockingIOError", "TimeoutError"):
         return "busy"
     if name == "AppRunningError":
-        return "app-running"
+        return "claude-open"
     return None
 
 
@@ -768,18 +768,8 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         except subprocess.TimeoutExpired as error:
             _write(_chat_failure(error), as_json=arguments.as_json, stream=output)
             return 1
-        if running and not live:
-            record_progress(config, "waiting-for-Claude")
-            _write(
-                {
-                    "state": "skipped",
-                    "reason": "app-running",
-                    "progress": "waiting-for-Claude",
-                },
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0 if arguments.command == "auto" else 1
+        if running:
+            return _report_waiting(arguments, config, output, "claude-open")
         record_progress(config, "syncing")
         started = deps.clock()
         try:
@@ -799,18 +789,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         except Exception as error:
             reason = _busy_reason(error)
             if reason is not None:
-                state = (
-                    "waiting-for-Claude"
-                    if reason == "app-running"
-                    else "waiting-for-sync"
-                )
-                record_progress(config, state)
-                _write(
-                    {"state": "skipped", "reason": reason, "progress": state},
-                    as_json=arguments.as_json,
-                    stream=output,
-                )
-                return 0 if arguments.command == "auto" else 1
+                return _report_waiting(arguments, config, output, reason)
             payload = _chat_failure(error)
         payload.update(
             run_adapters(
@@ -830,6 +809,22 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         raise
     finally:
         handoff.release()
+
+
+def _report_waiting(arguments, config: Config, output: TextIO, reason: str) -> int:
+    """Nothing was written. The next quit, switch, or retry syncs.
+
+    Only `auto` counts this as success: the watcher runs it again. A manual
+    `sync` that did not happen exits nonzero.
+    """
+
+    if reason == "claude-open":
+        payload = {"state": "waiting", "reason": reason, "progress": "waiting-for-Claude"}
+    else:
+        payload = {"state": "skipped", "reason": reason, "progress": "waiting-for-sync"}
+    record_progress(config, payload["progress"])
+    _write(payload, as_json=arguments.as_json, stream=output)
+    return 0 if arguments.command == "auto" else 1
 
 
 def run(

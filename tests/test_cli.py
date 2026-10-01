@@ -392,25 +392,29 @@ class CliAutomaticTests(unittest.TestCase):
                 "plan_id=plan-auto run_id=run-auto state=committed progress=finished\n",
             )
 
-    def test_auto_succeeds_with_explicit_skip_while_app_is_running(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: config(root),
-                planner_factory=lambda _config: self.fail("planner must not run"),
-                process_probe=FakeProcessProbe((object(),)),
-            )
+    def test_a_sync_waits_without_writing_while_claude_is_open(self):
+        for command, expected_exit in (("auto", 0), ("sync", 1)):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                out = io.StringIO()
+                dependencies = CliDependencies(
+                    config_loader=lambda path: config(root),
+                    planner_factory=lambda _config: self.fail("planner must not run"),
+                    process_probe=FakeProcessProbe((object(),)),
+                )
 
-            exit_code = run(
-                ["--config", str(root / "config.json"), "auto"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
+                exit_code = run(
+                    ["--config", str(root / "config.json"), command],
+                    dependencies=dependencies,
+                    stdout=out,
+                    stderr=io.StringIO(),
+                )
 
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(out.getvalue(), "state=skipped reason=app-running progress=waiting-for-Claude\n")
+                self.assertEqual(expected_exit, exit_code)
+                self.assertEqual(
+                    "state=waiting reason=claude-open progress=waiting-for-Claude\n",
+                    out.getvalue(),
+                )
 
     def test_auto_succeeds_with_explicit_skip_when_transaction_is_busy(self):
         class TransactionBusyError(Exception):

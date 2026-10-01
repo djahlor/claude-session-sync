@@ -188,81 +188,6 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual({X}, set(state.sync.synced[self.keys()[1]]))
         self.assertEqual(state.sync.seen[self.keys()[1]], {X})
 
-    def test_with_claude_open_the_signed_in_folder_only_gains_new_chats(self):
-        self.running = True
-        self.write(self.a, X, title="t", lastActivityAt=100)
-        self.write(self.b, X, title="renamed", lastActivityAt=200)
-        self.write(self.b, Y)
-        self.agree(X)
-        state = load_state(state_path(self.config.state_dir))
-        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
-        save_state(state_path(self.config.state_dir), state)
-
-        run = self.sync()
-
-        self.assertEqual(self.read(self.a, X)["title"], "t", "a live record is never replaced")
-        self.assertIsNotNone(self.read(self.a, Y), "a new chat may still be added")
-        self.assertEqual(run.problems, {"live": 1})
-        self.assertEqual(run.restart_suggested, 1)
-
-    def test_the_other_account_is_still_updated_while_claude_is_open(self):
-        self.running = True
-        self.write(self.a, X, title="renamed", lastActivityAt=200)
-        self.write(self.b, X, title="t", lastActivityAt=100)
-        self.agree(X)
-        state = load_state(state_path(self.config.state_dir))
-        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
-        save_state(state_path(self.config.state_dir), state)
-
-        run = self.sync()
-
-        self.assertEqual(self.read(self.b, X)["title"], "renamed")
-        self.assertEqual(run.restart_suggested, 0)
-
-    def test_right_after_a_switch_every_folder_only_gains_new_chats(self):
-        self.running = True
-        self.write(self.a, X, title="renamed", lastActivityAt=200)
-        self.write(self.b, X, title="t", lastActivityAt=100)
-        self.agree(X)
-        state = load_state(state_path(self.config.state_dir))
-        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 30 * 1000)
-        save_state(state_path(self.config.state_dir), state)
-
-        run = self.sync()
-
-        self.assertEqual(self.read(self.b, X)["title"], "t")
-        self.assertEqual(run.problems, {"live": 1})
-
-    def test_a_login_line_in_claudes_log_dates_the_switch(self):
-        self.running = True
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 30))
-        self.app_log.write_text(
-            "{} [info] [account] Login-state transition (loggedOut: true → false, "
-            "uuid: {} → {}), clearing oauth cache\n".format(stamp, B_ACCOUNT, A_ACCOUNT),
-            encoding="utf-8",
-        )
-        self.write(self.a, X, title="renamed", lastActivityAt=200)
-        self.write(self.b, X, title="t", lastActivityAt=100)
-        self.agree(X)
-
-        self.sync()
-
-        self.assertEqual(self.read(self.b, X)["title"], "t", "still inside the two minutes")
-        state = load_state(state_path(self.config.state_dir))
-        self.assertEqual(state.logins[str(self.data_root)][0], A_ACCOUNT)
-
-    def test_a_restart_clears_the_restart_suggestion(self):
-        self.running = True
-        self.write(self.b, Y)
-        state = load_state(state_path(self.config.state_dir))
-        state.logins[str(self.data_root)] = (A_ACCOUNT, NOW_MS - 10 * 60 * 1000)
-        save_state(state_path(self.config.state_dir), state)
-        self.assertEqual(self.sync().restart_suggested, 1)
-
-        self.running = False
-        self.assertEqual(self.sync().restart_suggested, 0)
-        self.assertEqual(load_state(state_path(self.config.state_dir)).live_creates, {})
-
     def test_leftover_folders_are_ignored(self):
         leftover = self.folder("cccccccc-0000-4000-8000-000000000003", A_ORG)
         self.write(leftover, X)
@@ -272,7 +197,7 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual(run.plan.ignored_targets, 1)
         self.assertIsNone(self.read(self.a, X))
 
-    def test_a_new_login_joins_once_claude_writes_a_chat_there(self):
+    def test_a_new_login_joins_the_plan_once_claude_writes_a_chat_there(self):
         new_account = "dddddddd-0000-4000-8000-000000000004"
         new_folder = self.folder(new_account, A_ORG)
         self.write(self.a, X)
@@ -285,10 +210,25 @@ class ChatSyncTests(ChatSyncFixture):
         fresh = new_folder / "local_{}.json".format(Y)
         fresh.write_text(json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8")
 
-        run = self.sync()
+        run = plan_chat_sync(self.config, self.planner())
 
         self.assertEqual(run.newly_enrolled, 1)
-        self.assertIsNotNone(self.read(new_folder, X))
+        self.assertIn(
+            new_folder / "local_{}.json".format(X),
+            [operation.destination for operation in run.plan.operations],
+        )
+
+    def test_no_chat_is_written_if_claude_opens_during_a_run(self):
+        from claude_session_sync.transaction import AppRunningError
+
+        self.write(self.a, X)
+        self.running = True
+
+        with self.assertRaises(AppRunningError):
+            self.sync()
+
+        self.assertIsNone(self.read(self.b, X))
+        self.assertFalse((self.config.state_dir / "runs").exists())
 
     def test_planning_writes_nothing(self):
         self.write(self.a, X)
@@ -368,7 +308,7 @@ class RecoveryTests(ChatSyncFixture):
         self.assertIn(run.receipt.status, ("committed", "partial"))
         self.assertIsNotNone(self.read(self.b, Y))
 
-    def test_an_interrupted_live_run_is_closed_and_the_next_run_goes_on(self):
+    def test_an_interrupted_run_is_closed_and_the_next_run_goes_on(self):
         from unittest.mock import patch
         from claude_session_sync import transaction
 

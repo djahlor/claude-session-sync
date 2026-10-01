@@ -80,7 +80,8 @@ def run_chat_sync(
         on_disk = encode_state(state)
 
     sweep_stale_stages((target.path for target in context.targets.values()), time.time())
-    receipt = engine.apply(plan, live_guard=context.is_live_path)
+    engine.close_interrupted_runs()
+    receipt = engine.apply(plan)
     _remember_placements(state, context, receipt)
 
     state.sync = _settle(state.sync, context.rescan())
