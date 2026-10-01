@@ -1,11 +1,14 @@
+import io
 import json
 import os
 import stat
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
+from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import load_config
 from claude_session_sync.installer import InstallLayout, Installer
 
@@ -83,48 +86,20 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(template["target_policy"], "approved-only")
             self.assertFalse(template["sync_sidebar_layout"])
             self.assertFalse(template["sync_code_routines"])
-            self.assertFalse(template["profiles"][1]["enabled"])
             self.assertEqual(
-                template["profiles"][1]["data_root"],
-                str(home / "Library" / "Application Support" / "Claude-Personal"),
-            )
-            self.assertEqual(
-                [profile.name for profile in load_config(layout.config_path).profiles],
-                ["Work"],
+                [
+                    {
+                        "name": "Work",
+                        "data_root": str(home / "Library" / "Application Support" / "Claude"),
+                        "launch_command": ["/usr/bin/open", "-a", "/Applications/Claude.app"],
+                        "is_default": True,
+                    }
+                ],
+                template["profiles"],
             )
             self.assertEqual(
                 stat.S_IMODE(layout.config_path.stat().st_mode),
                 stat.S_IRUSR | stat.S_IWUSR,
-            )
-            self.assertFalse(layout.work_app.exists())
-            self.assertFalse(layout.personal_app.exists())
-            template["profiles"][1]["enabled"] = True
-            template["acknowledge_cross_profile_copy"] = True
-            template["acknowledge_cross_account_copy"] = True
-            layout.config_path.write_text(
-                json.dumps(template, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            os.chmod(layout.config_path, 0o600)
-            activated = installer.install(dry_run=False)
-            self.assertEqual(activated.state, "installed")
-            work_launcher = layout.work_app / "Contents" / "MacOS" / "launcher"
-            personal_launcher = layout.personal_app / "Contents" / "MacOS" / "launcher"
-            self.assertIn("switch Work", work_launcher.read_text(encoding="utf-8"))
-            self.assertIn(
-                "--wait-for-exit 15",
-                work_launcher.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                "switch Personal", personal_launcher.read_text(encoding="utf-8")
-            )
-            self.assertIn(
-                "--wait-for-exit 15",
-                personal_launcher.read_text(encoding="utf-8"),
-            )
-            self.assertTrue(os.access(work_launcher, os.X_OK))
-            self.assertIn(
-                str(layout.runtime_cli), work_launcher.read_text(encoding="utf-8")
             )
             self.assertTrue(layout.runtime_cli.is_file())
             self.assertTrue(os.access(layout.runtime_cli, os.X_OK))
@@ -197,49 +172,31 @@ class InstallerTests(unittest.TestCase):
                 sum("swiftc" in call[0] for call in runner.calls), compile_count
             )
 
-    def test_replaced_wrapper_is_backed_up_and_uninstall_preserves_config(self):
+    def test_uninstall_backs_up_what_setup_made_and_keeps_the_config(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             layout = self.layout(home)
             runner = FakeCommandRunner()
-            installer = Installer(layout, runner=runner, backup_id=lambda: "backup-b")
+            installer = Installer(layout, runner=runner, backup_id=lambda: "removed")
             installer.install(dry_run=False)
-            template = json.loads(layout.config_path.read_text(encoding="utf-8"))
-            template["profiles"][1]["enabled"] = True
-            template["acknowledge_cross_profile_copy"] = True
-            template["acknowledge_cross_account_copy"] = True
-            layout.config_path.write_text(
-                json.dumps(template, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            generated = (
+                layout.launch_agent, layout.watcher_binary, layout.layout_helper,
+                layout.runtime_cli, layout.runtime_package,
             )
-            os.chmod(layout.config_path, 0o600)
-            installer.install(dry_run=False)
-            launcher = layout.work_app / "Contents" / "MacOS" / "launcher"
-            launcher.write_text("user replacement", encoding="utf-8")
 
-            repaired = installer.install(dry_run=False)
-
-            self.assertTrue(repaired.backups)
-            backup_app = repaired.backups[0]
-            self.assertEqual(
-                (backup_app / "Contents" / "MacOS" / "launcher").read_text(
-                    encoding="utf-8"
-                ),
-                "user replacement",
-            )
             dry_uninstall = installer.uninstall(dry_run=True)
-            self.assertEqual(dry_uninstall.state, "planned")
-            self.assertTrue(layout.work_app.exists())
-
+            self.assertEqual(
+                ("planned", [True] * len(generated)),
+                (dry_uninstall.state, [path.exists() for path in generated]),
+            )
             removed = installer.uninstall(dry_run=False)
 
-            self.assertEqual(removed.state, "uninstalled")
-            self.assertFalse(layout.work_app.exists())
-            self.assertFalse(layout.personal_app.exists())
-            self.assertFalse(layout.launch_agent.exists())
-            self.assertFalse(layout.watcher_binary.exists())
-            self.assertFalse(layout.runtime_cli.exists())
-            self.assertFalse(layout.runtime_package.exists())
+            self.assertEqual("uninstalled", removed.state)
+            self.assertEqual([False] * len(generated), [path.exists() for path in generated])
+            self.assertEqual(
+                sorted(path.name for path in generated),
+                sorted(path.name for path in (layout.backups_dir / "removed").iterdir()),
+            )
             self.assertTrue(layout.config_path.exists())
             self.assertTrue(
                 any(
@@ -247,6 +204,99 @@ class InstallerTests(unittest.TestCase):
                     for call in runner.calls
                 )
             )
+
+    def september_install(self, home: Path) -> InstallLayout:
+        """A home set up in September, plus the profile apps an older version made."""
+
+        layout = self.layout(home)
+        support = home / "Library" / "Application Support"
+        document = {
+            "version": 1,
+            "approved_targets": [
+                {"profile": "Work", "account": "account-a", "workspace": "workspace-a"},
+                {"profile": "Personal", "account": "account-p", "workspace": "workspace-p"},
+            ],
+            "acknowledge_cross_account_copy": True,
+            "acknowledge_cross_profile_copy": False,
+            "target_policy": "logins",
+            "sync_sidebar_layout": True,
+            "sync_code_routines": True,
+            "claude_executable": "/Applications/Claude.app/Contents/MacOS/Claude",
+            "profiles": [
+                {
+                    "data_root": str(support / "Claude"),
+                    "launch_command": ["/usr/bin/open", "-a", "/Applications/Claude.app"],
+                    "name": "Work",
+                    "is_default": True,
+                },
+                {
+                    "data_root": str(support / "Claude-Personal"),
+                    "launch_command": [
+                        "/Applications/Claude.app/Contents/MacOS/Claude",
+                        "--user-data-dir={}".format(support / "Claude-Personal"),
+                    ],
+                    "name": "Personal",
+                    "enabled": False,
+                    "is_default": False,
+                },
+            ],
+            "retention": 10,
+            "state_dir": str(layout.support_dir / "state"),
+        }
+        layout.config_path.parent.mkdir(parents=True)
+        layout.config_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+        os.chmod(layout.config_path, 0o600)
+        for app in layout.retired_apps:
+            launcher = app / "Contents" / "MacOS" / "launcher"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\nexec old-switch {}\n".format(app.stem))
+        return layout
+
+    def test_setup_over_a_september_install_leaves_one_profile_and_backs_up_the_old_apps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = self.september_install(Path(directory))
+            out = io.StringIO()
+
+            code = run(
+                ["--config", str(layout.config_path), "setup", "--automatic-targets",
+                 "--sync-layout", "--sync-routines", "--apply"],
+                dependencies=CliDependencies(
+                    installer_factory=lambda path: Installer(
+                        replace(layout, config_path=path),
+                        runner=FakeCommandRunner(),
+                        backup_id=lambda: "upgrade",
+                    ),
+                ),
+                stdout=out,
+                stderr=io.StringIO(),
+            )
+
+            self.assertEqual(0, code, out.getvalue())
+            document = json.loads(layout.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(["Work"], [profile["name"] for profile in document["profiles"]])
+            self.assertEqual(
+                [{"profile": "Work", "account": "account-a", "workspace": "workspace-a"}],
+                document["approved_targets"],
+            )
+            self.assertEqual(["Work"], [profile.name for profile in load_config(layout.config_path).profiles])
+            for app in layout.retired_apps:
+                self.assertFalse(app.exists())
+                kept = layout.backups_dir / "upgrade" / app.name / "Contents" / "MacOS" / "launcher"
+                self.assertEqual("#!/bin/sh\nexec old-switch {}\n".format(app.stem), kept.read_text())
+
+    def test_a_dry_run_over_a_september_install_lists_the_old_apps_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = self.september_install(Path(directory))
+            before = layout.config_path.read_bytes()
+
+            report = Installer(layout, runner=FakeCommandRunner()).setup(dry_run=True)
+
+            self.assertEqual(
+                [("remove-retired", app) for app in layout.retired_apps],
+                [(action.kind, action.path) for action in report.actions if action.kind == "remove-retired"],
+            )
+            self.assertEqual(before, layout.config_path.read_bytes())
+            self.assertTrue(all(app.exists() for app in layout.retired_apps))
 
     def test_install_reversibly_disables_known_legacy_agent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -285,7 +335,6 @@ class InstallerTests(unittest.TestCase):
                 installer.install(dry_run=False)
 
             self.assertFalse(layout.runtime_package.exists())
-            self.assertFalse(layout.work_app.exists())
 
     def test_compile_failure_restores_exact_preinstall_state(self):
         class FailingLayoutCompiler(FakeCommandRunner):
@@ -411,9 +460,7 @@ class InstallerTests(unittest.TestCase):
             layout = self.layout(home)
             installer = Installer(layout, runner=FakeCommandRunner())
             document = json.loads(installer.default_config_data())
-            document["profiles"][1]["enabled"] = True
-            document["acknowledge_cross_profile_copy"] = True
-            document["acknowledge_cross_account_copy"] = True
+            document["sync_sidebar_layout"] = True
             config_data = (
                 json.dumps(document, indent=2, sort_keys=True) + "\n"
             ).encode("utf-8")
@@ -422,8 +469,6 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(report.state, "installed")
             self.assertEqual(layout.config_path.read_bytes(), config_data)
-            self.assertTrue(layout.work_app.exists())
-            self.assertTrue(layout.personal_app.exists())
 
     def test_activation_failure_restores_existing_config_and_artifacts(self):
         class FailNextWatcherBootstrap(FakeCommandRunner):

@@ -541,13 +541,6 @@ class CliConfigureTests(unittest.TestCase):
                         "launch_command": ["/usr/bin/true"],
                         "is_default": True,
                     },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": False,
-                        "is_default": False,
-                    },
                 ],
                 "state_dir": str(root / "state"),
                 "retention": 5,
@@ -563,7 +556,7 @@ class CliConfigureTests(unittest.TestCase):
             exit_code = run(
                 [
                     "--config", str(config_path), "setup",
-                    "--automatic-targets", "--enable-personal",
+                    "--automatic-targets",
                     "--sync-layout", "--sync-routines", "--dry-run",
                 ],
                 dependencies=CliDependencies(installer_factory=lambda path: fake),
@@ -575,139 +568,119 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(1, len(fake.calls))
             self.assertTrue(fake.calls[0][0])
             desired = json.loads(fake.calls[0][1])
-            self.assertEqual("logins", desired["target_policy"])
-            self.assertTrue(desired["profiles"][1]["enabled"])
-            self.assertTrue(desired["sync_sidebar_layout"])
-            self.assertTrue(desired["sync_code_routines"])
+            self.assertEqual(
+                dict(
+                    document,
+                    target_policy="logins",
+                    acknowledge_cross_account_copy=True,
+                    sync_sidebar_layout=True,
+                    sync_code_routines=True,
+                ),
+                desired,
+            )
+            self.assertEqual(
+                "state=planned counts={'actions': 1, 'backups': 0, 'changes': 4, "
+                "'automatic_targets': 1, 'layout_sync': 1, 'routine_sync': 1} "
+                "bytes=0 duration_ms=0\n",
+                output.getvalue(),
+            )
             self.assertFalse(config_path.exists())
 
-    def test_configure_enables_automatic_targets_and_personal_profile(self):
+    def personal_era_config(self, root: Path, *, personal_enabled: bool) -> dict:
+        """A config from a version that generated a Personal profile."""
+
+        return {
+            "version": 1,
+            "approved_targets": [
+                {"profile": "Personal", "account": "account", "workspace": "workspace"},
+            ],
+            "profiles": [
+                {
+                    "name": "Work",
+                    "data_root": str(root / "Claude"),
+                    "launch_command": ["/usr/bin/true"],
+                    "is_default": True,
+                },
+                {
+                    "name": "Personal",
+                    "data_root": str(root / "Claude-Personal"),
+                    "launch_command": ["/usr/bin/true"],
+                    "enabled": personal_enabled,
+                    "is_default": False,
+                },
+            ],
+            "state_dir": str(root / "state"),
+            "retention": 5,
+            "acknowledge_cross_profile_copy": personal_enabled,
+            "acknowledge_cross_account_copy": False,
+            "target_policy": "approved-only",
+            "claude_executable": "/usr/bin/true",
+        }
+
+    def test_configure_enables_automatic_targets_and_drops_the_old_personal_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
-            document = {
-                "version": 1,
-                "approved_targets": [],
-                "profiles": [
-                    {
-                        "name": "Work",
-                        "data_root": str(root / "Claude"),
-                        "launch_command": ["/usr/bin/true"],
-                        "is_default": True,
-                    },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": False,
-                        "is_default": False,
-                    },
-                ],
-                "state_dir": str(root / "state"),
-                "retention": 5,
-                "acknowledge_cross_profile_copy": False,
-                "acknowledge_cross_account_copy": False,
-                "target_policy": "approved-only",
-                "claude_executable": "/usr/bin/true",
-            }
+            document = self.personal_era_config(root, personal_enabled=False)
             config_path.write_text(json.dumps(document), encoding="utf-8")
+            before = config_path.read_bytes()
 
             self.assertEqual(
                 0,
                 run(
-                    [
-                        "--config",
-                        str(config_path),
-                        "configure",
-                        "--automatic-targets",
-                        "--enable-personal",
-                        "--dry-run",
-                    ],
+                    ["--config", str(config_path), "configure", "--automatic-targets", "--dry-run"],
                     stdout=io.StringIO(),
                     stderr=io.StringIO(),
                 ),
             )
-            self.assertFalse(
-                json.loads(config_path.read_text(encoding="utf-8"))["profiles"][1][
-                    "enabled"
-                ]
-            )
+            self.assertEqual(before, config_path.read_bytes())
 
             output = io.StringIO()
             self.assertEqual(
                 0,
                 run(
-                    [
-                        "--config",
-                        str(config_path),
-                        "configure",
-                        "--automatic-targets",
-                        "--enable-personal",
-                        "--apply",
-                    ],
+                    ["--config", str(config_path), "configure", "--automatic-targets", "--apply"],
                     stdout=output,
                     stderr=io.StringIO(),
                 ),
             )
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("logins", updated["target_policy"])
-            self.assertTrue(updated["acknowledge_cross_account_copy"])
-            self.assertTrue(updated["acknowledge_cross_profile_copy"])
-            self.assertTrue(updated["profiles"][1]["enabled"])
+            self.assertEqual(
+                dict(
+                    document,
+                    approved_targets=[],
+                    profiles=document["profiles"][:1],
+                    target_policy="logins",
+                    acknowledge_cross_account_copy=True,
+                ),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
             self.assertIn("state=configured", output.getvalue())
 
-    def test_configure_disables_personal_and_enables_layout_sync(self):
+    def test_configure_drops_an_enabled_personal_profile_and_enables_layout_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
-            document = {
-                "version": 1,
-                "approved_targets": [],
-                "profiles": [
-                    {
-                        "name": "Work",
-                        "data_root": str(root / "Claude"),
-                        "launch_command": ["/usr/bin/true"],
-                        "is_default": True,
-                    },
-                    {
-                        "name": "Personal",
-                        "data_root": str(root / "Claude-Personal"),
-                        "launch_command": ["/usr/bin/true"],
-                        "enabled": True,
-                        "is_default": False,
-                    },
-                ],
-                "state_dir": str(root / "state"),
-                "retention": 5,
-                "acknowledge_cross_profile_copy": True,
-                "acknowledge_cross_account_copy": True,
-                "target_policy": "all-configured-profiles",
-                "sync_sidebar_layout": False,
-                "claude_executable": "/usr/bin/true",
-            }
+            document = self.personal_era_config(root, personal_enabled=True)
             config_path.write_text(json.dumps(document), encoding="utf-8")
 
             exit_code = run(
-                [
-                    "--config",
-                    str(config_path),
-                    "configure",
-                    "--disable-personal",
-                    "--sync-layout",
-                    "--sync-routines",
-                    "--apply",
-                ],
+                ["--config", str(config_path), "configure", "--sync-layout", "--sync-routines", "--apply"],
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
             )
 
             self.assertEqual(0, exit_code)
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertFalse(updated["profiles"][1]["enabled"])
-            self.assertFalse(updated["acknowledge_cross_profile_copy"])
-            self.assertTrue(updated["sync_sidebar_layout"])
-            self.assertTrue(updated["sync_code_routines"])
+            self.assertEqual(
+                dict(
+                    document,
+                    approved_targets=[],
+                    profiles=document["profiles"][:1],
+                    acknowledge_cross_profile_copy=False,
+                    sync_sidebar_layout=True,
+                    sync_code_routines=True,
+                ),
+                json.loads(config_path.read_text(encoding="utf-8")),
+            )
 
 
 class CliLayoutTests(unittest.TestCase):

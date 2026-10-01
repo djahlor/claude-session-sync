@@ -104,6 +104,8 @@ def _parse_profile(raw: Any, index: int) -> Tuple[Profile, bool]:
         or any(not isinstance(part, str) or not part for part in raw_command)
     ):
         raise ConfigError("profile launch_command must be a non-empty array of strings")
+    # Configs from older versions hold a disabled Personal profile until setup
+    # removes it, and setup must read them first.
     enabled = profile.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError("profile enabled must be a boolean")

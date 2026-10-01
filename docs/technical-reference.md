@@ -81,15 +81,15 @@ sync can run first.
 The same setup can run from Terminal:
 
 ```sh
-./install.sh --automatic-targets --sync-layout --sync-routines --disable-personal
+./install.sh --automatic-targets --sync-layout --sync-routines
 ```
 
 From this directory:
 
 ```sh
 python3 -m pip install .
-claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --dry-run
-claude-session-sync setup --automatic-targets --sync-layout --sync-routines --disable-personal --apply
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --dry-run
+claude-session-sync setup --automatic-targets --sync-layout --sync-routines --apply
 ```
 
 The per-user installer creates:
@@ -155,7 +155,7 @@ attention, and the last successful sync time. A missing or interrupted run is ne
 menu-bar status item and a non-activating status window show progress without
 depending on macOS notification permissions.
 
-Safe mode and non-default profile apps still sync after a manual quit.
+Safe mode still syncs after a manual quit.
 
 Manual commands remain available:
 
@@ -164,27 +164,25 @@ claude-session-sync sync
 claude-session-sync sync --json
 ```
 
-### Existing separate-profile installations
+### Switch from the command line
 
-The installer no longer offers separate Work and Personal apps. Existing
-profiles and these commands remain supported; this change deletes no data.
-For normal account switching, use the workflow above.
+Older versions offered separate Work and Personal apps. `setup` moves those
+apps into the backup folder and removes the Personal profile from the config.
+The watcher runs `switch` after an account change. It also runs by hand:
 
 ```sh
 claude-session-sync switch Work
-claude-session-sync switch Personal
-claude-session-sync switch Personal --no-launch
+claude-session-sync switch Work --no-launch
 claude-session-sync switch Work --wait-for-exit 15
 ```
 
 Without `--wait-for-exit`, `switch` refuses to proceed if any managed Claude
-process is open. Installed app wrappers use a bounded 15-second wait so they can
-be clicked while the previous account is still shutting down. After exit,
-`switch` safely waits for an automatic writer and replans if that writer commits
-first; a separate handoff lock ensures simultaneous wrapper clicks cannot
-launch two profiles. The wait uses a wall-clock deadline and a bounded process
-probe, so slow process inspection cannot silently extend the advertised limit.
-It launches the selected profile after synchronization, even when the sync failed.
+process is open. With it, `switch` waits that many seconds for Claude to finish
+quitting. After exit, `switch` waits up to 15 seconds for another writer to
+finish, then plans again and syncs. A separate handoff lock stops two switches
+at once from both launching Claude. The wait uses a wall-clock deadline and a
+bounded process probe, so slow process inspection cannot extend the limit.
+`switch` launches Claude after the sync, even when the sync failed.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
 returns success with `state=waiting` and `reason=claude-open`. If Claude opens
 again after the chats synced but before pins, groups, or routines did, those
@@ -206,8 +204,8 @@ After the sync, `switch` runs the profile's launch command, even when the sync
 failed, so a switch never leaves Claude closed. A failed sync still exits
 nonzero with its result and `launch=started`. `switch` returns
 `state=launch_failed` only when the launch command cannot start or exits with
-an error. A command still running after 10 seconds counts as launched, because a
-profile can launch the Claude executable itself. A failed or slow launch leaves
+an error, or is still running after 10 seconds. The launch command is `open`,
+which returns once macOS has started Claude. A failed or slow launch leaves
 nothing behind that blocks the next switch. Older versions could leave a
 `launch-pending.json` file after a slow launch. `setup` removes it.
 
@@ -475,9 +473,10 @@ claude-session-sync uninstall --dry-run
 claude-session-sync uninstall --apply
 ```
 
-Uninstall removes only generated wrappers, watcher, and LaunchAgent by moving
-them into the tool's backup area. It preserves the private config, transaction
-state, and the original Claude application for recovery.
+Uninstall removes only the generated runtime, watcher, sidebar helper, and
+LaunchAgent by moving them into the tool's backup area. It preserves the
+private config, transaction state, and the original Claude application for
+recovery.
 
 ## Development
 

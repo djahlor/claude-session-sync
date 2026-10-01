@@ -79,8 +79,6 @@ def _prepare_config_data(
     source: bytes,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
 ) -> tuple[bytes, dict]:
@@ -92,8 +90,6 @@ def _prepare_config_data(
     changes = _apply_config_options(
         document,
         automatic_targets=automatic_targets,
-        enable_personal=enable_personal,
-        disable_personal=disable_personal,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
     )
@@ -106,8 +102,6 @@ def _configure(
     config_path: Path,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
     apply: bool,
@@ -118,8 +112,6 @@ def _configure(
     encoded, payload = _prepare_config_data(
         config_path.read_bytes(),
         automatic_targets=automatic_targets,
-        enable_personal=enable_personal,
-        disable_personal=disable_personal,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
     )
@@ -140,12 +132,10 @@ def _apply_config_options(
     document: dict,
     *,
     automatic_targets: bool,
-    enable_personal: bool,
-    disable_personal: bool,
     sync_layout: bool,
     sync_routines: bool,
 ) -> int:
-    changes = 0
+    changes = _drop_personal_profile(document)
 
     if automatic_targets:
         # Sync every folder a real login uses, and let a new login join once
@@ -159,44 +149,6 @@ def _apply_config_options(
                 document[key] = value
                 changes += 1
 
-    if enable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is None:
-            raise ValueError("generated Personal profile is missing")
-        if personal.get("enabled") is not True:
-            personal["enabled"] = True
-            changes += 1
-        for key in (
-            "acknowledge_cross_profile_copy",
-            "acknowledge_cross_account_copy",
-        ):
-            if document.get(key) is not True:
-                document[key] = True
-                changes += 1
-
-    if disable_personal:
-        personal = next(
-            (
-                profile
-                for profile in document.get("profiles", [])
-                if profile.get("name") == "Personal"
-            ),
-            None,
-        )
-        if personal is not None and personal.get("enabled", True) is not False:
-            personal["enabled"] = False
-            changes += 1
-        if document.get("acknowledge_cross_profile_copy") is not False:
-            document["acknowledge_cross_profile_copy"] = False
-            changes += 1
-
     if sync_layout and document.get("sync_sidebar_layout") is not True:
         document["sync_sidebar_layout"] = True
         changes += 1
@@ -208,17 +160,29 @@ def _apply_config_options(
     return changes
 
 
+def _drop_personal_profile(document: dict) -> int:
+    """Remove the Personal profile older versions generated, with its targets."""
+
+    profiles = document.get("profiles", [])
+    kept = [profile for profile in profiles if profile.get("name") != "Personal"]
+    if len(kept) == len(profiles):
+        return 0
+    document["profiles"] = kept
+    if "approved_targets" in document:
+        document["approved_targets"] = [
+            target
+            for target in document["approved_targets"]
+            if target.get("profile") != "Personal"
+        ]
+    document["acknowledge_cross_profile_copy"] = False
+    return 1
+
+
 def _config_summary(document: dict, changes: int) -> dict:
     return {
         "state": "planned" if changes else "noop",
         "counts": {
             "changes": changes,
-            "personal_enabled": int(
-                any(
-                    profile.get("name") == "Personal" and profile.get("enabled") is True
-                    for profile in document.get("profiles", [])
-                )
-            ),
             "automatic_targets": int(
                 document.get("target_policy") in ("all-configured-profiles", "logins")
             ),

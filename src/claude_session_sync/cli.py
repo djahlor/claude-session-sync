@@ -243,23 +243,12 @@ def _parser() -> argparse.ArgumentParser:
     approve_mode.add_argument("--apply", action="store_true")
     configure = commands.add_parser(
         "configure",
-        help="configure automatic targets and optional profile launchers",
+        help="configure automatic targets and which stores sync",
     )
     configure.add_argument(
         "--automatic-targets",
         action="store_true",
         help="trust future account/workspace targets inside configured profiles",
-    )
-    profile_mode = configure.add_mutually_exclusive_group()
-    profile_mode.add_argument(
-        "--enable-personal",
-        action="store_true",
-        help="enable the generated Personal profile",
-    )
-    profile_mode.add_argument(
-        "--disable-personal",
-        action="store_true",
-        help="disable the generated Personal profile",
     )
     configure.add_argument(
         "--sync-layout",
@@ -278,9 +267,6 @@ def _parser() -> argparse.ArgumentParser:
         "setup", help="configure and install macOS adapters atomically"
     )
     setup.add_argument("--automatic-targets", action="store_true")
-    setup_profile = setup.add_mutually_exclusive_group()
-    setup_profile.add_argument("--enable-personal", action="store_true")
-    setup_profile.add_argument("--disable-personal", action="store_true")
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
     setup.add_argument(
@@ -957,8 +943,6 @@ def run(
             desired, config_payload = _prepare_config_data(
                 source,
                 automatic_targets=arguments.automatic_targets,
-                enable_personal=arguments.enable_personal,
-                disable_personal=arguments.disable_personal,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
             )
@@ -993,8 +977,6 @@ def run(
             payload = _configure(
                 arguments.config,
                 automatic_targets=arguments.automatic_targets,
-                enable_personal=arguments.enable_personal,
-                disable_personal=arguments.disable_personal,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
                 apply=arguments.apply,
