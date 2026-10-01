@@ -148,7 +148,7 @@ IDLE -> DISCOVERING -> PLANNED
 Tests exercise the external interface and CLI against temporary profile roots
 and injected process/launch adapters. Required behaviors include deterministic
 planning, explicit privacy scope, two-profile discovery, malformed and tied
-revision blocking, one-writer concurrency, interruption recovery, app-reopen
+revisions left alone, one-writer concurrency, interruption recovery, app-reopen
 abort, idempotent apply, byte-perfect rollback, and a 5,000-replica performance
 budget. Routine tests cover union, newest-edit selection, deletion propagation,
 new empty targets, malformed manifests, and missing task instructions.
