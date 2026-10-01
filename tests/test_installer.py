@@ -426,6 +426,54 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(report.state, "installed")
             self.assertEqual(layout.config_path.read_bytes(), config_data)
 
+    def run_failed_setup_that_records_a_choice(self, home, existing_choice):
+        from claude_session_sync.config import load_config
+        from claude_session_sync.layout import ADOPT_PENDING_FILENAME, request_adoption
+
+        class FailNextWatcherBootstrap(FakeCommandRunner):
+            fail_next = False
+
+            def __call__(self, command, **kwargs):
+                if self.fail_next and len(command) > 1 and command[1] == "bootstrap":
+                    self.fail_next = False
+                    raise subprocess.CalledProcessError(1, command)
+                return super().__call__(command, **kwargs)
+
+        layout = self.layout(home)
+        runner = FailNextWatcherBootstrap()
+        installer = Installer(layout, runner=runner, backup_id=lambda: "rollback")
+        installer.setup(dry_run=False)
+        state_dir = load_config(layout.config_path).state_dir
+        pending = state_dir / ADOPT_PENDING_FILENAME
+        if existing_choice is not None:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            pending.write_bytes(existing_choice)
+        document = json.loads(layout.config_path.read_bytes())
+        document["sync_sidebar_layout"] = True
+        changed = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+        runner.fail_next = True
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            installer.setup(
+                dry_run=False,
+                config_data=changed,
+                before_activation=lambda helper: request_adoption(state_dir, "acct/space"),
+            )
+        return pending
+
+    def test_a_failed_setup_leaves_no_new_main_account_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pending = self.run_failed_setup_that_records_a_choice(Path(directory), None)
+
+            self.assertFalse(pending.exists(), "the answer to a failed setup is not kept")
+
+    def test_a_failed_setup_keeps_the_choice_made_before_it(self):
+        earlier = b'{"version": 1, "source_scope": "earlier/space"}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            pending = self.run_failed_setup_that_records_a_choice(Path(directory), earlier)
+
+            self.assertEqual(earlier, pending.read_bytes())
+
     def test_activation_failure_restores_existing_config_and_artifacts(self):
         class FailNextWatcherBootstrap(FakeCommandRunner):
             def __init__(self):

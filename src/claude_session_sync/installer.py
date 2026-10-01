@@ -581,31 +581,48 @@ class Installer:
                 self._validate_staged_plists(staging, config_data)
                 transaction.stop_watcher()
                 self._remove_retired_launch_guard(config_data)
+                pending_choice = self._pending_choice(config_data)
+                pending_before = _read_optional(pending_choice)
                 if before_activation is not None:
                     before_activation(helper if helper.exists() else self.layout.layout_helper)
-                report = self._apply_setup(actions, config_data, watcher, helper)
-                remaining = self._planned_actions(config_data)
-                if remaining:
-                    raise RuntimeError(
-                        "installed artifacts failed verification: {}".format(
-                            ", ".join(str(action.path) for action in remaining)
+                try:
+                    report = self._apply_setup(actions, config_data, watcher, helper)
+                    remaining = self._planned_actions(config_data)
+                    if remaining:
+                        raise RuntimeError(
+                            "installed artifacts failed verification: {}".format(
+                                ", ".join(str(action.path) for action in remaining)
+                            )
                         )
-                    )
-                transaction.sync_targets()
+                    transaction.sync_targets()
+                except BaseException:
+                    # The transaction restores config and artifacts but not the
+                    # state directory, so put back the choice as it was.
+                    _restore_optional(pending_choice, pending_before)
+                    raise
                 return report
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    def _state_dir(self, config_data: Optional[bytes]) -> Optional[Path]:
+        if config_data is not None:
+            return self._load_config_bytes(config_data).state_dir
+        if self.layout.config_path.exists():
+            return load_config(self.layout.config_path).state_dir
+        return None
+
     def _remove_retired_launch_guard(self, config_data: Optional[bytes]) -> None:
         """Older versions left this file after a slow launch. Nothing reads it now."""
 
-        if config_data is not None:
-            state_dir = self._load_config_bytes(config_data).state_dir
-        elif self.layout.config_path.exists():
-            state_dir = load_config(self.layout.config_path).state_dir
-        else:
-            return
-        (state_dir / "launch-pending.json").unlink(missing_ok=True)
+        state_dir = self._state_dir(config_data)
+        if state_dir is not None:
+            (state_dir / "launch-pending.json").unlink(missing_ok=True)
+
+    def _pending_choice(self, config_data: Optional[bytes]) -> Optional[Path]:
+        from .layout import ADOPT_PENDING_FILENAME
+
+        state_dir = self._state_dir(config_data)
+        return None if state_dir is None else state_dir / ADOPT_PENDING_FILENAME
 
     def _validate_staged_plists(
         self, staging: Path, config_data: Optional[bytes]
@@ -705,3 +722,21 @@ class Installer:
             transaction.sync_targets()
             state = "uninstalled" if actions else "noop"
             return InstallReport(state, tuple(actions), tuple(self._backups))
+
+
+def _read_optional(path: Optional[Path]) -> Optional[bytes]:
+    if path is None or not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+def _restore_optional(path: Optional[Path], content: Optional[bytes]) -> None:
+    """Put a small state file back as it was: absent, or with these exact bytes."""
+
+    if path is None:
+        return
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_bytes(content)
+    os.chmod(str(path), 0o600)
