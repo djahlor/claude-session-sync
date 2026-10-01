@@ -17,6 +17,7 @@ from claude_session_sync.layout import (
     LOCAL_SLICE_KEY,
     LayoutError,
     LayoutBusyError,
+    LayoutReceipt,
     LayoutRecoveryError,
     LayoutSnapshot,
     LayoutSynchronizer,
@@ -441,7 +442,7 @@ class LayoutRecoveryTests(unittest.TestCase):
             with patch("claude_session_sync.layout.LevelDatabase", FakeDatabase):
                 result = synchronizer.probe()
             self.assertEqual("compatible", result["state"])
-            self.assertEqual(0, result["group_count"])
+            self.assertEqual(1, result["group_count"])
             self.assertEqual(b"original", marker.read_bytes())
             self.assertTrue(opened)
             self.assertNotIn(database_path, opened)
@@ -1091,6 +1092,173 @@ class FollowAccountTests(unittest.TestCase):
             self.assertEqual(latest["groups"], scopes["b/w"]["groups"])
             self.assertIsNone(layout_module.read_pending_adoption(synchronizer.config.state_dir))
             self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+
+
+def group_names(records_by_key, keys):
+    scopes = decoded(records_by_key[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+    return {key: [group["name"] for group in scopes[key]["groups"]] for key in keys}
+
+
+class FirstAdoptionTests(unittest.TestCase):
+    """With no adopted account yet, one account's sidebar becomes the source."""
+
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def first_sync(self, scopes, active):
+        return transform_layout_records(
+            records(scopes, active=active), self.targets, timestamp_ms=10
+        )
+
+    def test_the_signed_in_account_with_groups_is_copied_to_the_others(self):
+        result = self.first_sync(
+            {"a/w": scope("Focus", assignments={"code:x": "id-focus"}), "b/w": scope("Other")},
+            active="a/w",
+        )
+
+        self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
+        self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
+        self.assertIsNone(result.canonical_upload_scope, "a's own groups need no upload")
+
+    def test_an_empty_signed_in_account_gets_the_only_account_with_groups(self):
+        result = self.first_sync({"a/w": scope(), "b/w": scope("Focus")}, active="a/w")
+
+        self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
+        self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
+        self.assertEqual("a/w", result.canonical_upload_scope, "a's servers must get the copy")
+
+    def test_no_groups_anywhere_changes_nothing_and_says_so(self):
+        current = records({"a/w": scope(), "b/w": scope()}, active="a/w")
+
+        result = transform_layout_records(current, self.targets, timestamp_ms=10)
+
+        self.assertEqual(current, dict(result.records))
+        self.assertEqual("no-groups-yet", result.reason)
+        self.assertIsNone(result.snapshot, "nothing is adopted yet")
+
+    def test_an_empty_signed_in_account_and_two_grouped_accounts_stop_for_a_choice(self):
+        targets = dict(self.targets, **{"c/w": {"code:x"}})
+        with self.assertRaisesRegex(LayoutError, "keep one with"):
+            transform_layout_records(
+                records({"a/w": scope(), "b/w": scope("Focus"), "c/w": scope("Other")}, active="a/w"),
+                targets,
+                timestamp_ms=10,
+            )
+
+    def test_a_signed_in_account_outside_sync_leaves_every_record_alone(self):
+        current = records({"a/w": scope("Focus"), "stale/w": scope("Stale")}, active="stale/w")
+
+        result = transform_layout_records(current, self.targets, timestamp_ms=10)
+
+        self.assertEqual(current, dict(result.records))
+        self.assertIsNone(result.reason)
+
+
+class FirstSyncTests(unittest.TestCase):
+    """The first closed sync on a fresh or upgraded install, through the synchronizer."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def installed(self, root, scopes, *, active, owner=None):
+        synchronizer, fake, _database, values = self.transaction_fixture(root)
+        values.clear()
+        values.update(records(scopes, active=active))
+        if owner is not None:
+            values[layout_module.SYNC_OWNER_KEY] = b"\x01" + owner.encode("utf-8")
+            values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+        synchronizer.helper = root / "helper"
+        synchronizer.helper.write_bytes(b"fixture")
+        os.chmod(synchronizer.helper, 0o700)
+
+        def sync(**options):
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets
+            ):
+                return synchronizer.sync(**options)
+
+        return synchronizer, values, sync
+
+    def edit(self, values, scope_key, new_scope):
+        """Claude writes a sidebar edit to both group records."""
+        store = decoded(values[DFRAME_STORE_KEY])
+        store["state"]["customGroupsByScope"][scope_key] = new_scope
+        values[DFRAME_STORE_KEY] = encoded(store)
+        persisted = decoded(values[GROUP_SCOPES_KEY])
+        persisted["value"][scope_key] = new_scope
+        values[GROUP_SCOPES_KEY] = encoded(persisted)
+
+    def test_a_group_deleted_in_one_account_stays_deleted_after_the_next_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            both = scope("Focus", "Old idea", assignments={"code:x": "id-focus"})
+            _synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": both, "b/w": both}, active="a/w"
+            )
+
+            sync()
+            self.edit(values, "a/w", scope("Focus", assignments={"code:x": "id-focus"}))
+            sync()
+            repeated = sync()
+
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+            self.assertEqual("noop", repeated.state)
+
+    def test_an_install_from_the_union_model_adopts_at_its_next_closed_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            union = scope("Focus", "Backlog", assignments={"code:x": "id-focus"})
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": union, "b/w": union}, active="b/w", owner="b"
+            )
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            # The shape the union model wrote before this change.
+            snapshot_path.write_text(json.dumps({
+                "version": 1,
+                "groups": ["Focus", "Backlog"],
+                "assignments": {"code:x": "Focus"},
+                "pinned_order": ["code:x"],
+                "home_projects_pinned_order": [],
+                "group_order": {"Backlog": [], "Focus": ["code:x"]},
+                "group_records": [{"id": "id-focus", "name": "Focus"}, {"id": "id-backlog", "name": "Backlog"}],
+                "adopted_scope": None,
+            }, indent=2, sort_keys=True) + "\n")
+
+            sync()
+            self.assertEqual({"version": 1, "adopted_scope": "b/w"}, json.loads(snapshot_path.read_text()))
+            self.edit(values, "b/w", scope("Focus", assignments={"code:x": "id-focus"}))
+            sync()
+
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+
+    def test_a_choice_made_at_install_is_copied_into_the_signed_in_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = scope("Focus", assignments={"code:x": "id-focus"})
+            # b is signed in, but Claude has not shown b's Code sidebar yet.
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": latest, "b/w": scope("Old")}, active="a/w", owner="b"
+            )
+            layout_module.request_adoption(synchronizer.config.state_dir, "a/w")
+
+            receipt = sync()
+
+            self.assertEqual("synced", receipt.state)
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+            self.assertEqual(b"\x01b/w", values[layout_module.GROUP_UPLOAD_KEY])
+            snapshot = json.loads((synchronizer.config.state_dir / "sidebar-layout-0.json").read_text())
+            self.assertEqual("b/w", snapshot["adopted_scope"])
+            self.assertIsNone(layout_module.read_pending_adoption(synchronizer.config.state_dir))
+
+    def test_no_groups_anywhere_is_reported_and_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, sync = self.installed(
+                Path(directory), {"a/w": scope(), "b/w": scope()}, active="a/w"
+            )
+            before = dict(values)
+
+            receipt = sync()
+
+            self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "no-groups-yet"), receipt)
+            self.assertEqual(before, values)
+            self.assertFalse((synchronizer.config.state_dir / "sidebar-layout-0.json").exists())
 
 
 if __name__ == "__main__":

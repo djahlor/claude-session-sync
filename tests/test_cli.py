@@ -1540,6 +1540,43 @@ class CliLayoutTests(unittest.TestCase):
                 payload["layout"],
             )
 
+    def test_sync_says_plainly_when_no_account_has_groups_yet(self):
+        from claude_session_sync.layout import LayoutReceipt
+
+        class EmptyLayout:
+            def sync(self):
+                return LayoutReceipt("noop", 1, 0, 0, 0, 0, "no-groups-yet")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = replace(config(root), sync_sidebar_layout=True)
+            planned = Plan(1, "digest", (), (), (), "plan-layout", 0)
+            receipt = RunReceipt("run-layout", "committed", "plan-layout", 0, 0)
+            output = io.StringIO()
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: FakePlanner(planned),
+                engine_factory=lambda _config: FakeEngine(receipt),
+                layout_factory=lambda _config: EmptyLayout(),
+                process_probe=FakeProcessProbe(),
+            )
+
+            exit_code = run(
+                ["--config", str(root / "config.json"), "sync", "--json"],
+                dependencies=dependencies,
+                stdout=output,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("finished", payload["progress"])
+            self.assertEqual(
+                {"state": "noop", "reason": "no-groups-yet", "profiles": 1, "records": 0,
+                 "groups": 0, "assignments": 0, "pins": 0},
+                payload["layout"],
+            )
+
     def test_layout_failure_does_not_change_a_committed_chat_result(self):
         class BrokenLayout:
             def sync(self):

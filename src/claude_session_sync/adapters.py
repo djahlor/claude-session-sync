@@ -140,6 +140,8 @@ def run_adapters(
                     result.update(
                         {key: getattr(receipt, attr) for key, attr in fields.items()}
                     )
+                    if getattr(receipt, "reason", None):
+                        result["reason"] = receipt.reason
                     probes[name] = {"state": "compatible", "validated_by": "sync"}
         except Exception as error:
             result = _failure(name, error)
