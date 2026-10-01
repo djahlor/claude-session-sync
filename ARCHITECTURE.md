@@ -102,10 +102,15 @@ window display progress without depending on Notification Center.
 
 Claude stores chats and sidebar layout in separate stores. After chat sync
 commits, the optional layout adapter derives account and workspace scopes from
-the validated session registry. It then unions group names and pin order across
-those scopes. Group assignments copy by group name only when the source scopes
-agree. Ambiguous assignments remain unchanged in their existing scope and are
-not guessed for new scopes.
+the validated session registry. One scope is the source, and a private snapshot
+records which one. With none recorded, the first sync adopts the scope chosen
+at install, else the signed-in scope if it has groups, else the only scope with
+groups. After that the signed-in scope is the source, except right after an
+account switch, when the scope just left is. The adapter copies the source's
+groups, assignments, and group order into every other scope. Pins are one
+shared list and stay as they are. When only the user can say which scope to
+keep, the adapter stops and asks. `doctor` runs the same plan on a disposable
+copy of the database.
 
 The native helper is compiled locally from bundled LevelDB and Snappy sources.
 It exposes only exact-key reads and an atomic write batch. Unknown record shapes,

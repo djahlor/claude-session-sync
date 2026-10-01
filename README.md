@@ -12,7 +12,7 @@ on one Mac. Keep using the regular Claude app.
 ## What it syncs
 
 - Claude Code chat history.
-- Pins, custom groups, and chat assignments where they do not conflict.
+- Pins and custom groups, copied from one main account to the others.
 - Claude Code routine definitions, but not saved permissions or past runs.
 
 Sync runs locally. It does not move data between Macs, transfer Claude web chats,
@@ -28,6 +28,12 @@ Tools, Apple's build tools.
 3. Unzip it.
 4. Double-click `Install Claude Session Sync.command` inside the folder.
 5. Choose **1** for automatic sync.
+6. If two or more accounts have custom groups, the installer lists them and
+   asks which one is the main one. Type its number, or press Enter to keep the
+   account you are signed into.
+
+The other accounts copy the main account's pins and groups the next time
+Claude closes.
 
 The installer adds a background helper and a small **Sync** menu-bar item.
 It does not replace the Claude app.
@@ -59,7 +65,9 @@ The **Sync** menu keeps the latest status.
   old Mac are ignored.
 
 Pins and groups follow the account you use. When you switch, the account you
-just left is the source. Otherwise the account you are signed into wins.
+just left is the source. Otherwise the account you are signed into wins. A
+group you delete stays deleted in every account. To pick another main account
+later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
 Routines sync at the same moments as chats.
 
 ## Update
