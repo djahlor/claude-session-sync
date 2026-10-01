@@ -88,11 +88,13 @@ def read_status(state_dir: Path, filename: str) -> dict:
 
 
 def _failure(name, error) -> dict:
-    from .layout import LayoutBusyError, LayoutError
+    from .layout import LayoutBusyError, LayoutChoiceError, LayoutError
     from .routines import RoutineBusyError, RoutineError
 
     if isinstance(error, (LayoutBusyError, RoutineBusyError)):
         return {"state": "skipped", "reason": "writer-busy"}
+    if isinstance(error, LayoutChoiceError):
+        return {"state": "skipped", "reason": "choose-main-account", "detail": str(error)}
     if isinstance(error, (LayoutError, RoutineError)):
         return {"state": "skipped", "reason": "unsafe-" + name, "detail": str(error)}
     singular = "routine" if name == "routines" else name

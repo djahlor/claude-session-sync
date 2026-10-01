@@ -54,8 +54,8 @@ MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
 ADOPT_PENDING_FILENAME = "sidebar-adopt-pending.json"
 NEEDS_MAIN_ACCOUNT = (
-    "current account sidebar differs from the adopted canonical layout; "
-    "keep one with sync --adopt-current-sidebar or --adopt-source-scope"
+    "it is unclear which account's pins and groups to keep; list the accounts "
+    "with keep-sidebar --dry-run, then keep one with keep-sidebar --account N --apply"
 )
 
 
@@ -69,6 +69,10 @@ class LayoutBusyError(LayoutError):
 
 class LayoutRecoveryError(LayoutError):
     """Raised when a failed write cannot be restored automatically."""
+
+
+class LayoutChoiceError(LayoutError):
+    """Raised when only the user can say which account's sidebar to keep."""
 
 
 @dataclass(frozen=True)
@@ -596,7 +600,7 @@ def _source_scope(
             return active
         if after_account_switch or active_is_empty:
             return snapshot.adopted_scope
-        raise LayoutError(NEEDS_MAIN_ACCOUNT)
+        raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
     grouped = [
         key
         for key in sorted(target_sessions)
@@ -608,7 +612,7 @@ def _source_scope(
         return None
     if len(grouped) == 1 and active_is_empty:
         return grouped[0]
-    raise LayoutError(NEEDS_MAIN_ACCOUNT)
+    raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
 
 
 def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
@@ -873,38 +877,113 @@ class LayoutSynchronizer:
             owner = _owner_account(database.get_optional(SYNC_OWNER_KEY))
         return sidebar_accounts(records, target_sessions, owner)
 
+    def _requested_source(
+        self, adopt_current_sidebar: bool, adopt_source_scope: Optional[str]
+    ) -> Tuple[Optional[str], bool]:
+        """The account a sync must copy from by request, and whether it is a pending choice.
+
+        A choice made with keep-sidebar, or at install, waits in a file until
+        Claude is closed.
+        """
+        if adopt_current_sidebar and adopt_source_scope is not None:
+            raise LayoutError("current sidebar modes cannot be combined")
+        pending = False
+        if not adopt_current_sidebar and adopt_source_scope is None:
+            adopt_source_scope = read_pending_adoption(self.config.state_dir)
+            pending = adopt_source_scope is not None
+        if (adopt_current_sidebar or adopt_source_scope is not None) and (
+            len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
+        ):
+            raise LayoutError(
+                "choose the single default data profile before adopting its current sidebar"
+            )
+        return adopt_source_scope, pending
+
+    def _plan_profile(
+        self,
+        database: LevelDatabase,
+        target_sessions: Mapping[str, Set[str]],
+        snapshot: Optional[LayoutSnapshot],
+        *,
+        adopt_current_sidebar: bool,
+        adopt_source_scope: Optional[str],
+        after_account_switch: bool,
+    ) -> Tuple[Dict[bytes, Optional[bytes]], Dict[bytes, bytes], LayoutTransform]:
+        """Read one profile's sidebar and plan the records to write.
+
+        Returns the records read, the records planned, and the transform.
+        Sync runs this on the live database and doctor on a disposable copy.
+        """
+        current = {}  # type: Dict[bytes, Optional[bytes]]
+        for key in LAYOUT_KEYS:
+            self._assert_stopped()
+            current[key] = database.get(key)
+        self._assert_stopped()
+        transformed = transform_layout_records(
+            current,
+            target_sessions,
+            snapshot=snapshot,
+            adopt_current_sidebar=adopt_current_sidebar,
+            adopt_source_scope=adopt_source_scope,
+            after_account_switch=after_account_switch,
+            owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
+        )
+        planned = dict(transformed.records)
+        marker = self._group_upload_marker(
+            database,
+            current,
+            planned,
+            canonical_upload_scope=transformed.canonical_upload_scope,
+        )
+        if marker is not None:
+            current[GROUP_UPLOAD_KEY], planned[GROUP_UPLOAD_KEY] = marker
+        return current, planned, transformed
+
     def probe(self) -> Dict[str, Any]:
-        """Validate current records in disposable copies without opening live DBs."""
+        """Plan the next closed sync on disposable copies, without opening live DBs.
+
+        It takes the inputs `auto` takes: the signed-in owner account and a
+        pending choice, with no account-switch mode. A switch restart syncs
+        at once, so the sync doctor checks is the one when Claude closes.
+        """
         if not self.config.sync_sidebar_layout:
             return {"state": "disabled"}
         self._assert_stopped()
+        adopt_source_scope, _pending = self._requested_source(False, None)
         profiles = groups = pins = assignments = 0
+        reasons = []
         for index, profile in enumerate(self.config.profiles):
             targets = self._target_sessions(profile.name, profile.data_root)
+            snapshot = load_snapshot(
+                self.config.state_dir / "sidebar-layout-{}.json".format(index)
+            )
             self._assert_stopped()
             with self._database_copy(profile.data_root) as database:
-                self._assert_stopped()
-                current = {key: database.get(key) for key in LAYOUT_KEYS}
-                transformed = transform_layout_records(
-                    current,
+                _current, _planned, transformed = self._plan_profile(
+                    database,
                     targets,
-                    snapshot=load_snapshot(
-                        self.config.state_dir / "sidebar-layout-{}.json".format(index)
-                    ),
+                    snapshot,
+                    adopt_current_sidebar=False,
+                    adopt_source_scope=adopt_source_scope,
+                    after_account_switch=False,
                 )
-                self._group_upload_marker(database, current, transformed.records)
-                profiles += 1
-                groups += transformed.group_count
-                pins += transformed.pin_count
-                assignments += transformed.assignment_count
+            profiles += 1
+            groups += transformed.group_count
+            pins += transformed.pin_count
+            assignments += transformed.assignment_count
+            if transformed.reason is not None:
+                reasons.append(transformed.reason)
         self._assert_stopped()
-        return {
+        result = {
             "state": "compatible",
             "profile_count": profiles,
             "group_count": groups,
             "pin_count": pins,
             "assignment_count": assignments,
-        }
+        }  # type: Dict[str, Any]
+        if reasons:
+            result["reason"] = reasons[0]
+        return result
 
     def sync(
         self,
@@ -915,22 +994,9 @@ class LayoutSynchronizer:
     ) -> LayoutReceipt:
         if not self.config.sync_sidebar_layout:
             return LayoutReceipt("disabled", 0, 0, 0, 0, 0)
-        if adopt_current_sidebar and adopt_source_scope is not None:
-            raise LayoutError("current sidebar modes cannot be combined")
-        pending = None
-        if not (adopt_current_sidebar or adopt_source_scope):
-            pending = read_pending_adoption(self.config.state_dir)
-            if pending is not None:
-                # An adoption asked for while Claude was open: the chosen
-                # account's organization becomes the source of truth.
-                adopt_source_scope = pending
-                after_account_switch = False
-        if (adopt_current_sidebar or adopt_source_scope is not None) and (
-            len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
-        ):
-            raise LayoutError(
-                "choose the single default data profile before adopting its current sidebar"
-            )
+        adopt_source_scope, pending = self._requested_source(
+            adopt_current_sidebar, adopt_source_scope
+        )
         self._assert_stopped()
         if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
             raise LayoutError("sidebar helper is not installed")
@@ -953,33 +1019,18 @@ class LayoutSynchronizer:
                 self._check_database_path(database_path)
                 target_sessions = self._target_sessions(profile.name, profile.data_root)
                 database = LevelDatabase(self.helper, database_path)
-                current = {}
-                for key in LAYOUT_KEYS:
-                    self._assert_stopped()
-                    current[key] = database.get(key)
                 snapshot_path = self.config.state_dir / "sidebar-layout-{}.json".format(
                     index
                 )
                 snapshot_before = _snapshot_bytes(snapshot_path)
-                self._assert_stopped()
-                transformed = transform_layout_records(
-                    current,
+                current, planned_records, transformed = self._plan_profile(
+                    database,
                     target_sessions,
-                    snapshot=_decode_snapshot(snapshot_before),
+                    _decode_snapshot(snapshot_before),
                     adopt_current_sidebar=adopt_current_sidebar,
                     adopt_source_scope=adopt_source_scope,
                     after_account_switch=after_account_switch,
-                    owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
                 )
-                planned_records = dict(transformed.records)
-                marker = self._group_upload_marker(
-                    database,
-                    current,
-                    planned_records,
-                    canonical_upload_scope=transformed.canonical_upload_scope,
-                )
-                if marker is not None:
-                    current[GROUP_UPLOAD_KEY], planned_records[GROUP_UPLOAD_KEY] = marker
                 replacements = {
                     key: value
                     for key, value in planned_records.items()
@@ -1008,7 +1059,7 @@ class LayoutSynchronizer:
                 totals[3] = max(totals[3], transformed.pin_count)
                 if transformed.reason is not None:
                     reasons.append(transformed.reason)
-            if pending is not None:
+            if pending:
                 clear_pending_adoption(self.config.state_dir)
             return LayoutReceipt(
                 "synced" if changed_profiles else "noop",

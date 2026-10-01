@@ -17,6 +17,7 @@ from claude_session_sync.layout import (
     LOCAL_SLICE_KEY,
     LayoutError,
     LayoutBusyError,
+    LayoutChoiceError,
     LayoutReceipt,
     LayoutRecoveryError,
     LayoutSnapshot,
@@ -197,7 +198,7 @@ class LayoutTransformTests(unittest.TestCase):
         current = dict(adopted.records)
         current[DFRAME_STORE_KEY] = _encode_record(switched)
 
-        with self.assertRaisesRegex(LayoutError, "differs from the adopted"):
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
             transform_layout_records(
                 current,
                 {"a/w": {"code:keep"}, "b/w": {"code:keep"}},
@@ -435,6 +436,9 @@ class LayoutRecoveryTests(unittest.TestCase):
 
                 def get(self, key):
                     return data[key]
+
+                def get_optional(self, key):
+                    return data.get(key)
 
             synchronizer = LayoutSynchronizer(
                 config, helper=helper, process_probe=lambda: ()
@@ -1031,7 +1035,7 @@ class FollowAccountTests(unittest.TestCase):
         adopted = self.adopted(scope("Focus"), scope(), targets)
         current = self.switched_to_b(adopted, scope("Edited in b"))
 
-        with self.assertRaisesRegex(LayoutError, "adopt-current-sidebar"):
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
             transform_layout_records(
                 current, targets, snapshot=adopted.snapshot, timestamp_ms=20, owner_account="b"
             )
@@ -1137,7 +1141,7 @@ class FirstAdoptionTests(unittest.TestCase):
 
     def test_an_empty_signed_in_account_and_two_grouped_accounts_stop_for_a_choice(self):
         targets = dict(self.targets, **{"c/w": {"code:x"}})
-        with self.assertRaisesRegex(LayoutError, "keep one with"):
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
             transform_layout_records(
                 records({"a/w": scope(), "b/w": scope("Focus"), "c/w": scope("Other")}, active="a/w"),
                 targets,
@@ -1259,6 +1263,92 @@ class FirstSyncTests(unittest.TestCase):
             self.assertEqual(LayoutReceipt("noop", 1, 0, 0, 0, 0, "no-groups-yet"), receipt)
             self.assertEqual(before, values)
             self.assertFalse((synchronizer.config.state_dir / "sidebar-layout-0.json").exists())
+
+
+class DoctorTests(unittest.TestCase):
+    """doctor plans the next closed sync with the inputs sync uses."""
+
+    config = LayoutRecoveryTests.config
+    transaction_fixture = LayoutRecoveryTests.transaction_fixture
+    targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
+
+    def switched_to_b(self, root):
+        """a was synced last; b is signed in and Claude reloaded b's old groups."""
+        synchronizer, fake, _database, values = self.transaction_fixture(root)
+        values.clear()
+        values.update(records(
+            {"a/w": scope("Focus", assignments={"code:x": "id-focus"}), "b/w": scope("Old")},
+            active="b/w",
+        ))
+        values[layout_module.SYNC_OWNER_KEY] = b"\x01b"
+        values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+        # The snapshot the adoption code wrote before this change.
+        (synchronizer.config.state_dir / "sidebar-layout-0.json").write_text(json.dumps({
+            "version": 1,
+            "groups": ["Focus"],
+            "assignments": {"code:x": "Focus"},
+            "pinned_order": [],
+            "home_projects_pinned_order": [],
+            "group_order": {"Focus": ["code:x"]},
+            "group_records": [{"id": "id-focus", "name": "Focus"}],
+            "adopted_scope": "a/w",
+        }))
+        synchronizer.helper = root / "helper"
+        synchronizer.helper.write_bytes(b"fixture")
+        os.chmod(synchronizer.helper, 0o700)
+        patches = (
+            patch("claude_session_sync.layout.LevelDatabase", fake),
+            patch.object(synchronizer, "_target_sessions", return_value=self.targets),
+        )
+        return synchronizer, values, patches
+
+    def test_after_a_switch_doctor_accepts_the_account_the_user_chose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, (database, targets) = self.switched_to_b(Path(directory))
+            layout_module.request_adoption(synchronizer.config.state_dir, "a/w")
+
+            with database, targets:
+                probed = synchronizer.probe()
+                synced = synchronizer.sync()
+
+            self.assertEqual(
+                {"state": "compatible", "profile_count": 1, "group_count": 1,
+                 "pin_count": 0, "assignment_count": 1},
+                probed,
+            )
+            self.assertEqual(("synced", 1), (synced.state, synced.group_count))
+            self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
+
+    def test_after_a_switch_without_a_choice_doctor_never_advises_the_reloaded_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            synchronizer, values, (database, targets) = self.switched_to_b(Path(directory))
+
+            with database, targets:
+                with self.assertRaises(LayoutChoiceError) as raised:
+                    synchronizer.probe()
+                with self.assertRaises(LayoutChoiceError):
+                    synchronizer.sync()
+
+            self.assertIn("keep-sidebar --dry-run", str(raised.exception))
+            self.assertNotIn("adopt-current-sidebar", str(raised.exception))
+
+    def test_a_needed_choice_is_reported_as_one(self):
+        from claude_session_sync.adapters import run_adapters
+
+        class Undecided:
+            def probe(self):
+                raise LayoutChoiceError("which one?")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            dependencies = type("Dependencies", (), {"layout_factory": lambda self, _config: Undecided()})()
+
+            result = run_adapters(config, dependencies, lambda: False, probe_only=True)
+
+        self.assertEqual(
+            {"layout": {"state": "skipped", "reason": "choose-main-account", "detail": "which one?"}},
+            result,
+        )
 
 
 if __name__ == "__main__":
