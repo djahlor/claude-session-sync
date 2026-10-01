@@ -3,7 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Union
 
 from . import strict_json as json
 from .chat_model import SyncState
@@ -25,8 +25,8 @@ class StateUnusable(RuntimeError):
 @dataclass
 class ChatState:
     sync: SyncState = field(default_factory=SyncState)
-    # data root -> (signed-in account, when that login began, in epoch ms)
-    logins: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+    # data root -> account -> its first login this Mac recorded, in epoch ms
+    logins: Dict[str, Dict[str, int]] = field(default_factory=dict)
     # partition keys that joined because Claude wrote a chat there after a login
     enrolled: List[str] = field(default_factory=list)
     last_success_ms: int = 0
@@ -79,10 +79,15 @@ def _decode(document: Any) -> ChatState:
     }
     logins = {}
     for root, value in _mapping(document.get("logins", {})).items():
-        values = _list(value)
-        if len(values) != 2:
-            raise ValueError("login entry")
-        logins[_string(root)] = (_string(values[0]), _integer(values[1]))
+        if isinstance(value, list):
+            # Older versions kept only the signed-in account: [account, login ms].
+            if len(value) != 2:
+                raise ValueError("login entry")
+            value = {value[0]: value[1]}
+        logins[_string(root)] = {
+            _string(account): _integer(login_ms)
+            for account, login_ms in _mapping(value).items()
+        }
     enrolled = [_string(item) for item in _list(document.get("enrolled", []))]
     # Versions that synced with Claude open also kept "live_creates". It is
     # ignored here and dropped on the next save.
@@ -105,8 +110,9 @@ def encode_state(state: ChatState) -> Dict[str, Any]:
         },
         "seen": {key: sorted(ids) for key, ids in sorted(state.sync.seen.items())},
         "logins": {
-            root: [account, changed]
-            for root, (account, changed) in sorted(state.logins.items())
+            root: dict(sorted(accounts.items()))
+            for root, accounts in sorted(state.logins.items())
+            if accounts
         },
         "enrolled": sorted(set(state.enrolled)),
         "last_success_ms": state.last_success_ms,

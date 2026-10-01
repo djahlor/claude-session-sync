@@ -8,7 +8,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import strict_json as json
 
@@ -21,7 +21,8 @@ LOGIN_LINE = re.compile(
     r"uuid: \S+ \u2192 ([0-9A-Fa-f-]{36})\)"
 )
 
-Logins = Dict[str, Tuple[str, int]]
+# data root -> account -> its first login this Mac recorded, in epoch ms
+Logins = Dict[str, Dict[str, int]]
 
 
 def default_app_log() -> Path:
@@ -42,52 +43,51 @@ def last_known_account(data_root: Path) -> Optional[str]:
     return value.lower() if isinstance(value, str) and value else None
 
 
-def login_dated_by_app(app_log: Path, account: str, now_ms: int) -> Optional[int]:
-    """When the log last recorded a login to this account, or None if its end does not say."""
+def logins_in_app_log(app_log: Path, now_ms: int) -> List[Tuple[str, int]]:
+    """Every login the end of Claude's log records, as (account, epoch ms), oldest first."""
 
     try:
         with open(str(app_log), "rb") as handle:
             handle.seek(max(0, os.fstat(handle.fileno()).st_size - APP_LOG_TAIL))
             tail = handle.read().decode("utf-8", errors="replace")
     except OSError:
-        return None
-    for line in reversed(tail.splitlines()):
-        found = LOGIN_LINE.match(line)
-        if found is None:
+        return []
+    found = []
+    for line in tail.splitlines():
+        match = LOGIN_LINE.match(line)
+        if match is None:
             continue
-        if found.group(2).lower() != account.lower():
-            return None
         try:
-            stamped = int(time.mktime(time.strptime(found.group(1), "%Y-%m-%d %H:%M:%S"))) * 1000
+            stamped = int(time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))) * 1000
         except (ValueError, OverflowError):
-            return None
-        return min(stamped, now_ms)
-    return None
+            continue
+        found.append((match.group(2).lower(), min(stamped, now_ms)))
+    return found
 
 
-def observe_logins(
+def record_logins(
     roots: Iterable[Path],
     logins: Logins,
     now_ms: int,
     app_log_for: Callable[[Path], Optional[Path]],
 ) -> None:
-    """Date each root's login by Claude's log where it names it, else by first sighting.
+    """Remember each account's first login per data root, so log rotation cannot lose it.
 
-    Claude rewrites config.json about once a minute for other reasons, so its
-    modification time cannot date a login.
+    Claude's log dates a login. A signed-in account the log does not name
+    counts from the first time sync sees it. Claude rewrites config.json about
+    once a minute for other reasons, so its modification time cannot date a
+    login.
     """
 
     for root in {_normalized(Path(root)) for root in roots}:
-        account = last_known_account(root)
-        if account is None:
-            continue
         app_log = app_log_for(root)
-        dated = login_dated_by_app(app_log, account, now_ms) if app_log is not None else None
-        known = logins.get(str(root))
-        if known is None or known[0] != account:
-            logins[str(root)] = (account, now_ms if dated is None else dated)
-        elif dated is not None and dated > known[1]:
-            logins[str(root)] = (account, dated)
+        seen = list(logins_in_app_log(app_log, now_ms)) if app_log is not None else []
+        signed_in = last_known_account(root)
+        if signed_in is not None:
+            seen.append((signed_in, now_ms))
+        for account, login_ms in seen:
+            known = logins.setdefault(str(root), {})
+            known[account] = min(login_ms, known.get(account, login_ms))
 
 
 def _normalized(path: Path) -> Path:

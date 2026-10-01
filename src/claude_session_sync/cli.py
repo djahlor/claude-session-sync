@@ -714,7 +714,6 @@ def _live_chat_payload(arguments: Any, config: Config, deps: CliDependencies) ->
             deps.engine_factory(config),
             prefer=getattr(arguments, "prefer", None),
             prefer_session=getattr(arguments, "session", None),
-            running_processes=lambda loaded: _running_processes(loaded, deps),
         )
     except ChatStateError:
         return {
@@ -948,11 +947,7 @@ def run(
             if _live_sync(deps):
                 from .chat_sync import plan_chat_sync
 
-                chat_run = plan_chat_sync(
-                    config,
-                    deps.planner_factory(config),
-                    running_processes=lambda loaded: _running_processes(loaded, deps),
-                )
+                chat_run = plan_chat_sync(config, deps.planner_factory(config))
                 plan = chat_run.plan
                 if arguments.report:
                     _write_plan_report(config, chat_run)

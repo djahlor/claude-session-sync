@@ -12,7 +12,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
 from .filesystem import sweep_stale_stages
@@ -37,12 +37,11 @@ def plan_chat_sync(
     *,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
-    running_processes: Optional[Callable] = None,
 ) -> ChatRun:
     """Plan without writing anything, including the state file."""
 
     state = _load(config)
-    plan = _plan(planner, config, state, prefer, prefer_session, running_processes)
+    plan = _plan(planner, config, state, prefer, prefer_session)
     return _summary(plan)
 
 
@@ -53,13 +52,12 @@ def run_chat_sync(
     *,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
-    running_processes: Optional[Callable] = None,
     clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
 ) -> ChatRun:
     path = state_path(config.state_dir)
     state = _load(config)
     on_disk = encode_state(state)
-    plan = _plan(planner, config, state, prefer, prefer_session, running_processes)
+    plan = _plan(planner, config, state, prefer, prefer_session)
     context = plan.context
     if context is None:
         # A planner without chat state: apply as the engine always did.
@@ -130,7 +128,7 @@ def _load(config):
         raise ChatStateError(str(error)) from error
 
 
-def _plan(planner, config, state, prefer, prefer_session, running_processes) -> Plan:
+def _plan(planner, config, state, prefer, prefer_session) -> Plan:
     request = SyncRequest(config)
     try:
         parameters = inspect.signature(planner.plan).parameters
@@ -140,10 +138,7 @@ def _plan(planner, config, state, prefer, prefer_session, running_processes) -> 
         if prefer is not None or prefer_session is not None:
             raise ValueError("this planner cannot settle ties")
         return planner.plan(request)
-    options: Dict[str, Any] = {"state": state, "prefer": prefer, "prefer_session": prefer_session}
-    if running_processes is not None and "running_processes" in parameters:
-        options["running_processes"] = running_processes
-    return planner.plan(request, **options)
+    return planner.plan(request, state=state, prefer=prefer, prefer_session=prefer_session)
 
 
 def _settle(sync, snapshots):

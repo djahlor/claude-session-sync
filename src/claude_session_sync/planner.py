@@ -27,7 +27,7 @@ from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
 from .hash_cache import HashCache
-from .logins import default_app_log, observe_logins
+from .logins import default_app_log, record_logins
 from .model import (
     Conflict,
     Discovery,
@@ -56,26 +56,16 @@ class PlanContext:
     rescan: Optional[Callable[[], List[Snapshot]]] = None
 
 
-def default_running_processes(config: Config) -> tuple:
-    from .processes import managed_processes
-
-    return managed_processes(
-        config.profiles, executable=config.claude_executable, timeout=5.0
-    )
-
-
 class Planner:
     def __init__(
         self,
         store: Optional[SessionStore] = None,
         *,
-        running_processes: Optional[Callable[[Config], Sequence[Any]]] = None,
         clock_ns: Callable[[], int] = time.time_ns,
         app_log: Optional[Path] = None,
         state: Optional[ChatState] = None,
     ) -> None:
         self._store = store
-        self._running_processes = running_processes or default_running_processes
         self._clock_ns = clock_ns
         self._app_log = app_log
         self._state = state
@@ -87,11 +77,8 @@ class Planner:
         state: Optional[ChatState] = None,
         prefer: Optional[str] = None,
         prefer_session: Optional[str] = None,
-        running_processes: Optional[Callable[[Config], Sequence[Any]]] = None,
     ) -> Plan:
         config = request.config
-        if running_processes is not None:
-            self._running_processes = running_processes
         if len(config.profiles) > 1 and not config.acknowledge_cross_profile_copy:
             raise ConfigError(
                 "acknowledge_cross_profile_copy must be true when multiple profiles are enabled"
@@ -119,13 +106,8 @@ class Planner:
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
 
-        running = {
-            _normalized(process.user_data_dir)
-            for process in self._running_processes(config)
-            if getattr(process, "user_data_dir", None) is not None
-        }
         app_log = self._app_log or default_app_log()
-        observe_logins(
+        record_logins(
             roots.values(),
             state.logins,
             now_ms,
@@ -137,7 +119,6 @@ class Planner:
             config,
             found.targets,
             {target_key(target) for target in selected},
-            running,
             state.logins,
         )
         if newly:

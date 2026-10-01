@@ -6,7 +6,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from claude_session_sync.chat_state import load_state, save_state, state_path
 from claude_session_sync.chat_sync import plan_chat_sync, run_chat_sync
@@ -78,11 +77,24 @@ class ChatSyncFixture(unittest.TestCase):
         path = folder / "local_{}.json".format(session_id)
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
-    def processes(self, _config):
-        return (SimpleNamespace(pid=4242, user_data_dir=self.data_root),) if self.running else ()
-
     def planner(self):
-        return Planner(running_processes=self.processes, app_log=self.app_log)
+        return Planner(app_log=self.app_log)
+
+    def log_logins(self, *logins):
+        """Write Claude's login lines: (account left, account signed in, seconds ago)."""
+
+        self.app_log.write_text(
+            "".join(
+                "{} [info] [account] Login-state transition (loggedOut: true → false, "
+                "uuid: {} → {}), clearing oauth cache\n".format(
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - ago)),
+                    before,
+                    after,
+                )
+                for before, after, ago in logins
+            ),
+            encoding="utf-8",
+        )
 
     def sync(self, **options):
         engine = TransactionEngine(self.config.state_dir, process_probe=lambda: self.running)
@@ -197,26 +209,39 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual(run.plan.ignored_targets, 1)
         self.assertIsNone(self.read(self.a, X))
 
-    def test_a_new_login_joins_the_plan_once_claude_writes_a_chat_there(self):
+    def test_an_account_that_logged_in_earlier_joins_with_claude_closed(self):
         new_account = "dddddddd-0000-4000-8000-000000000004"
         new_folder = self.folder(new_account, A_ORG)
+        # The new account logged in 10 minutes ago. A is signed in again now.
+        self.log_logins((A_ACCOUNT, new_account, 600), (new_account, A_ACCOUNT, 60))
         self.write(self.a, X)
-        self.running = True
-        self.signed_in = new_account
-        self.write_config()
-        state = load_state(state_path(self.config.state_dir))
-        state.logins[str(self.data_root)] = (new_account, NOW_MS - 10 * 60 * 1000)
-        save_state(state_path(self.config.state_dir), state)
-        fresh = new_folder / "local_{}.json".format(Y)
-        fresh.write_text(json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8")
+        chat = new_folder / "local_{}.json".format(Y)
+        chat.write_text(json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8")
+        saved = time.time() - 300
+        os.utime(chat, (saved, saved))
 
-        run = plan_chat_sync(self.config, self.planner())
+        run = self.sync()
 
-        self.assertEqual(run.newly_enrolled, 1)
-        self.assertIn(
-            new_folder / "local_{}.json".format(X),
-            [operation.destination for operation in run.plan.operations],
+        self.assertFalse(self.running)
+        self.assertEqual(1, run.newly_enrolled)
+        self.assertIsNotNone(self.read(new_folder, X))
+        self.assertIsNotNone(self.read(self.a, Y))
+
+    def test_a_login_stays_recorded_after_claudes_log_rotates(self):
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_folder = self.folder(new_account, A_ORG)
+        self.log_logins((A_ACCOUNT, new_account, 600), (new_account, A_ACCOUNT, 300))
+        self.write(self.a, X)
+        self.assertEqual(0, self.sync().newly_enrolled, "no chat was saved there after the login")
+
+        self.app_log.write_text("", encoding="utf-8")
+        (new_folder / "local_{}.json".format(Y)).write_text(
+            json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8"
         )
+        run = self.sync()
+
+        self.assertEqual(1, run.newly_enrolled)
+        self.assertIsNotNone(self.read(new_folder, X))
 
     def test_no_chat_is_written_if_claude_opens_during_a_run(self):
         from claude_session_sync.transaction import AppRunningError
