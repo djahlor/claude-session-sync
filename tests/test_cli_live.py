@@ -1,4 +1,4 @@
-"""Command-line behavior of live chat sync with the built-in planner."""
+"""Command-line behavior of chat sync on real folders with the real planner and engine."""
 
 import io
 import itertools
@@ -115,7 +115,6 @@ class ChatCliFixture(unittest.TestCase):
                 engine_factory=self.engine(),
                 layout_factory=lambda _config: self.fail("pins and groups must not sync"),
                 routine_factory=lambda _config: self.fail("routines must not sync"),
-                live_sync=True,
             ),
             **dependencies,
         )
