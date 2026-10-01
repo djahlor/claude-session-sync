@@ -1,4 +1,4 @@
-"""End-to-end chat sync over real folders: rules, liveness, journal, and state."""
+"""End-to-end chat sync over real folders: rules, journal, and state."""
 
 import json
 import os
@@ -239,45 +239,12 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertIsNone(self.read(self.b, X))
         self.assertFalse(state_path(self.config.state_dir).exists())
 
-    def test_a_file_that_moves_on_mid_run_waits_for_the_next_run(self):
-        self.write(self.a, X)
-        self.write(self.a, Y)
-        planner = self.planner()
-        plan = planner.plan(SimpleNamespace(config=self.config))
-        # Claude writes Y into B after planning.
-        self.write(self.b, Y, title="claude wrote this")
-        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: False)
-
-        receipt = engine.apply(plan, live_guard=plan.context.is_live_path)
-
-        self.assertEqual(receipt.status, "partial")
-        self.assertEqual(receipt.skipped_count, 1)
-        self.assertIsNotNone(self.read(self.b, X))
-        self.assertEqual(self.read(self.b, Y)["title"], "claude wrote this")
-
-
 if __name__ == "__main__":
     unittest.main()
 
 
 class RecoveryTests(ChatSyncFixture):
     """Paired steps, crashes mid-run, and leftovers of killed runs."""
-
-    def test_a_marker_stays_when_the_record_meant_to_replace_it_waits(self):
-        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000)
-        marker = self.b / "deleted_{}".format(X)
-        marker.write_text(str(NOW_MS - 10_000), encoding="ascii")
-        plan = self.planner().plan(SimpleNamespace(config=self.config))
-        self.assertEqual(["create", "retire"], [op.kind for op in plan.operations])
-        # Claude saves the chat in A between planning and writing.
-        self.write(self.a, X, lastActivityAt=NOW_MS + 5_000 - 10_000, title="saved again")
-        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: False)
-
-        receipt = engine.apply(plan, live_guard=plan.context.is_live_path)
-
-        self.assertEqual(2, receipt.skipped_count)
-        self.assertTrue(marker.exists(), "the marker must not go without the record")
-        self.assertIsNone(self.read(self.b, X))
 
     def test_a_crash_right_after_a_removal_neither_blocks_sync_nor_loses_the_file(self):
         from unittest.mock import patch
@@ -305,7 +272,7 @@ class RecoveryTests(ChatSyncFixture):
         # And the next live run is not blocked by the crash.
         self.write(self.a, Y)
         run = self.sync()
-        self.assertIn(run.receipt.status, ("committed", "partial"))
+        self.assertEqual("committed", run.receipt.status)
         self.assertIsNotNone(self.read(self.b, Y))
 
     def test_an_interrupted_run_is_closed_and_the_next_run_goes_on(self):

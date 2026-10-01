@@ -101,7 +101,7 @@ Action = Union[
 
 @dataclass(frozen=True)
 class Problem:
-    """A session left alone on purpose: live, tied, lost, unreadable or future."""
+    """A session left alone on purpose: tied, lost, unreadable or future."""
 
     kind: str
     session_id: str

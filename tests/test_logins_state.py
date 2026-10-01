@@ -1,4 +1,4 @@
-"""The chat state file, the live-folder check, and login-based folder selection."""
+"""The chat state file, Claude's logins, and login-based folder selection."""
 
 import json
 import os
@@ -19,9 +19,7 @@ from claude_session_sync.chat_state import (
 from claude_session_sync.config import ApprovedTarget, Config
 from claude_session_sync.enrollment import new_login_targets, select_targets
 from claude_session_sync.fingerprint import normalisation
-from claude_session_sync.liveness import (
-    SWITCH_GRACE_MS,
-    is_live,
+from claude_session_sync.logins import (
     last_known_account,
     login_dated_by_app,
     observe_logins,
@@ -48,7 +46,6 @@ class ChatStateTests(unittest.TestCase):
                 sync=SyncState(synced={"k": {"x": "h"}}, seen={"k": {"x"}}),
                 logins={"/root": (ACCOUNT, 5)},
                 enrolled=["Work/a/b"],
-                live_creates={"k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}},
                 last_success_ms=9,
             )
 
@@ -89,7 +86,35 @@ class ChatStateTests(unittest.TestCase):
                     self.assertEqual({"k": {"x"}}, state.sync.seen)
 
 
-class LivenessTests(unittest.TestCase):
+    def test_a_state_saved_while_claude_synced_open_loads_and_drops_live_creates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chat-state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "normalisation": normalisation(),
+                        "synced": {"k": {"x": "h"}},
+                        "seen": {"k": ["x"]},
+                        "enrolled": ["Work/a/b"],
+                        "live_creates": {
+                            "k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = load_state(path)
+            save_state(path, state)
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual({"k": {"x": "h"}}, saved["synced"])
+            self.assertEqual(["Work/a/b"], saved["enrolled"])
+            self.assertNotIn("live_creates", saved)
+
+
+class LoginTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -107,34 +132,6 @@ class LivenessTests(unittest.TestCase):
         self.sign_in(ACCOUNT.upper())
 
         self.assertEqual(ACCOUNT, last_known_account(self.root))
-
-    def test_nothing_is_live_while_claude_is_closed(self):
-        self.sign_in(ACCOUNT)
-
-        self.assertFalse(is_live(self.root, ACCOUNT, False, NOW_MS, {}))
-
-    def test_the_signed_in_accounts_folders_are_live(self):
-        self.sign_in(ACCOUNT)
-        logins = {str(self.root): (ACCOUNT, NOW_MS - 10 * SWITCH_GRACE_MS)}
-
-        self.assertTrue(is_live(self.root, ACCOUNT, True, NOW_MS, logins))
-        self.assertFalse(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_every_folder_is_live_for_two_minutes_after_a_switch(self):
-        self.sign_in(ACCOUNT)
-        logins = {str(self.root): (ACCOUNT, NOW_MS - SWITCH_GRACE_MS + 1)}
-
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_an_undated_login_or_a_config_write_in_flight_counts_as_live(self):
-        self.sign_in(ACCOUNT)
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, {}))
-        logins = {str(self.root): (ACCOUNT, 0)}
-        (self.root / "config.json.journal").write_text("", encoding="utf-8")
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_an_unreadable_login_counts_as_live(self):
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, {}))
 
     def test_claudes_log_dates_a_login_and_ignores_a_later_logout(self):
         log = self.root / "main.log"

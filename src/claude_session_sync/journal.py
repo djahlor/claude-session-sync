@@ -67,7 +67,6 @@ class RunJournal:
         records: Iterable[Mapping[str, Any]],
         *,
         run_id: Optional[str] = None,
-        lenient: bool = False,
     ) -> "RunJournal":
         state = ensure_private_directory(state_root)
         authentication_key = cls._load_or_create_key(state)
@@ -115,8 +114,6 @@ class RunJournal:
                 "records": materialized,
                 "receipt": None,
             }
-            if lenient:
-                manifest["lenient"] = True
             journal = cls(state, identifier, manifest, authentication_key)
             journal._persist(destination=run_root / "manifest.json")
             fsync_directory(run_root)

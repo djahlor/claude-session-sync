@@ -94,8 +94,8 @@ class CliDependencies:
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
-    # Live sync needs the built-in planner, which knows the chat state and
-    # which folders a running Claude holds. None means: use it when it is built in.
+    # Chat sync with state needs the built-in planner, which knows the chat
+    # state. None means: use it when it is built in.
     live_sync: Optional[bool] = None
 
 
@@ -587,7 +587,7 @@ def _keep_sidebar(config: Config, *, apply: bool) -> tuple:
 
     from .enrollment import selected_targets
     from .layout import request_adoption
-    from .liveness import last_known_account
+    from .logins import last_known_account
     from .store import SessionStore
 
     if not config.sync_sidebar_layout:
@@ -618,7 +618,6 @@ def _chat_run_summary(run: Any, duration_ms: int) -> dict:
     counts = {
         "operations": receipt.operation_count,
         "planned": len(plan.operations),
-        "skipped": receipt.skipped_count,
     }
     counts.update(_problem_counts(run))
     payload = {
@@ -629,8 +628,6 @@ def _chat_run_summary(run: Any, duration_ms: int) -> dict:
         "run_id": receipt.run_id,
         "state": receipt.status,
     }
-    if run.restart_suggested:
-        payload["restart_suggested"] = run.restart_suggested
     if any(run.problems.get(kind) for kind in ("tied", "lost", "unreadable", "future")):
         payload["next_action"] = "run-plan-report"
     return payload
@@ -643,15 +640,13 @@ def _chat_plan_summary(run: Any, duration_ms: int) -> dict:
     for kind in ("create", "replace", "retire"):
         counts[kind + "s"] = sum(1 for operation in plan.operations if operation.kind == kind)
     counts.update(_problem_counts(run))
-    if run.restart_suggested:
-        payload["restart_suggested"] = run.restart_suggested
     return payload
 
 
 def _problem_counts(run: Any) -> dict:
     counts = {
         kind: run.problems[kind]
-        for kind in ("live", "tied", "lost", "unreadable", "future")
+        for kind in ("tied", "lost", "unreadable", "future")
         if run.problems.get(kind)
     }
     if run.plan.ignored_targets:
@@ -703,7 +698,6 @@ def _write_plan_report(config: Config, run: Any) -> None:
                 }
                 for problem in plan.problems
             ],
-            "live_folders": sorted(labels.get(key, "?") for key in plan.live_targets),
             "ignored_folders": plan.ignored_targets,
         },
     )
@@ -1028,7 +1022,6 @@ def run(
             progress = current_progress(
                 config,
                 app_running=bool(running),
-                live=_live_sync(deps),
                 failures=watcher_error
                 + layout_failure
                 + routine_failure

@@ -29,8 +29,6 @@ class ChatState:
     logins: Dict[str, Tuple[str, int]] = field(default_factory=dict)
     # partition keys that joined because Claude wrote a chat there after a login
     enrolled: List[str] = field(default_factory=list)
-    # partition key -> chats created in a live folder, invisible until Claude reloads it
-    live_creates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_success_ms: int = 0
 
 
@@ -86,20 +84,12 @@ def _decode(document: Any) -> ChatState:
             raise ValueError("login entry")
         logins[_string(root)] = (_string(values[0]), _integer(values[1]))
     enrolled = [_string(item) for item in _list(document.get("enrolled", []))]
-    live_creates = {}
-    for key, value in _mapping(document.get("live_creates", {})).items():
-        entry = _mapping(value)
-        live_creates[_string(key)] = {
-            "account": _string(entry["account"]),
-            "login_ms": _integer(entry["login_ms"]),
-            "pids": sorted(_integer(pid) for pid in _list(entry["pids"])),
-            "ids": sorted({_string(item) for item in _list(entry["ids"])}),
-        }
+    # Versions that synced with Claude open also kept "live_creates". It is
+    # ignored here and dropped on the next save.
     return ChatState(
         sync=SyncState(synced=synced, seen=seen),
         logins=logins,
         enrolled=sorted(set(enrolled)),
-        live_creates=live_creates,
         last_success_ms=_integer(document.get("last_success_ms", 0)),
     )
 
@@ -119,16 +109,6 @@ def encode_state(state: ChatState) -> Dict[str, Any]:
             for root, (account, changed) in sorted(state.logins.items())
         },
         "enrolled": sorted(set(state.enrolled)),
-        "live_creates": {
-            key: {
-                "account": entry["account"],
-                "login_ms": entry["login_ms"],
-                "pids": sorted(entry["pids"]),
-                "ids": sorted(set(entry["ids"])),
-            }
-            for key, entry in sorted(state.live_creates.items())
-            if entry.get("ids")
-        },
         "last_success_ms": state.last_success_ms,
     }
 

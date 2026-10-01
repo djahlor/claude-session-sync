@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Iterable, List, Sequence, Set, Tuple
 
-from .liveness import Logins, last_known_account
+from .logins import Logins, last_known_account
 
 
 # A chat Claude saved this long after the login began was written by Claude,

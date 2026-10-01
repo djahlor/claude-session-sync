@@ -16,7 +16,6 @@ from typing import Any, Callable, Dict, Optional
 
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
 from .filesystem import sweep_stale_stages
-from .liveness import last_known_account
 from .model import Plan, RunReceipt, SyncRequest
 
 
@@ -29,7 +28,6 @@ class ChatRun:
     plan: Plan
     receipt: Optional[RunReceipt] = None
     problems: Dict[str, int] = field(default_factory=dict)
-    restart_suggested: int = 0
     newly_enrolled: int = 0
 
 
@@ -45,7 +43,7 @@ def plan_chat_sync(
 
     state = _load(config)
     plan = _plan(planner, config, state, prefer, prefer_session, running_processes)
-    return _summary(plan, state)
+    return _summary(plan)
 
 
 def run_chat_sync(
@@ -68,9 +66,8 @@ def run_chat_sync(
         receipt = engine.apply(plan) if not plan.invalid_replicas else None
         return ChatRun(plan, receipt)
     if plan.invalid_replicas:
-        return _summary(plan, state)
+        return _summary(plan)
 
-    _forget_stale_live_creates(state, context)
     for snapshot in context.snapshots:
         state.sync.seen.setdefault(snapshot.key, set()).update(snapshot.records)
     if encode_state(state) != on_disk:
@@ -85,11 +82,11 @@ def run_chat_sync(
     _remember_placements(state, context, receipt)
 
     state.sync = _settle(state.sync, context.rescan())
-    if receipt.status in ("committed", "partial", "noop"):
+    if receipt.status in ("committed", "noop"):
         state.last_success_ms = clock_ms()
     if encode_state(state) != on_disk:
         save_state(path, state)
-    run = _summary(plan, state)
+    run = _summary(plan)
     run.receipt = receipt
     return run
 
@@ -155,50 +152,13 @@ def _settle(sync, snapshots):
     return settle(sync, snapshots)
 
 
-def _summary(plan: Plan, state) -> ChatRun:
+def _summary(plan: Plan) -> ChatRun:
     context = plan.context
     run = ChatRun(plan)
     run.problems = dict(Counter(problem.kind for problem in plan.problems))
     if context is not None:
         run.newly_enrolled = len(context.newly_enrolled)
-        run.restart_suggested = sum(
-            len(entry.get("ids", ()))
-            for key, entry in state.live_creates.items()
-            if key in context.data_roots
-            and context.running_pids.get(str(context.data_roots[key]))
-        )
     return run
-
-
-def _signed_in(state, context, key: str):
-    """(account, login time, pids) for a folder of the signed-in account, else None."""
-
-    root = context.data_roots.get(key)
-    if root is None:
-        return None
-    pids = context.running_pids.get(str(root))
-    login = state.logins.get(str(root))
-    account = last_known_account(Path(root))
-    target = context.targets[key]
-    if not pids or login is None or account is None or login[0] != account:
-        return None
-    if target.account_id.lower() != account:
-        return None
-    return account, login[1], list(pids)
-
-
-def _forget_stale_live_creates(state, context) -> None:
-    """Claude reads a folder again when it restarts or the login changes."""
-
-    for key in list(state.live_creates):
-        entry = state.live_creates[key]
-        current = _signed_in(state, context, key)
-        if current is None or (
-            current[0] != entry["account"]
-            or current[1] != entry["login_ms"]
-            or sorted(current[2]) != sorted(entry["pids"])
-        ):
-            del state.live_creates[key]
 
 
 def _remember_placements(state, context, receipt: RunReceipt) -> None:
@@ -212,16 +172,5 @@ def _remember_placements(state, context, receipt: RunReceipt) -> None:
         if operation.source_state_hash is not None:
             # What sync placed is this folder's version in step with the others.
             state.sync.synced.setdefault(key, {})[operation.session_id] = operation.source_state_hash
-        if operation.kind != "create":
-            continue
-        state.sync.seen.setdefault(key, set()).add(operation.session_id)
-        if key not in context.live:
-            continue
-        current = _signed_in(state, context, key)
-        if current is None:
-            continue  # a folder of another account, read when that account signs in
-        entry = state.live_creates.get(key)
-        if entry is None or (entry["account"], entry["login_ms"]) != current[:2]:
-            entry = {"account": current[0], "login_ms": current[1], "pids": current[2], "ids": []}
-            state.live_creates[key] = entry
-        entry["ids"] = sorted(set(entry["ids"]) | {operation.session_id})
+        if operation.kind == "create":
+            state.sync.seen.setdefault(key, set()).add(operation.session_id)
