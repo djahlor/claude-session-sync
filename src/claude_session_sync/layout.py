@@ -51,6 +51,11 @@ SYNC_METADATA_KEYS = (SYNC_OWNER_KEY, SYNC_ACTIVE_KEY, SYNC_QUARANTINE_KEY, GROU
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 SNAPSHOT_VERSION = 1
 ADOPT_PENDING_FILENAME = "sidebar-adopt-pending.json"
+COPY_NOT_UPLOADED = (
+    "an account's groups changed before Claude uploaded the copy synced into it, "
+    "so they may be its old server groups; list the accounts with keep-sidebar "
+    "--dry-run, then keep one with keep-sidebar --account N --apply"
+)
 NEEDS_MAIN_ACCOUNT = (
     "it is unclear which account's pins and groups to keep; list the accounts "
     "with keep-sidebar --dry-run, then keep one with keep-sidebar --account N --apply"
@@ -59,6 +64,9 @@ NEEDS_MAIN_ACCOUNT = (
 
 class LayoutError(RuntimeError):
     """Raised when sidebar data cannot be changed without guessing."""
+
+    # What status and doctor report; None reports unsafe-layout.
+    reason: Optional[str] = None
 
 
 class LayoutBusyError(LayoutError):
@@ -72,6 +80,14 @@ class LayoutRecoveryError(LayoutError):
 class LayoutChoiceError(LayoutError):
     """Raised when only the user can say which account's sidebar to keep."""
 
+    reason = "choose-main-account"
+
+
+class LayoutDisagreementError(LayoutError):
+    """Raised when Claude's two saved copies of the same sidebar data differ."""
+
+    reason = "sidebar-records-disagree"
+
 
 @dataclass(frozen=True)
 class LayoutSnapshot:
@@ -81,9 +97,16 @@ class LayoutSnapshot:
     """
 
     adopted_scope: str
+    # The layout last copied into adopted_scope, kept while Claude has not
+    # consumed the marker that uploads it as that account's own. Until then
+    # that account is the source only while it still holds this layout.
+    unconfirmed_copy: Optional[Mapping[str, Any]] = None
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"version": SNAPSHOT_VERSION, "adopted_scope": self.adopted_scope}
+        document = {"version": SNAPSHOT_VERSION, "adopted_scope": self.adopted_scope}
+        if self.unconfirmed_copy is not None:
+            document["unconfirmed_copy"] = copy.deepcopy(dict(self.unconfirmed_copy))
+        return document
 
 
 @dataclass(frozen=True)
@@ -117,10 +140,15 @@ class SidebarAccount:
     # ACCOUNT/WORKSPACE. Never printed whole: it is the only name on disk.
     scope: str
     is_signed_in: bool
-    groups: int
+    # In sidebar order. The user's own data, shown in their own terminal.
+    group_names: Tuple[str, ...]
     # Pinned chats among this account's chats; pins are one shared list.
     pins: int
     chats: int
+
+    @property
+    def groups(self) -> int:
+        return len(self.group_names)
 
 
 def _string_list(value: Any, label: str) -> List[str]:
@@ -291,7 +319,37 @@ def _load_snapshot_document(document: Any) -> Optional[LayoutSnapshot]:
         return None
     if not isinstance(adopted_scope, str) or "/" not in adopted_scope:
         raise LayoutError("snapshot adopted scope has an unknown shape")
-    return LayoutSnapshot(adopted_scope)
+    unconfirmed = document.get("unconfirmed_copy")
+    if unconfirmed is not None and (
+        not isinstance(unconfirmed, dict)
+        or set(unconfirmed) != {"groups", "assignments", "order"}
+    ):
+        raise LayoutError("snapshot unconfirmed copy has an unknown shape")
+    return LayoutSnapshot(adopted_scope, unconfirmed)
+
+
+def _layout(scope: Mapping[str, Any]) -> Dict[str, Any]:
+    """A scope's groups, chat assignments, and group order by name, for comparison."""
+
+    names = dict(_ordered_group_pairs(scope))
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    return {
+        "groups": list(names.values()),
+        "assignments": {session: names[group] for session, group in sorted(assignments.items())},
+        "order": {name: list(sessions) for name, sessions in _scope_order_by_name(scope).items()},
+    }
+
+
+def _upload_scope(marker: Optional[bytes]) -> Optional[str]:
+    """The scope whose sidebar upload Claude has not consumed yet, if any."""
+
+    if marker is None or not marker.startswith(b"\x01"):
+        return None
+    try:
+        value = marker[1:].decode("utf-8")
+    except UnicodeError:
+        return None
+    return value[: -len("|migrate")] if value.endswith("|migrate") else value
 
 
 def _snapshot_bytes(path: Path) -> Optional[bytes]:
@@ -370,8 +428,13 @@ def _adopt_current_sidebar_records(
     timestamp_ms: Optional[int],
     source_scope: Optional[str],
     active_scope: Optional[str],
+    unconfirmed_copy: Optional[Mapping[str, Any]] = None,
 ) -> LayoutTransform:
-    """Copy one account's groups into every sync target; pins stay one shared list."""
+    """Copy one account's groups into every sync target; pins stay one shared list.
+
+    A copy into the signed-in account stays unconfirmed until Claude uploads
+    it; otherwise unconfirmed_copy is carried over as given.
+    """
 
     store_state = store_record["state"]
     store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
@@ -392,6 +455,7 @@ def _adopt_current_sidebar_records(
         )
 
     source = store_scopes[selected_scope]
+    _check_copies_agree(selected_scope, store_scopes, persisted_scopes, store_state, local_record)
     current_pins = _string_list(store_state.get("pinnedOrder", []), "stored pins")
     current_project_pins = _string_list(
         store_state.get("homeProjectsPinnedOrder", []), "stored project pins"
@@ -439,7 +503,10 @@ def _adopt_current_sidebar_records(
         },
         # The account in use now holds the copy, so it is the source of
         # truth from here: its later edits win until the next switch.
-        snapshot=LayoutSnapshot(active_scope),
+        snapshot=LayoutSnapshot(
+            active_scope,
+            _layout(source) if selected_scope != active_scope else unconfirmed_copy,
+        ),
         group_count=len(_ordered_group_pairs(source)),
         assignment_count=len(source.get("assignments", {})),
         pin_count=len(current_pins),
@@ -447,6 +514,37 @@ def _adopt_current_sidebar_records(
             active_scope if selected_scope != active_scope else None
         ),
     )
+
+
+def _check_copies_agree(
+    source_scope: str,
+    store_scopes: Mapping[str, Mapping[str, Any]],
+    persisted_scopes: Mapping[str, Mapping[str, Any]],
+    store_state: Mapping[str, Any],
+    local_record: Mapping[str, Any],
+) -> None:
+    """Stop before a copy when Claude's two saves of the source data differ.
+
+    Claude keeps each account's groups, and the pins, in two records. An
+    interrupted save can leave a change in only one, and the copy would drop it.
+    """
+
+    if source_scope in persisted_scopes and _layout(persisted_scopes[source_scope]) != _layout(
+        store_scopes[source_scope]
+    ):
+        raise LayoutDisagreementError(
+            "Claude's two saved copies of the source account's groups differ, so "
+            "sync wrote nothing; open Claude, check its sidebar, and quit it"
+        )
+    for key in ("pinnedOrder", "homeProjectsPinnedOrder"):
+        local = local_record["value"].get(key)
+        if local is not None and _string_list(local, "local pins") != _string_list(
+            store_state.get(key, []), "stored pins"
+        ):
+            raise LayoutDisagreementError(
+                "Claude's two saved copies of the pins differ, so sync wrote "
+                "nothing; open Claude, check its pins, and quit it"
+            )
 
 
 def transform_layout_records(
@@ -459,13 +557,14 @@ def transform_layout_records(
     adopt_source_scope: Optional[str] = None,
     after_account_switch: bool = False,
     owner_account: Optional[str] = None,
+    upload_pending_scope: Optional[str] = None,
 ) -> LayoutTransform:
     """Return exact allowlisted record replacements for one Claude data root.
 
     One account's sidebar is the source of truth at a time, and its groups
     are copied to the other accounts. The first sync adopts the account chosen
-    at install, else the signed-in account, else the only account with
-    groups. After that the signed-in account wins. Right after an account
+    at install or with keep-sidebar. Without a choice it adopts only when that
+    overwrites no different groups. After that the signed-in account wins. Right after an account
     switch, the account just left still holds the newest organization,
     because Claude reloads the new account's groups from its servers at
     sign-in, so that one is copied instead.
@@ -486,12 +585,20 @@ def transform_layout_records(
         raise LayoutError("current sidebar modes cannot be combined")
     store_state = store_record["state"]
     active = _signed_in_scope(store_state, target_sessions, owner_account)
+    unconfirmed = confirmed = None
+    if snapshot is not None and snapshot.unconfirmed_copy is not None:
+        if upload_pending_scope == snapshot.adopted_scope:
+            unconfirmed = snapshot.unconfirmed_copy
+        else:
+            # Claude uploaded the copy; the snapshot file forgets it either way.
+            snapshot = confirmed = LayoutSnapshot(snapshot.adopted_scope)
     if adopt_current_sidebar:
         source = active
     elif adopt_source_scope is not None:
         source = adopt_source_scope
     elif active is None:
-        return _unchanged(records)  # the signed-in account does not sync yet
+        # The signed-in account does not sync yet.
+        return _unchanged(records, snapshot=confirmed)
     else:
         store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
         persisted_scopes = _validated_scopes(group_record["value"])
@@ -509,7 +616,14 @@ def transform_layout_records(
             return _unchanged(
                 records,
                 reason="no-groups-yet" if snapshot is None else "main-account-has-no-groups",
+                snapshot=confirmed,
             )
+        if (
+            unconfirmed is not None
+            and source == snapshot.adopted_scope
+            and _layout(store_scopes[source]) != unconfirmed
+        ):
+            raise LayoutChoiceError(COPY_NOT_UPLOADED)
     return _adopt_current_sidebar_records(
         group_record,
         local_record,
@@ -518,6 +632,9 @@ def transform_layout_records(
         timestamp_ms=timestamp_ms,
         source_scope=source,
         active_scope=active,
+        unconfirmed_copy=(
+            unconfirmed if snapshot is not None and active == snapshot.adopted_scope else None
+        ),
     )
 
 
@@ -558,7 +675,12 @@ def sidebar_accounts(
         SidebarAccount(
             scope=scope_key,
             is_signed_in=scope_key == active,
-            groups=len(_ordered_group_pairs(store_scopes.get(scope_key, {"groups": []}))),
+            group_names=tuple(
+                name
+                for _group_id, name in _ordered_group_pairs(
+                    store_scopes.get(scope_key, {"groups": []})
+                )
+            ),
             pins=len(pins & sessions),
             chats=len(sessions),
         )
@@ -610,13 +732,23 @@ def _source_scope(
         else:
             raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
         return source if source in grouped else None
-    if active in grouped:
-        return active
     if not grouped:
         return None
-    if len(grouped) == 1 and active_is_empty:
-        return grouped[0]
-    raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
+    if groups_differ(
+        [name for _group_id, name in _ordered_group_pairs(store_scopes[key])] for key in grouped
+    ):
+        raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
+    return active if active in grouped else grouped[0]
+
+
+def groups_differ(group_names: Iterable[Iterable[str]]) -> bool:
+    """Whether accounts with groups hold different ones, so only the user can pick.
+
+    With no adopted account, sync copies on its own only when one account has
+    groups or all hold the same ones, as installs from the union model do.
+    """
+
+    return len({frozenset(names) for names in group_names if names}) > 1
 
 
 def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
@@ -627,6 +759,29 @@ def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
         and not scope.get("assignments", {})
         and not any(scope.get("order", {}).values())
     )
+
+
+# Why a main-account choice cannot apply, with the words to tell the user.
+MAIN_ACCOUNT_BLOCKERS = {
+    "sidebar-sync-off": "pins and groups do not sync, so there is no main account",
+    "needs-one-default-profile": (
+        "a main account works only with exactly one Claude profile enabled, the default one"
+    ),
+}
+
+
+def main_account_blocker(config: Config) -> Optional[str]:
+    """Why sync would refuse a main-account choice for this config, or None.
+
+    The install question, keep-sidebar, and sync all ask this, so a choice is
+    offered and recorded only where sync applies it.
+    """
+
+    if not config.sync_sidebar_layout:
+        return "sidebar-sync-off"
+    if len(config.profiles) != 1 or not config.profiles[0].is_default:
+        return "needs-one-default-profile"
+    return None
 
 
 def request_adoption(state_dir: Path, source_scope: str) -> None:
@@ -676,11 +831,14 @@ def _owner_account(value: Optional[bytes]) -> Optional[str]:
 
 
 def _unchanged(
-    records: Mapping[bytes, bytes], reason: Optional[str] = None
+    records: Mapping[bytes, bytes],
+    reason: Optional[str] = None,
+    snapshot: Optional[LayoutSnapshot] = None,
 ) -> LayoutTransform:
+    """Write no record. A snapshot, when given, still replaces the file."""
     return LayoutTransform(
         records={key: records[key] for key in LAYOUT_KEYS},
-        snapshot=None,
+        snapshot=snapshot,
         group_count=0,
         assignment_count=0,
         pin_count=0,
@@ -873,10 +1031,10 @@ class LayoutSynchronizer:
     def accounts(self, target_sessions: Mapping[str, Set[str]]) -> List[SidebarAccount]:
         """The default profile's accounts as rows. Works while Claude is open."""
 
-        defaults = [profile for profile in self.config.profiles if profile.is_default]
-        if len(defaults) != 1:
-            raise LayoutError("choose the single default data profile before listing accounts")
-        with self._database_copy(defaults[0].data_root) as database:
+        blocker = main_account_blocker(self.config)
+        if blocker is not None:
+            raise LayoutError(MAIN_ACCOUNT_BLOCKERS[blocker])
+        with self._database_copy(self.config.profiles[0].data_root) as database:
             records = {key: database.get(key) for key in LAYOUT_KEYS}
             owner = _owner_account(database.get_optional(SYNC_OWNER_KEY))
         return sidebar_accounts(records, target_sessions, owner)
@@ -895,12 +1053,9 @@ class LayoutSynchronizer:
         if not adopt_current_sidebar and adopt_source_scope is None:
             adopt_source_scope = read_pending_adoption(self.config.state_dir)
             pending = adopt_source_scope is not None
-        if (adopt_current_sidebar or adopt_source_scope is not None) and (
-            len(self.config.profiles) != 1 or not self.config.profiles[0].is_default
-        ):
-            raise LayoutError(
-                "choose the single default data profile before adopting its current sidebar"
-            )
+        blocker = main_account_blocker(self.config)
+        if (adopt_current_sidebar or adopt_source_scope is not None) and blocker is not None:
+            raise LayoutError(MAIN_ACCOUNT_BLOCKERS[blocker])
         return adopt_source_scope, pending
 
     def _plan_profile(
@@ -931,6 +1086,7 @@ class LayoutSynchronizer:
             adopt_source_scope=adopt_source_scope,
             after_account_switch=after_account_switch,
             owner_account=_owner_account(database.get_optional(SYNC_OWNER_KEY)),
+            upload_pending_scope=_upload_scope(database.get_optional(GROUP_UPLOAD_KEY)),
         )
         planned = dict(transformed.records)
         marker = self._group_upload_marker(
@@ -1072,7 +1228,7 @@ class LayoutSynchronizer:
                 totals[1],
                 totals[2],
                 totals[3],
-                reasons[0] if reasons and not changed_profiles else None,
+                ",".join(dict.fromkeys(reasons)) or None,
             )
         finally:
             lock.release()

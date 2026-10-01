@@ -330,8 +330,8 @@ class LiveCliTests(ChatCliFixture):
             code, out, errors = self.cli("keep-sidebar", "--dry-run")
             self.assertEqual(0, code, errors)
             self.assertEqual(
-                "  1  signed in     2 groups     1 pin        2 chats\n"
-                "  2                1 group      1 pin        1 chat\n"
+                "  1  signed in     2 groups     1 pin        2 chats   Focus, Admin\n"
+                "  2                1 group      1 pin        1 chat    Old\n"
                 "state=planned account=1 next_action=restart-claude\n",
                 out,
             )
@@ -365,12 +365,31 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(0, code, errors)
         self.assertEqual(
-            "  1  signed in     1 group      0 pins       1 chat\n"
-            "  2                2 groups     0 pins       1 chat\n"
+            "  1  signed in     1 group      0 pins       1 chat    Focus\n"
+            "  2                2 groups     0 pins       1 chat    Old, Ideas\n"
             "state=planned account=1 next_action=restart-claude\n",
             out,
         )
         self.assertFalse(state_path(self.config.state_dir).exists(), "listing writes no chat state")
+
+    def test_keep_sidebar_shows_three_group_names_then_how_many_more(self):
+        from dataclasses import replace
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+        long_name = "A very long group name that keeps going"
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Line\nbreak", long_name, "Four", "Five"], (B_ACCOUNT, B_ORG): []},
+            signed_in=A_ACCOUNT,
+        ):
+            code, out, _errors = self.cli("keep-sidebar", "--dry-run")
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "  1  signed in     5 groups     0 pins       0 chats   "
+            "Focus, Line break, A very long group name that k\u2026 and 2 more",
+            out.splitlines()[0],
+        )
+        self.assertEqual("  2                0 groups     0 pins       0 chats", out.splitlines()[1])
 
     def test_keep_sidebar_keeps_another_account_by_its_row_number(self):
         from dataclasses import replace
@@ -399,8 +418,8 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(1, code)
         self.assertEqual(
-            "  1             aaaaaaaa/aaaaaaaa     1 group      0 pins       0 chats\n"
-            "  2             bbbbbbbb/bbbbbbbb     1 group      0 pins       0 chats\n"
+            "  1             aaaaaaaa/aaaaaaaa     1 group      0 pins       0 chats   Focus\n"
+            "  2             bbbbbbbb/bbbbbbbb     1 group      0 pins       0 chats   Focus\n"
             "state=blocked reason=signed-in-account-not-synced\n",
             out,
         )
@@ -413,7 +432,7 @@ class LiveCliTests(ChatCliFixture):
         self.assertIn("sidebar-sync-off", out)
 
 
-    def install(self, answers, *, tty=True, output_tty=True):
+    def install(self, answers, *, tty=True, output_tty=True, second_profile=False):
         from claude_session_sync.installer import InstallReport
 
         test = self
@@ -428,11 +447,16 @@ class LiveCliTests(ChatCliFixture):
             ],
             "state_dir": str(self.config.state_dir),
             "retention": 5,
-            "acknowledge_cross_profile_copy": False,
+            "acknowledge_cross_profile_copy": second_profile,
             "acknowledge_cross_account_copy": True,
             "target_policy": "logins",
             "claude_executable": str(self.config.claude_executable),
         }
+        if second_profile:
+            document["profiles"].append(
+                {"name": "Personal", "data_root": str(self.root / "Personal"), "launch_command": ["open"],
+                 "is_default": False}
+            )
         config_path = self.root / "config.json"
         config_path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -480,8 +504,8 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual(
             "\nWhich account is the main one?\n"
             "The other accounts will copy its pins and groups.\n\n"
-            "  1  signed in     2 groups     0 pins       1 chat\n"
-            "  2                1 group      0 pins       1 chat\n\n"
+            "  1  signed in     2 groups     0 pins       1 chat    Focus, Admin\n"
+            "  2                1 group      0 pins       1 chat    Old\n\n"
             "Press Enter for 1, or type a number: "
             "Account 2 is the main one. The others copy its pins and groups "
             "the next time Claude closes.\n\n",
@@ -533,6 +557,42 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual((0, None), (code, self.pending()))
         self.assertNotIn("Which account", out)
+
+    def test_no_question_when_the_accounts_hold_the_same_groups(self):
+        self.write(self.a, X)
+        self.write(self.b, Y)
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Admin", "Focus"]}, signed_in=A_ACCOUNT
+        ):
+            code, out = self.install("2\n")
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
+    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled_until_setup_drops_one(self):
+        from dataclasses import replace
+
+        self.config = replace(
+            self.config,
+            profiles=self.config.profiles + (Profile("Personal", self.root / "Personal", ("open",), False),),
+            acknowledge_cross_profile_copy=True,
+            sync_sidebar_layout=True,
+        )
+        reason = "a main account works only with exactly one Claude profile enabled, the default one"
+        with self.two_grouped_accounts():
+            code, out, _errors = self.cli("keep-sidebar", "--account", "2", "--apply")
+            self.assertEqual(
+                (1, reason + "\nstate=blocked reason=needs-one-default-profile\n"), (code, out)
+            )
+            self.assertIsNone(self.pending())
+
+            # Setup drops the retired second profile before it asks, so the
+            # install question applies and records the choice.
+            code, out = self.install("2\n", second_profile=True)
+
+        self.assertEqual(0, code)
+        self.assertIsNotNone(self.pending())
+        self.assertIn("Which account is the main one?", out)
 
     def test_no_question_once_an_account_was_adopted(self):
         state_dir = self.config.state_dir

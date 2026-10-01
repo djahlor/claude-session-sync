@@ -537,15 +537,17 @@ def _chat_failure(error: Exception) -> dict:
 def _sidebar_rows(
     config: Config, deps: CliDependencies, helper: Optional[Path] = None
 ) -> list:
-    """The accounts the next sync can copy pins and groups from, signed-in first."""
+    """The accounts the next sync can copy pins and groups from, signed-in first.
+
+    Callers check main_account_blocker first, so the one profile is the default.
+    """
 
     from .layout import LayoutSynchronizer, scope_sessions
 
-    default = next(profile for profile in config.profiles if profile.is_default)
     targets = [
         target
         for target in deps.planner_factory(config).sync_targets(config)
-        if target.profile_name == default.name
+        if target.profile_name == config.profiles[0].name
     ]
     return LayoutSynchronizer(config, helper=helper).accounts(scope_sessions(targets))
 
@@ -554,7 +556,7 @@ def _account_lines(rows: Sequence[Any]) -> list:
     """One line per account. Accounts have no names on disk, so rows that would
     look the same also show a short ID."""
 
-    looks = [(row.is_signed_in, row.groups, row.pins, row.chats) for row in rows]
+    looks = [(row.is_signed_in, row.group_names, row.pins, row.chats) for row in rows]
     show_id = len(set(looks)) < len(looks)
     lines = []
     for number, row in enumerate(rows, 1):
@@ -564,8 +566,22 @@ def _account_lines(rows: Sequence[Any]) -> list:
             columns.append("{}/{}".format(account[:8], workspace[:8]))
         for count, word in ((row.groups, "group"), (row.pins, "pin"), (row.chats, "chat")):
             columns.append("{:>4} {}".format(count, word if count == 1 else word + "s").ljust(11))
+        columns.append(_group_summary(row.group_names))
         lines.append("  ".join(columns).rstrip())
     return lines
+
+
+def _group_summary(names: Sequence[str]) -> str:
+    """Up to three group names, then how many more."""
+
+    shown = []
+    for name in names[:3]:
+        printable = "".join(character if character.isprintable() else " " for character in name)
+        shown.append(printable if len(printable) <= 30 else printable[:29] + "\u2026")
+    summary = ", ".join(shown)
+    if len(names) > 3:
+        summary += " and {} more".format(len(names) - 3)
+    return summary
 
 
 def _keep_sidebar(
@@ -576,12 +592,11 @@ def _keep_sidebar(
     Returns the payload, the exit code, and the account lines to show.
     """
 
-    from .layout import request_adoption
+    from .layout import MAIN_ACCOUNT_BLOCKERS, main_account_blocker, request_adoption
 
-    if not config.sync_sidebar_layout:
-        return {"state": "blocked", "reason": "sidebar-sync-off"}, 1, []
-    if sum(profile.is_default for profile in config.profiles) != 1:
-        return {"state": "blocked", "reason": "needs-one-default-profile"}, 1, []
+    blocker = main_account_blocker(config)
+    if blocker is not None:
+        return {"state": "blocked", "reason": blocker}, 1, [MAIN_ACCOUNT_BLOCKERS[blocker]]
     rows = _sidebar_rows(config, deps)
     lines = _account_lines(rows)
     if number is None:
@@ -612,16 +627,24 @@ def _ask_main_account(
     """At install, ask which account's pins and groups the others copy.
 
     Asks only when both input and output are a terminal, before any account
-    was adopted, and when two or more accounts have groups. Enter keeps the
+    was adopted, and when accounts hold different groups. Enter keeps the
     signed-in account. The install never fails here: a problem skips the
-    question, and the first sync then follows its own rules.
+    question, and the first sync then waits for a choice instead of guessing.
     """
 
-    from .layout import load_snapshot, request_adoption
+    from .layout import (
+        MAIN_ACCOUNT_BLOCKERS,
+        groups_differ,
+        load_snapshot,
+        main_account_blocker,
+        request_adoption,
+    )
 
     if not (stdin.isatty() and output.isatty()) or not config.sync_sidebar_layout:
         return
-    if sum(profile.is_default for profile in config.profiles) != 1:
+    blocker = main_account_blocker(config)
+    if blocker is not None:
+        output.write("\nSkipped the main-account question: {}.\n".format(MAIN_ACCOUNT_BLOCKERS[blocker]))
         return
     try:
         snapshots = [
@@ -631,7 +654,7 @@ def _ask_main_account(
         if any(load_snapshot(path) is not None for path in snapshots):
             return
         rows = _sidebar_rows(config, deps, helper)
-        if sum(1 for row in rows if row.groups) < 2:
+        if not groups_differ(row.group_names for row in rows):
             return
         _discard_typeahead(stdin)
         output.write("\nWhich account is the main one?\n")
@@ -640,7 +663,10 @@ def _ask_main_account(
         output.write("\n")
         number = _choose_row(rows, stdin, output)
         if number is None:
-            output.write("\nNo account chosen. The first sync decides.\n")
+            output.write(
+                "\nNo account chosen. Pins and groups wait until you choose one with "
+                "keep-sidebar --account N --apply.\n"
+            )
             return
         request_adoption(config.state_dir, rows[number - 1].scope)
     except Exception as error:
@@ -976,22 +1002,14 @@ def run(
             _write(payload, as_json=False, stream=output)
             return 0
         config = deps.config_loader(arguments.config)
-        if getattr(arguments, "adopt_current_sidebar", False) and (
-            not config.sync_sidebar_layout
-            or len(config.profiles) != 1
-            or not config.profiles[0].is_default
+        if getattr(arguments, "adopt_current_sidebar", False) or (
+            getattr(arguments, "adopt_source_scope", None) is not None
         ):
-            raise ValueError(
-                "--adopt-current-sidebar requires sidebar sync and exactly one default profile"
-            )
-        if getattr(arguments, "adopt_source_scope", None) is not None and (
-            not config.sync_sidebar_layout
-            or len(config.profiles) != 1
-            or not config.profiles[0].is_default
-        ):
-            raise ValueError(
-                "--adopt-source-scope requires sidebar sync and exactly one default profile"
-            )
+            from .layout import MAIN_ACCOUNT_BLOCKERS, main_account_blocker
+
+            blocker = main_account_blocker(config)
+            if blocker is not None:
+                raise ValueError(MAIN_ACCOUNT_BLOCKERS[blocker])
         if arguments.command == "restart-check":
             profile = _find_profile(config, arguments.profile)
             if not profile.is_default or config.target_policy not in (

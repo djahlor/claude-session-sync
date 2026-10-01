@@ -97,7 +97,7 @@ syncs chats, Code routines, pins, and groups when the account changes or Claude
 quits. It uses the macOS system Python and does not install Python packages
 globally.
 
-If two or more accounts already have custom groups, the installer then asks
+If your accounts already have different custom groups, the installer then asks
 which account is the main one. The other accounts copy its pins and groups the
 next time Claude closes. `setup --ask-main-account` asks only in a terminal and
 only before any account was adopted. It asks before the watcher starts, so no
@@ -361,11 +361,15 @@ Claude closed, and the new account must then upload the copy.
 
 - **One source of truth.** One account's groups are the source, and the other
   accounts copy them. A private snapshot records which account that was.
-- **The first sync.** It copies the account chosen at install. With no choice,
-  it copies the signed-in account if it has groups, or else the only account
-  that has groups. If no account has groups yet, nothing changes and the
-  layout result says `reason=no-groups-yet`.
-- **The main account at install.** When two or more accounts have groups, the
+- **The first sync.** It copies the account chosen at install or with
+  `keep-sidebar`. Without a choice, it copies an account only when that
+  overwrites no different groups. That is when one account has groups, or when
+  every account with groups has the same ones, as installs from older versions
+  do.
+  Otherwise it stops with `reason=choose-main-account` until you choose. If no
+  account has groups yet, nothing changes and the layout result says
+  `reason=no-groups-yet`.
+- **The main account at install.** When accounts have different groups, the
   installer lists them and asks which one is the main one. Press Enter to keep
   the account you are signed into.
 - **After that.** The signed-in account wins when Claude closes normally.
@@ -380,8 +384,8 @@ Claude closed, and the new account must then upload the copy.
   The next group it gets is copied as usual.
 - **A choice when unclear.** If you signed in to another account without the
   switch restart, and that account has groups, sync stops with
-  `reason=choose-main-account`. The same happens on a first sync when the
-  signed-in account is empty and two other accounts have groups.
+  `reason=choose-main-account`. The same happens on a first sync when accounts
+  hold different groups and none was chosen.
 - **Accounts not yet synced** are left alone.
 
 To see the accounts and choose the main one yourself, run:
@@ -393,7 +397,8 @@ claude-session-sync restart-claude
 ```
 
 `--dry-run` prints one numbered row per account the next sync uses, with
-whether it is signed in and its group, pin, and chat counts. Accounts have no
+whether it is signed in, its group, pin, and chat counts, and up to three of its
+group names. Accounts have no
 names on disk, so a row shows an 8-character ID prefix only when two rows would
 otherwise look the same. It reads a private copy of Claude's database, so it
 works while Claude is open. `--apply` makes that row the source the next time

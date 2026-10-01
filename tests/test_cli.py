@@ -740,21 +740,24 @@ class CliLayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             loaded = config(root)
+            one_profile = "exactly one Claude profile enabled, the default one"
             unsafe_configs = (
-                replace(loaded, sync_sidebar_layout=True),
-                replace(
-                    loaded,
-                    profiles=(replace(loaded.profiles[1], is_default=False),),
-                    sync_sidebar_layout=True,
+                (replace(loaded, sync_sidebar_layout=True), one_profile),
+                (
+                    replace(
+                        loaded,
+                        profiles=(replace(loaded.profiles[1], is_default=False),),
+                        sync_sidebar_layout=True,
+                    ),
+                    one_profile,
                 ),
-                replace(
-                    loaded,
-                    profiles=loaded.profiles[:1],
-                    sync_sidebar_layout=False,
+                (
+                    replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False),
+                    "pins and groups do not sync",
                 ),
             )
-            for unsafe in unsafe_configs:
-                with self.subTest(config=unsafe):
+            for unsafe, reason in unsafe_configs:
+                with self.subTest(reason=reason, profiles=len(unsafe.profiles)):
                     planner_calls = []
                     deps = CliDependencies(
                         config_loader=lambda path, value=unsafe: value,
@@ -771,7 +774,7 @@ class CliLayoutTests(unittest.TestCase):
                         ),
                     )
                     self.assertEqual([], planner_calls)
-                    self.assertIn("exactly one default profile", errors.getvalue())
+                    self.assertIn(reason, errors.getvalue())
 
 class CliInstallTests(unittest.TestCase):
     def test_install_modes_do_not_require_an_existing_config(self):

@@ -104,8 +104,9 @@ Claude stores chats and sidebar layout in separate stores. After chat sync
 commits, the optional layout adapter derives account and workspace scopes from
 the validated session registry. One scope is the source, and a private snapshot
 records which one. With none recorded, the first sync adopts the scope chosen
-at install, else the signed-in scope if it has groups, else the only scope with
-groups. After that the signed-in scope is the source, except right after an
+at install or with `keep-sidebar`. Without a choice it adopts a scope only when
+one scope has groups or every scope with groups holds the same ones, and
+otherwise stops and asks. After that the signed-in scope is the source, except right after an
 account switch, when the scope just left is. The adapter copies the source's
 groups, assignments, and group order into every other scope. Pins are one
 shared list and stay as they are. When only the user can say which scope to

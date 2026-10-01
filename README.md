@@ -33,10 +33,12 @@ are missing. Then it downloads the latest version, builds its helpers, and adds 
 background helper and a small **Sync** menu-bar item. It does not replace the
 Claude app.
 
-If two or more accounts have custom groups, it lists them and asks which one is
-the main one. Type its number, or press Enter to keep the account you are signed
-into. The other accounts copy the main account's pins and groups the next time
-Claude closes.
+If your accounts have different custom groups, it lists them, with up to three
+group names each, and asks which one is the main one. Type its number, or press
+Enter to keep the account you are signed into. The other accounts copy the main
+account's pins and groups the next time Claude closes. Sync never overwrites
+different groups on its own. Until you choose a main account, it leaves them
+alone.
 
 A new account joins the sync after you chat in it and then switch accounts or
 quit Claude.
@@ -74,8 +76,9 @@ The **Sync** menu keeps the latest status.
 
 Pins and groups follow the account you use. When you switch, the account you
 just left is the source. Otherwise the account you are signed into wins. A
-group you delete stays deleted in every account. To pick another main account
-later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
+group you delete stays deleted in every account. The one exception: if you
+delete the main account's last group, the other accounts keep theirs, and the
+status says so. To pick another main account later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
 Routines sync at the same moments as chats.
 
 ## Update
