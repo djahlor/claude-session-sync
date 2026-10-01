@@ -21,7 +21,6 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Sequence,
     Set,
     Tuple,
 )
@@ -32,7 +31,6 @@ from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_direc
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .processes import managed_processes
 from .record_journal import (
-    Record,
     RecordJournal,
     RecordJournalError,
     RecordRecoveryError,
@@ -1136,23 +1134,6 @@ class LayoutSynchronizer:
         self._check_database_path(path)
         return path, key
 
-    def _legacy_records(self, document: Mapping[str, Any]) -> Sequence[Record]:
-        raw = document["records"]
-        if not isinstance(raw, list):
-            raise ValueError("invalid sidebar records")
-        return [
-            Record(
-                self._record_target(
-                    Path(document["database"]), bytes.fromhex(item["key"])
-                ),
-                bytes.fromhex(item["before"]),
-                None,
-                item["after_sha256"],
-                legacy=True,
-            )
-            for item in raw
-        ]
-
     def _journal(self) -> RecordJournal:
         def recovery_equivalent(target: str, expected: Optional[bytes], current: Optional[bytes]) -> bool:
             _path, key = self._parse_target(target)
@@ -1196,7 +1177,6 @@ class LayoutSynchronizer:
             validate=self._parse_target,
             before_mutation=self._assert_stopped,
             retention=self.config.retention,
-            legacy_loader=self._legacy_records,
             recovery_equivalent=recovery_equivalent,
         )
 
