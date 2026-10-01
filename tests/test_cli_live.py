@@ -553,6 +553,17 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual((0, None), (code, self.pending()))
         self.assertNotIn("Which account", out)
 
+    def test_no_question_when_the_accounts_hold_the_same_groups(self):
+        self.write(self.a, X)
+        self.write(self.b, Y)
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Admin", "Focus"]}, signed_in=A_ACCOUNT
+        ):
+            code, out = self.install("2\n")
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
     def test_no_question_once_an_account_was_adopted(self):
         state_dir = self.config.state_dir
         state_dir.mkdir(parents=True)

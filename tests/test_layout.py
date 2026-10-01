@@ -1150,15 +1150,26 @@ class FirstAdoptionTests(unittest.TestCase):
             records(scopes, active=active), self.targets, timestamp_ms=10
         )
 
-    def test_the_signed_in_account_with_groups_is_copied_to_the_others(self):
+    def test_accounts_holding_the_same_groups_adopt_the_signed_in_one(self):
         result = self.first_sync(
-            {"a/w": scope("Focus", assignments={"code:x": "id-focus"}), "b/w": scope("Other")},
+            {
+                "a/w": scope("Focus", "Admin", assignments={"code:x": "id-admin"}),
+                "b/w": scope("Admin", "Focus", assignments={"code:x": "id-focus"}),
+            },
             active="a/w",
         )
 
-        self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(result.records, self.targets))
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        self.assertEqual({"code:x": "id-admin"}, scopes["b/w"]["assignments"])
+        self.assertEqual({"a/w": ["Focus", "Admin"], "b/w": ["Focus", "Admin"]}, group_names(result.records, self.targets))
         self.assertEqual(LayoutSnapshot("a/w"), result.snapshot)
         self.assertIsNone(result.canonical_upload_scope, "a's own groups need no upload")
+
+    def test_different_groups_stop_for_a_choice_even_when_the_signed_in_account_has_groups(self):
+        current = records({"a/w": scope("Focus"), "b/w": scope("Other")}, active="a/w")
+
+        with self.assertRaisesRegex(LayoutChoiceError, "keep-sidebar --account N --apply"):
+            transform_layout_records(current, self.targets, timestamp_ms=10)
 
     def test_an_empty_signed_in_account_gets_the_only_account_with_groups(self):
         result = self.first_sync({"a/w": scope(), "b/w": scope("Focus")}, active="a/w")
@@ -1405,7 +1416,7 @@ class DisagreeingCopiesTests(unittest.TestCase):
     targets = {"a/w": {"code:x"}, "b/w": {"code:x"}}
 
     def test_a_group_or_pin_in_only_one_save_stops_the_copy(self):
-        current = records({"a/w": scope("Focus"), "b/w": scope("Old")}, active="a/w", pins=["code:x"])
+        current = records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w", pins=["code:x"])
         group_only_persisted = dict(current)
         persisted = decoded(current[GROUP_SCOPES_KEY])
         persisted["value"]["a/w"] = scope("Focus", "Only here")
@@ -1426,7 +1437,7 @@ class DisagreeingCopiesTests(unittest.TestCase):
             root = Path(directory)
             synchronizer, fake, _database, values = self.transaction_fixture(root)
             values.clear()
-            values.update(records({"a/w": scope("Focus"), "b/w": scope("Old")}, active="a/w"))
+            values.update(records({"a/w": scope("Focus"), "b/w": scope()}, active="a/w"))
             persisted = decoded(values[GROUP_SCOPES_KEY])
             persisted["value"]["a/w"] = scope("Focus", "Only here")
             values[GROUP_SCOPES_KEY] = encoded(persisted)

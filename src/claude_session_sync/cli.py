@@ -626,12 +626,12 @@ def _ask_main_account(
     """At install, ask which account's pins and groups the others copy.
 
     Asks only when both input and output are a terminal, before any account
-    was adopted, and when two or more accounts have groups. Enter keeps the
+    was adopted, and when accounts hold different groups. Enter keeps the
     signed-in account. The install never fails here: a problem skips the
-    question, and the first sync then follows its own rules.
+    question, and the first sync then waits for a choice instead of guessing.
     """
 
-    from .layout import load_snapshot, request_adoption
+    from .layout import groups_differ, load_snapshot, request_adoption
 
     if not (stdin.isatty() and output.isatty()) or not config.sync_sidebar_layout:
         return
@@ -645,7 +645,7 @@ def _ask_main_account(
         if any(load_snapshot(path) is not None for path in snapshots):
             return
         rows = _sidebar_rows(config, deps, helper)
-        if sum(1 for row in rows if row.groups) < 2:
+        if not groups_differ(row.group_names for row in rows):
             return
         _discard_typeahead(stdin)
         output.write("\nWhich account is the main one?\n")
@@ -654,7 +654,10 @@ def _ask_main_account(
         output.write("\n")
         number = _choose_row(rows, stdin, output)
         if number is None:
-            output.write("\nNo account chosen. The first sync decides.\n")
+            output.write(
+                "\nNo account chosen. Pins and groups wait until you choose one with "
+                "keep-sidebar --account N --apply.\n"
+            )
             return
         request_adoption(config.state_dir, rows[number - 1].scope)
     except Exception as error:

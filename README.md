@@ -28,12 +28,13 @@ Tools, Apple's build tools.
 3. Unzip it.
 4. Double-click `Install Claude Session Sync.command` inside the folder.
 5. Choose **1** for automatic sync.
-6. If two or more accounts have custom groups, the installer lists them and
-   asks which one is the main one. Type its number, or press Enter to keep the
-   account you are signed into.
+6. If your accounts have different custom groups, the installer lists them,
+   with up to three group names each, and asks which one is the main one. Type
+   its number, or press Enter to keep the account you are signed into.
 
 The other accounts copy the main account's pins and groups the next time
-Claude closes.
+Claude closes. Sync never overwrites different groups on its own. Until you
+choose a main account, it leaves them alone.
 
 The installer adds a background helper and a small **Sync** menu-bar item.
 It does not replace the Claude app.

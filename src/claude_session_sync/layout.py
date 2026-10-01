@@ -563,8 +563,8 @@ def transform_layout_records(
 
     One account's sidebar is the source of truth at a time, and its groups
     are copied to the other accounts. The first sync adopts the account chosen
-    at install, else the signed-in account, else the only account with
-    groups. After that the signed-in account wins. Right after an account
+    at install or with keep-sidebar. Without a choice it adopts only when that
+    overwrites no different groups. After that the signed-in account wins. Right after an account
     switch, the account just left still holds the newest organization,
     because Claude reloads the new account's groups from its servers at
     sign-in, so that one is copied instead.
@@ -732,13 +732,23 @@ def _source_scope(
         else:
             raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
         return source if source in grouped else None
-    if active in grouped:
-        return active
     if not grouped:
         return None
-    if len(grouped) == 1 and active_is_empty:
-        return grouped[0]
-    raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
+    if groups_differ(
+        [name for _group_id, name in _ordered_group_pairs(store_scopes[key])] for key in grouped
+    ):
+        raise LayoutChoiceError(NEEDS_MAIN_ACCOUNT)
+    return active if active in grouped else grouped[0]
+
+
+def groups_differ(group_names: Iterable[Iterable[str]]) -> bool:
+    """Whether accounts with groups hold different ones, so only the user can pick.
+
+    With no adopted account, sync copies on its own only when one account has
+    groups or all hold the same ones, as installs from the union model do.
+    """
+
+    return len({frozenset(names) for names in group_names if names}) > 1
 
 
 def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
