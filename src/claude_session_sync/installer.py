@@ -689,21 +689,6 @@ class Installer:
             capture_output=True,
         )
 
-    def unload_launch_agent(self) -> None:
-        """Stop the per-user watcher before its plist is removed."""
-
-        self._runner(
-            [
-                "/bin/launchctl",
-                "bootout",
-                "gui/{}".format(os.getuid()),
-                str(self.layout.launch_agent),
-            ],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-
     def uninstall(self, *, dry_run: bool) -> InstallReport:
         targets = (
             self.layout.launch_agent,

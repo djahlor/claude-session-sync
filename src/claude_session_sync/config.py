@@ -3,7 +3,7 @@
 from . import strict_json as json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Set, Tuple, Union
+from typing import Any, Mapping, Set, Tuple, Union
 
 from .model import Profile
 
@@ -32,10 +32,6 @@ class Config:
     sync_sidebar_layout: bool = False
     sync_code_routines: bool = False
     version: int = 1
-
-    @classmethod
-    def load(cls, path: Union[str, Path]) -> "Config":
-        return load_config(path)
 
 
 _CONFIG_KEYS = {
@@ -124,48 +120,6 @@ def _parse_approved_target(raw: Any, index: int) -> ApprovedTarget:
         _nonempty_string(target["account"], "approved target account"),
         _nonempty_string(target["workspace"], "approved target workspace"),
     )
-
-
-def config_as_dict(config: Config, include_paths: bool = True) -> Dict[str, Any]:
-    profiles: List[Dict[str, Any]] = []
-    for profile in config.profiles:
-        profiles.append(
-            {
-                "name": profile.name,
-                "data_root": str(profile.data_root) if include_paths else "<data-root>",
-                "launch_command": list(profile.launch_command),
-                "is_default": profile.is_default,
-            }
-        )
-    return {
-        "version": config.version,
-        "profiles": profiles,
-        "approved_targets": [
-            {
-                "profile": target.profile_name,
-                "account": target.account_id if include_paths else "<account>",
-                "workspace": (target.workspace_id if include_paths else "<workspace>"),
-            }
-            for target in sorted(
-                config.approved_targets,
-                key=lambda item: (
-                    item.profile_name,
-                    item.account_id,
-                    item.workspace_id,
-                ),
-            )
-        ],
-        "state_dir": str(config.state_dir) if include_paths else "<state-dir>",
-        "retention": config.retention,
-        "acknowledge_cross_profile_copy": config.acknowledge_cross_profile_copy,
-        "acknowledge_cross_account_copy": config.acknowledge_cross_account_copy,
-        "target_policy": config.target_policy,
-        "sync_sidebar_layout": config.sync_sidebar_layout,
-        "sync_code_routines": config.sync_code_routines,
-        "claude_executable": (
-            str(config.claude_executable) if include_paths else "<claude-executable>"
-        ),
-    }
 
 
 def load_config(path: Union[str, Path]) -> Config:

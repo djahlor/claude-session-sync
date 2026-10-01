@@ -6,7 +6,6 @@ rules leave alone are reported as problems and never block the rest.
 """
 
 import hashlib
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +25,7 @@ from .chat_model import (
 from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
+from .filesystem import normalized_path
 from .hash_cache import HashCache
 from .logins import default_app_log, record_logins
 from .model import (
@@ -33,7 +33,6 @@ from .model import (
     InvalidReplica,
     Operation,
     Plan,
-    Replica,
     SyncRequest,
     Target,
 )
@@ -107,7 +106,7 @@ class Planner:
 
     def _select(self, config, found: Discovery, state: ChatState):
         """Record logins and enroll new folders in ``state``, then select."""
-        roots = {profile.name: _normalized(profile.data_root) for profile in config.profiles}
+        roots = {profile.name: normalized_path(profile.data_root) for profile in config.profiles}
         default_roots = {
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
@@ -276,10 +275,6 @@ def _resolve_prefer(prefer: Optional[str], targets: Mapping[str, Target]) -> Opt
     raise ValueError("--prefer names no synced sidebar folder")
 
 
-def _normalized(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
-
-
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -367,16 +362,3 @@ def _portable_reason(reason: str, config: Config) -> str:
         portable = portable.replace(str(profile.data_root), "<{}>".format(profile.name))
     portable = portable.replace(str(config.state_dir), "<state-dir>")
     return portable
-
-
-def _target_key(target: Target) -> Tuple[str, str, str]:
-    return target.profile_name, target.account_id, target.workspace_id
-
-
-def _replica_key(replica: Replica) -> Tuple[str, str, str, str]:
-    return (
-        replica.target.profile_name,
-        replica.target.account_id,
-        replica.target.workspace_id,
-        replica.session_id,
-    )

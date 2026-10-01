@@ -329,6 +329,3 @@ def _replica_key(replica: Replica) -> Tuple[str, str, str, str]:
         replica.target.workspace_id,
         replica.session_id,
     )
-
-
-Store = SessionStore

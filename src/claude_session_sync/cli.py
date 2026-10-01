@@ -23,6 +23,7 @@ from .config_commands import (
     _prepare_config_data,
     _validate_config_data,
 )
+from .filesystem import normalized_path
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
 from .progress import current_progress, finish_progress, record_progress
 from .model import Plan
@@ -386,10 +387,6 @@ def _wait_for_managed_processes_to_exit(
         if remaining <= 0:
             return False
         dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-
-
-def _normalized_path(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
 def _switch_chat_result(config: Config, dependencies: CliDependencies) -> dict:
@@ -1007,8 +1004,8 @@ def run(
             except subprocess.TimeoutExpired as error:
                 _write(_chat_failure(error), as_json=True, stream=output)
                 return 1
-            selected_root = _normalized_path(profile.data_root)
-            if any(_normalized_path(process.user_data_dir) != selected_root for process in processes):
+            selected_root = normalized_path(profile.data_root)
+            if any(normalized_path(process.user_data_dir) != selected_root for process in processes):
                 raise ValueError("another managed profile is open; leave Claude open until it is closed")
             _write({"state": "ready", "pids": [process.pid for process in processes]}, as_json=True, stream=output)
             return 0
