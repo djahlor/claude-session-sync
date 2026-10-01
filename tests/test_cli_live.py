@@ -243,19 +243,145 @@ class LiveCliTests(unittest.TestCase):
         self.assertIsNone(self.read(self.a, X))
         self.assertEqual({}, load_state(state_path(self.config.state_dir)).sync.synced)
 
-    def test_keep_sidebar_marks_the_signed_in_account_for_the_next_closed_sync(self):
+    def sidebar(self, groups_by_folder, *, signed_in, pins=()):
+        """A fake sidebar database: {(account, org): group names}."""
+        from unittest.mock import patch
+
+        from claude_session_sync import layout
+
+        scopes = {
+            "{}/{}".format(account, org): {
+                "groups": [{"id": "id-" + name, "name": name} for name in names],
+                "assignments": {},
+                "order": {},
+            }
+            for (account, org), names in groups_by_folder.items()
+        }
+        state = {
+            "customGroupsByScope": scopes,
+            "pinnedOrder": list(pins),
+            "homeProjectsPinnedOrder": [],
+            "lastSidebarScopeKey": None,
+        }
+        records = {
+            layout.GROUP_SCOPES_KEY: layout._encode_record({"value": scopes, "timestamp": 1}),
+            layout.LOCAL_SLICE_KEY: layout._encode_record({"value": {"pinnedOrder": list(pins)}, "timestamp": 1}),
+            layout.DFRAME_STORE_KEY: layout._encode_record({"state": state, "version": 4}),
+            layout.SYNC_OWNER_KEY: b"\x01" + signed_in.encode("utf-8"),
+        }
+
+        class FakeDatabase:
+            def __init__(self, _helper, database):
+                self.database = database
+
+            def get(self, key):
+                return records[key]
+
+            def get_optional(self, key):
+                return records.get(key)
+
+        live = self.data_root / "Local Storage" / "leveldb"
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "CURRENT").write_bytes(b"MANIFEST-000001\n")
+        helper = self.root / "bin" / "layoutdb"
+        helper.parent.mkdir(exist_ok=True)
+        helper.write_bytes(b"fixture")
+        helper.chmod(0o700)
+        return patch.object(layout, "LevelDatabase", FakeDatabase)
+
+    def test_keep_sidebar_lists_accounts_and_marks_the_signed_in_one_for_the_next_closed_sync(self):
         from dataclasses import replace
         from claude_session_sync.layout import read_pending_adoption
 
         self.config = replace(self.config, sync_sidebar_layout=True)
+        self.write(self.a, X)
+        self.write(self.a, Y)
+        self.write(self.b, X)
+        self.running = True  # The list reads a copy, so Claude may stay open.
 
-        code, out, _errors = self.cli("keep-sidebar", "--dry-run")
-        self.assertEqual((0, "state=planned next_action=restart-claude\n"), (code, out))
-        self.assertIsNone(read_pending_adoption(self.config.state_dir))
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Old"]},
+            signed_in=A_ACCOUNT,
+            pins=["code:local_" + X],
+        ):
+            code, out, errors = self.cli("keep-sidebar", "--dry-run")
+            self.assertEqual(0, code, errors)
+            self.assertEqual(
+                "  1  signed in     2 groups     1 pin        2 chats\n"
+                "  2                1 group      1 pin        1 chat\n"
+                "state=planned account=1 next_action=restart-claude\n",
+                out,
+            )
+            self.assertIsNone(read_pending_adoption(self.config.state_dir))
 
-        code, out, _errors = self.cli("keep-sidebar", "--apply")
+            code, out, _errors = self.cli("keep-sidebar", "--apply")
         self.assertEqual(0, code)
+        self.assertTrue(out.endswith("state=pending account=1 next_action=restart-claude\n"))
         self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), read_pending_adoption(self.config.state_dir))
+
+    def test_keep_sidebar_lists_accounts_the_next_sync_would_join_on_a_fresh_install(self):
+        from dataclasses import replace
+
+        self.config = replace(self.config, sync_sidebar_layout=True, approved_targets=())
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 600))
+        self.app_log.write_text(
+            "".join(
+                "{} [info] [account] Login-state transition (loggedOut: true \u2192 false, "
+                "uuid: <none> \u2192 {}), clearing oauth cache\n".format(stamp, account)
+                for account in (B_ACCOUNT, A_ACCOUNT)
+            ),
+            encoding="utf-8",
+        )
+        self.write(self.a, X)
+        self.write(self.b, Y)
+
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old", "Ideas"]}, signed_in=A_ACCOUNT
+        ):
+            code, out, errors = self.cli("keep-sidebar", "--dry-run")
+
+        self.assertEqual(0, code, errors)
+        self.assertEqual(
+            "  1  signed in     1 group      0 pins       1 chat\n"
+            "  2                2 groups     0 pins       1 chat\n"
+            "state=planned account=1 next_action=restart-claude\n",
+            out,
+        )
+        self.assertFalse(state_path(self.config.state_dir).exists(), "listing writes no chat state")
+
+    def test_keep_sidebar_keeps_another_account_by_its_row_number(self):
+        from dataclasses import replace
+        from claude_session_sync.layout import read_pending_adoption
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old"]}, signed_in=A_ACCOUNT
+        ):
+            code, out, _errors = self.cli("keep-sidebar", "--account", "2", "--apply")
+            self.assertEqual(0, code)
+            self.assertEqual("{}/{}".format(B_ACCOUNT, B_ORG), read_pending_adoption(self.config.state_dir))
+
+            code, out, _errors = self.cli("keep-sidebar", "--account", "3", "--apply")
+            self.assertEqual(1, code)
+            self.assertIn("state=blocked reason=no-such-account", out)
+
+    def test_keep_sidebar_shows_a_short_id_when_two_rows_look_the_same(self):
+        from dataclasses import replace
+
+        self.config = replace(self.config, sync_sidebar_layout=True)
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Focus"]}, signed_in=OLD_ACCOUNT
+        ):
+            code, out, _errors = self.cli("keep-sidebar", "--dry-run")
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "  1             aaaaaaaa/aaaaaaaa     1 group      0 pins       0 chats\n"
+            "  2             bbbbbbbb/bbbbbbbb     1 group      0 pins       0 chats\n"
+            "state=blocked reason=signed-in-account-not-synced\n",
+            out,
+        )
+        self.assertNotIn(A_ACCOUNT, out, "never a full account ID")
 
     def test_keep_sidebar_refuses_when_pins_and_groups_do_not_sync(self):
         code, out, _errors = self.cli("keep-sidebar", "--apply")

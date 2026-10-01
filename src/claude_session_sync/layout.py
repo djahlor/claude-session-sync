@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import shutil
@@ -15,6 +16,8 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -103,6 +106,19 @@ class LayoutReceipt:
     assignment_count: int
     pin_count: int
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SidebarAccount:
+    """One synced account's sidebar, as the main-account question shows it."""
+
+    # ACCOUNT/WORKSPACE. Never printed whole: it is the only name on disk.
+    scope: str
+    is_signed_in: bool
+    groups: int
+    # Pinned chats among this account's chats; pins are one shared list.
+    pins: int
+    chats: int
 
 
 def _string_list(value: Any, label: str) -> List[str]:
@@ -519,6 +535,48 @@ def _signed_in_scope(
     return active if active in target_sessions else None
 
 
+def sidebar_accounts(
+    records: Mapping[bytes, bytes],
+    target_sessions: Mapping[str, Set[str]],
+    owner_account: Optional[str],
+) -> List[SidebarAccount]:
+    """The accounts whose pins and groups can be the source, signed-in first."""
+
+    store_record = _decode_record(records[DFRAME_STORE_KEY], "dframe store record")
+    store_state = store_record.get("state")
+    if not isinstance(store_state, dict):
+        raise LayoutError("dframe store record has an unknown shape")
+    store_scopes = _validated_scopes(store_state.get("customGroupsByScope", {}))
+    pins = set(_string_list(store_state.get("pinnedOrder", []), "stored pins"))
+    active = _signed_in_scope(store_state, target_sessions, owner_account)
+    rows = [
+        SidebarAccount(
+            scope=scope_key,
+            is_signed_in=scope_key == active,
+            groups=len(_ordered_group_pairs(store_scopes.get(scope_key, {"groups": []}))),
+            pins=len(pins & sessions),
+            chats=len(sessions),
+        )
+        for scope_key, sessions in target_sessions.items()
+    ]
+    return sorted(rows, key=lambda row: (not row.is_signed_in, row.scope))
+
+
+def scope_sessions(targets: Iterable[Any]) -> Dict[str, Set[str]]:
+    """Map each sync target's ACCOUNT/WORKSPACE to the chats in its folder."""
+
+    scopes = {}
+    for target in targets:
+        sessions = set()
+        for replica in target.path.iterdir():
+            if replica.is_symlink() or not replica.is_file():
+                continue
+            if replica.name.startswith("local_") and replica.name.endswith(".json"):
+                sessions.add("code:{}".format(replica.stem))
+        scopes["{}/{}".format(target.account_id, target.workspace_id)] = sessions
+    return scopes
+
+
 def _source_scope(
     active: str,
     snapshot: Optional[LayoutSnapshot],
@@ -782,35 +840,50 @@ class LayoutSynchronizer:
         if any(parent.is_symlink() for parent in (path.parent, path.parent.parent)):
             raise LayoutError("Claude Local Storage includes an unsafe symlink")
 
+    @contextlib.contextmanager
+    def _database_copy(self, data_root: Path) -> Iterator[LevelDatabase]:
+        """Open a disposable copy of one profile's sidebar database.
+
+        Opening LevelDB can write to it, so the live files are never opened.
+        """
+        if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
+            raise LayoutError("sidebar helper is not installed")
+        source = data_root / "Local Storage" / "leveldb"
+        self._check_database_path(source)
+        with tempfile.TemporaryDirectory(prefix="claude-layout-probe-") as temporary:
+            copied = Path(temporary) / "leveldb"
+            # Preserve symlinks in the copy, then reject them before opening.
+            shutil.copytree(source, copied, symlinks=True)
+            for entry in copied.rglob("*"):
+                mode = entry.lstat().st_mode
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                    raise LayoutError("Claude Local Storage contains an unsafe entry")
+                os.chmod(str(entry), 0o700 if stat.S_ISDIR(mode) else 0o600)
+            os.chmod(str(copied), 0o700)
+            yield LevelDatabase(self.helper, copied)
+
+    def accounts(self, target_sessions: Mapping[str, Set[str]]) -> List[SidebarAccount]:
+        """The default profile's accounts as rows. Works while Claude is open."""
+
+        defaults = [profile for profile in self.config.profiles if profile.is_default]
+        if len(defaults) != 1:
+            raise LayoutError("choose the single default data profile before listing accounts")
+        with self._database_copy(defaults[0].data_root) as database:
+            records = {key: database.get(key) for key in LAYOUT_KEYS}
+            owner = _owner_account(database.get_optional(SYNC_OWNER_KEY))
+        return sidebar_accounts(records, target_sessions, owner)
+
     def probe(self) -> Dict[str, Any]:
         """Validate current records in disposable copies without opening live DBs."""
         if not self.config.sync_sidebar_layout:
             return {"state": "disabled"}
         self._assert_stopped()
-        if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
-            raise LayoutError("sidebar helper is not installed")
         profiles = groups = pins = assignments = 0
         for index, profile in enumerate(self.config.profiles):
-            source = profile.data_root / "Local Storage" / "leveldb"
-            self._check_database_path(source)
             targets = self._target_sessions(profile.name, profile.data_root)
-            with tempfile.TemporaryDirectory(
-                prefix="claude-layout-probe-"
-            ) as temporary:
-                copied = Path(temporary) / "leveldb"
+            self._assert_stopped()
+            with self._database_copy(profile.data_root) as database:
                 self._assert_stopped()
-                # Preserve symlinks in the copy, then reject them before opening.
-                shutil.copytree(source, copied, symlinks=True)
-                for entry in copied.rglob("*"):
-                    mode = entry.lstat().st_mode
-                    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                        raise LayoutError(
-                            "Claude Local Storage contains an unsafe entry"
-                        )
-                    os.chmod(str(entry), 0o700 if stat.S_ISDIR(mode) else 0o600)
-                os.chmod(str(copied), 0o700)
-                self._assert_stopped()
-                database = LevelDatabase(self.helper, copied)
                 current = {key: database.get(key) for key in LAYOUT_KEYS}
                 transformed = transform_layout_records(
                     current,
@@ -957,17 +1030,11 @@ class LayoutSynchronizer:
             raise LayoutError("Claude session storage has an unknown layout")
         from .enrollment import selected_targets
 
-        targets = {}
-        for target in selected_targets(self.config, discovery.targets):
-            if target.profile_name != profile_name:
-                continue
-            sessions = set()
-            for replica in target.path.iterdir():
-                if replica.is_symlink() or not replica.is_file():
-                    continue
-                if replica.name.startswith("local_") and replica.name.endswith(".json"):
-                    sessions.add("code:{}".format(replica.stem))
-            targets["{}/{}".format(target.account_id, target.workspace_id)] = sessions
+        targets = scope_sessions(
+            target
+            for target in selected_targets(self.config, discovery.targets)
+            if target.profile_name == profile_name
+        )
         if not targets:
             raise LayoutError("no approved Claude sidebar scopes were found")
         if (

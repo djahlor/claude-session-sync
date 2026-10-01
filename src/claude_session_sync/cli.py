@@ -117,6 +117,16 @@ def _nonnegative_seconds(value: str) -> float:
     return seconds
 
 
+def _row_number(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a row number") from error
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a row number")
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-session-sync")
     parser.add_argument("--version", action="version", version=__version__)
@@ -204,10 +214,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     keep_sidebar = commands.add_parser(
         "keep-sidebar",
-        help="make the signed-in account's pins and groups the source of truth next time Claude closes",
+        help="make one account's pins and groups the source of truth next time Claude closes",
+    )
+    keep_sidebar.add_argument(
+        "--account",
+        type=_row_number,
+        metavar="N",
+        help="the row number --dry-run shows; the signed-in account by default",
     )
     keep_mode = keep_sidebar.add_mutually_exclusive_group(required=True)
-    keep_mode.add_argument("--dry-run", action="store_true")
+    keep_mode.add_argument(
+        "--dry-run", action="store_true", help="list the accounts and the one --apply keeps"
+    )
     keep_mode.add_argument("--apply", action="store_true")
     forget = commands.add_parser(
         "forget-lost",
@@ -585,32 +603,72 @@ def _chat_failure(error: Exception) -> dict:
     }
 
 
-def _keep_sidebar(config: Config, *, apply: bool) -> tuple:
-    """Choose the signed-in account's synced folder as the pins-and-groups source."""
+def _sidebar_rows(
+    config: Config, deps: CliDependencies, helper: Optional[Path] = None
+) -> list:
+    """The accounts the next sync can copy pins and groups from, signed-in first."""
 
-    from .enrollment import selected_targets
+    from .layout import LayoutSynchronizer, scope_sessions
+
+    default = next(profile for profile in config.profiles if profile.is_default)
+    targets = [
+        target
+        for target in deps.planner_factory(config).sync_targets(config)
+        if target.profile_name == default.name
+    ]
+    return LayoutSynchronizer(config, helper=helper).accounts(scope_sessions(targets))
+
+
+def _account_lines(rows: Sequence[Any]) -> list:
+    """One line per account. Accounts have no names on disk, so rows that would
+    look the same also show a short ID."""
+
+    looks = [(row.is_signed_in, row.groups, row.pins, row.chats) for row in rows]
+    show_id = len(set(looks)) < len(looks)
+    lines = []
+    for number, row in enumerate(rows, 1):
+        columns = ["{:>3}".format(number), "signed in" if row.is_signed_in else " " * 9]
+        if show_id:
+            account, _separator, workspace = row.scope.partition("/")
+            columns.append("{}/{}".format(account[:8], workspace[:8]))
+        for count, word in ((row.groups, "group"), (row.pins, "pin"), (row.chats, "chat")):
+            columns.append("{:>4} {}".format(count, word if count == 1 else word + "s").ljust(11))
+        lines.append("  ".join(columns).rstrip())
+    return lines
+
+
+def _keep_sidebar(
+    config: Config, deps: CliDependencies, *, number: Optional[int], apply: bool
+) -> tuple:
+    """Choose which account's pins and groups the next closed sync copies.
+
+    Returns the payload, the exit code, and the account lines to show.
+    """
+
     from .layout import request_adoption
-    from .logins import last_known_account
-    from .store import SessionStore
 
     if not config.sync_sidebar_layout:
-        return {"state": "blocked", "reason": "sidebar-sync-off"}, 1
-    defaults = [profile for profile in config.profiles if profile.is_default]
-    if len(defaults) != 1:
-        return {"state": "blocked", "reason": "needs-one-default-profile"}, 1
-    account = last_known_account(defaults[0].data_root)
-    folders = [
-        target
-        for target in selected_targets(config, SessionStore().discover_targets(config).targets)
-        if target.profile_name == defaults[0].name and target.account_id.lower() == account
-    ]
-    if account is None or len(folders) != 1:
-        return {"state": "blocked", "reason": "signed-in-account-not-synced"}, 1
+        return {"state": "blocked", "reason": "sidebar-sync-off"}, 1, []
+    if sum(profile.is_default for profile in config.profiles) != 1:
+        return {"state": "blocked", "reason": "needs-one-default-profile"}, 1, []
+    rows = _sidebar_rows(config, deps)
+    lines = _account_lines(rows)
+    if number is None:
+        number = next((index for index, row in enumerate(rows, 1) if row.is_signed_in), None)
+        if number is None:
+            return {"state": "blocked", "reason": "signed-in-account-not-synced"}, 1, lines
+    if number > len(rows):
+        return {"state": "blocked", "reason": "no-such-account"}, 1, lines
+    if not rows[number - 1].groups:
+        return {"state": "blocked", "reason": "account-has-no-groups"}, 1, lines
     if apply:
-        request_adoption(
-            config.state_dir, "{}/{}".format(folders[0].account_id, folders[0].workspace_id)
-        )
-    return {"state": "pending" if apply else "planned", "next_action": "restart-claude"}, 0
+        request_adoption(config.state_dir, rows[number - 1].scope)
+    payload = {
+        "state": "pending" if apply else "planned",
+        "account": number,
+        "next_action": "restart-claude",
+    }
+    return payload, 0, lines
 
 
 def _chat_run_summary(run: Any, duration_ms: int) -> dict:
@@ -989,7 +1047,10 @@ def run(
             _write({"state": "requested"}, as_json=False, stream=output)
             return 0
         if arguments.command == "keep-sidebar":
-            payload, exit_code = _keep_sidebar(config, apply=arguments.apply)
+            payload, exit_code, lines = _keep_sidebar(
+                config, deps, number=arguments.account, apply=arguments.apply
+            )
+            output.write("".join(line + "\n" for line in lines))
             _write(payload, as_json=False, stream=output)
             return exit_code
         if arguments.command == "forget-lost":

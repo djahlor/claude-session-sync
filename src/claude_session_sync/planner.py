@@ -97,23 +97,28 @@ class Planner:
         cache = HashCache(config.state_dir / "hash-cache.sqlite3")
         return SessionStore(cache, clock_ns=self._clock_ns), cache
 
-    def _plan(self, config, store, state, prefer, prefer_session) -> Plan:
-        now_ms = self._clock_ns() // 1_000_000
-        found = store.discover_targets(config)
-        profiles = {profile.name: profile for profile in config.profiles}
-        roots = {name: _normalized(profile.data_root) for name, profile in profiles.items()}
+    def sync_targets(self, config: Config) -> Tuple[Target, ...]:
+        """The folders the next sync will use, including ones it would enroll.
+
+        Reads the chat state and Claude's log without writing either.
+        """
+        state = self._state or load_state(state_path(config.state_dir))
+        found = (self._store or SessionStore()).discover_targets(config)
+        return self._select(config, found, state)[0]
+
+    def _select(self, config, found: Discovery, state: ChatState):
+        """Record logins and enroll new folders in ``state``, then select."""
+        roots = {profile.name: _normalized(profile.data_root) for profile in config.profiles}
         default_roots = {
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
-
         app_log = self._app_log or default_app_log()
         record_logins(
             roots.values(),
             state.logins,
-            now_ms,
+            self._clock_ns() // 1_000_000,
             lambda root: app_log if root in default_roots else None,
         )
-
         selected, ignored = select_targets(config, found.targets, state.enrolled)
         newly = new_login_targets(
             config,
@@ -124,6 +129,11 @@ class Planner:
         if newly:
             state.enrolled = sorted(set(state.enrolled) | set(newly))
             selected, ignored = select_targets(config, found.targets, state.enrolled)
+        return selected, ignored, newly
+
+    def _plan(self, config, store, state, prefer, prefer_session) -> Plan:
+        found = store.discover_targets(config)
+        selected, ignored, newly = self._select(config, found, state)
 
         invalid = list(found.invalid_replicas)
         if config.target_policy == "approved-only":
