@@ -1,9 +1,10 @@
 # Claude Session Sync
 
-Keep your Claude Code chats when you switch accounts.
+Keep your Claude Code chats, pins, and groups when you switch accounts in the
+Claude Desktop app on macOS. Runs locally, nothing leaves your Mac.
 
-Sync chats, routines, pins, and custom groups between accounts in Claude Desktop
-on one Mac. Keep using the regular Claude app.
+For people who use more than one Claude account in Claude Desktop on one Mac,
+for example a work account and a personal one. Keep using the regular Claude app.
 
 > [!WARNING]
 > Experimental and unofficial. Claude updates can break sync.
@@ -20,25 +21,32 @@ copy logins, or sync Cowork routines.
 
 ## Install
 
-You need a Mac with Claude Desktop, Python 3.9 or newer, and Xcode Command Line
-Tools, Apple's build tools.
+You need macOS and [Claude Desktop](https://claude.ai/download). Paste this into
+Terminal:
 
-1. Quit Claude.
-2. [Download the ZIP](https://github.com/popcorn-so/claude-session-sync/archive/refs/heads/main.zip).
-3. Unzip it.
-4. Double-click `Install Claude Session Sync.command` inside the folder.
-5. Choose **1** for automatic sync.
-6. If two or more accounts have custom groups, the installer lists them and
-   asks which one is the main one. Type its number, or press Enter to keep the
-   account you are signed into.
+```sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
+```
 
-The other accounts copy the main account's pins and groups the next time
+It checks for Apple's Command Line Tools and asks macOS to install them if they
+are missing. Then it downloads the latest version, builds its helpers, and adds a
+background helper and a small **Sync** menu-bar item. It does not replace the
+Claude app.
+
+If two or more accounts have custom groups, it lists them and asks which one is
+the main one. Type its number, or press Enter to keep the account you are signed
+into. The other accounts copy the main account's pins and groups the next time
 Claude closes.
 
-The installer adds a background helper and a small **Sync** menu-bar item.
-It does not replace the Claude app.
 A new account joins the sync after you chat in it and then switch accounts or
 quit Claude.
+
+### Without Terminal
+
+1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
+2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open
+   System Settings, then Privacy & Security, and click **Open Anyway**.
+3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
 
 ## Switch accounts
 
@@ -72,8 +80,14 @@ Routines sync at the same moments as chats.
 
 ## Update
 
-Quit Claude, download a fresh ZIP, and run the installer again. Choose **1**
-for automatic sync. No separate Claude app is needed.
+Run the same Terminal command again. Your sync history, backups, and main
+account stay as they are.
+
+To remove it, run:
+
+```sh
+"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" uninstall --apply
+```
 
 ## If something goes wrong
 
