@@ -284,7 +284,7 @@ class WatcherTests(unittest.TestCase):
         subprocess.run(["/usr/bin/xcrun", "swiftc", str(source), "-o", str(executable), "-framework", "AppKit"], check=True, capture_output=True)
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
             "CFBundleExecutable": "SyncTest", "CFBundleIdentifier": "com.example.sync-test." + uuid.uuid4().hex,
-            "CFBundleName": "SyncTest", "CFBundlePackageType": "APPL",
+            "CFBundleName": "SyncTest", "CFBundlePackageType": "APPL", "LSUIElement": True,
         }))
         return app, executable
 
