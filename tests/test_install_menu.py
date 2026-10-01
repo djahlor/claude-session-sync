@@ -54,5 +54,30 @@ class InstallMenuTests(unittest.TestCase):
                 self.assertIn("No changes made", result.stdout + result.stderr)
 
 
+    def test_install_script_asks_for_the_main_account_during_setup(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "install.sh"
+        with tempfile.TemporaryDirectory(prefix="sync-install-") as directory:
+            root = Path(directory)
+            python = root / "python3"
+            python.write_text("#!/bin/sh\nprintf 'PY_ARG=%s\\n' \"$@\"\n")
+            python.chmod(0o700)
+            result = subprocess.run(
+                ["zsh", str(source), "--automatic-targets", "--sync-layout", "--sync-routines"],
+                env={"HOME": str(root / "home"), "PATH": "/usr/bin:/bin", "PYTHON_BIN": str(python)},
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = re.findall(r"PY_ARG=([^\r\n]*)", result.stdout)
+        setup = arguments[arguments.index("setup"):]
+        self.assertEqual(
+            ["setup", "--automatic-targets", "--sync-layout", "--ask-main-account",
+             "--sync-routines", "--apply"],
+            setup,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

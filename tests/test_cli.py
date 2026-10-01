@@ -1179,7 +1179,7 @@ class CliConfigureTests(unittest.TestCase):
             def default_config_data(self):
                 return self.default_data
 
-            def setup(self, *, dry_run, config_data=None):
+            def setup(self, *, dry_run, config_data=None, before_activation=None):
                 self.calls.append((dry_run, config_data))
                 return InstallReport(
                     "planned" if dry_run else "installed",

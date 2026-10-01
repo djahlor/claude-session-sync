@@ -628,9 +628,18 @@ class Installer:
         )
 
     def setup(
-        self, *, dry_run: bool, config_data: Optional[bytes] = None
+        self,
+        *,
+        dry_run: bool,
+        config_data: Optional[bytes] = None,
+        before_activation: Optional[Callable[[Path], None]] = None,
     ) -> InstallReport:
-        """Validate and stage a complete setup, then apply it transactionally."""
+        """Validate and stage a complete setup, then apply it transactionally.
+
+        before_activation gets the sidebar helper's path. It runs while the
+        old watcher is stopped and sync is locked, before the new watcher
+        starts, so whatever it records is in place before any sync.
+        """
 
         if dry_run:
             if (self.layout.support_dir / "install-state").exists():
@@ -652,6 +661,8 @@ class Installer:
                 self._validate_staged_plists(staging, config_data)
                 transaction.stop_watcher()
                 self._remove_retired_launch_guard(config_data)
+                if before_activation is not None:
+                    before_activation(helper if helper.exists() else self.layout.layout_helper)
                 report = self._apply_setup(actions, config_data, watcher, helper)
                 remaining = self._planned_actions(config_data)
                 if remaining:

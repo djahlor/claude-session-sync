@@ -60,14 +60,14 @@ def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) 
     }
 
 
-def _validate_config_data(encoded: bytes) -> None:
+def _validate_config_data(encoded: bytes) -> Config:
     descriptor, raw_path = tempfile.mkstemp(prefix="claude-session-sync-config-")
     path = Path(raw_path)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
         os.chmod(str(path), 0o600)
-        load_config(path)
+        return load_config(path)
     finally:
         try:
             path.unlink()

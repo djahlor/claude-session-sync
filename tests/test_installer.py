@@ -385,6 +385,26 @@ class InstallerTests(unittest.TestCase):
 
             self.assertFalse(guard.exists())
 
+    def test_the_main_account_question_runs_before_the_new_watcher_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = self.layout(Path(directory))
+            runner = FakeCommandRunner()
+            installer = Installer(layout, runner=runner)
+            seen = []
+
+            def ask(helper):
+                launchctl = [call[0][1] for call in runner.calls if call[0][0] == "/bin/launchctl"]
+                seen.append((helper.read_bytes(), launchctl))
+
+            installer.setup(dry_run=False, config_data=installer.default_config_data(), before_activation=ask)
+
+            (helper_bytes, before), = seen
+            after = [call[0][1] for call in runner.calls if call[0][0] == "/bin/launchctl"]
+            self.assertEqual(b"compiled-layout-helper", helper_bytes, "the staged helper reads the sidebar")
+            self.assertIn("bootout", before, "the old watcher was stopped first")
+            self.assertNotIn("bootstrap", before, "the new watcher had not started")
+            self.assertIn("bootstrap", after[len(before):], "the new watcher starts after the answer")
+
     def test_setup_applies_supplied_config_in_the_same_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

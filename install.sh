@@ -83,7 +83,8 @@ if [[ "$disable_personal" == true ]]; then
   setup_args+=(--disable-personal)
 fi
 if [[ "$sync_layout" == true ]]; then
-  setup_args+=(--sync-layout)
+  # On a terminal, setup asks which account's pins and groups the others copy.
+  setup_args+=(--sync-layout --ask-main-account)
 fi
 if [[ "$sync_routines" == true ]]; then
   setup_args+=(--sync-routines)

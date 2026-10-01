@@ -17,7 +17,12 @@ from .config import Config, load_config
 from . import __version__
 from . import strict_json as json
 from .adapters import adapter_failure, run_adapters
-from .config_commands import _approve_current_targets, _configure, _prepare_config_data
+from .config_commands import (
+    _approve_current_targets,
+    _configure,
+    _prepare_config_data,
+    _validate_config_data,
+)
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
 from .progress import current_progress, finish_progress, record_progress
 from .model import Plan, SyncRequest
@@ -288,6 +293,11 @@ def _parser() -> argparse.ArgumentParser:
     setup_profile.add_argument("--disable-personal", action="store_true")
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
+    setup.add_argument(
+        "--ask-main-account",
+        action="store_true",
+        help="on a terminal, ask whose pins and groups the other accounts copy",
+    )
     setup_mode = setup.add_mutually_exclusive_group(required=True)
     setup_mode.add_argument("--dry-run", action="store_true")
     setup_mode.add_argument("--apply", action="store_true")
@@ -671,6 +681,77 @@ def _keep_sidebar(
     return payload, 0, lines
 
 
+def _ask_main_account(
+    config: Config,
+    deps: CliDependencies,
+    helper: Path,
+    stdin: TextIO,
+    output: TextIO,
+) -> None:
+    """At install, ask which account's pins and groups the others copy.
+
+    Asks only on a terminal, before any account was adopted, and when two or
+    more accounts have groups. Enter keeps the signed-in account. The install
+    never fails here: a problem skips the question, and the first sync then
+    follows its own rules.
+    """
+
+    from .layout import load_snapshot, request_adoption
+
+    if not stdin.isatty() or not config.sync_sidebar_layout:
+        return
+    if sum(profile.is_default for profile in config.profiles) != 1:
+        return
+    try:
+        snapshots = [
+            config.state_dir / "sidebar-layout-{}.json".format(index)
+            for index in range(len(config.profiles))
+        ]
+        if any(load_snapshot(path) is not None for path in snapshots):
+            return
+        rows = _sidebar_rows(config, deps, helper)
+    except Exception as error:
+        output.write("Could not read pins and groups to ask about them: {}\n".format(error))
+        return
+    if sum(1 for row in rows if row.groups) < 2:
+        return
+    output.write("\nWhich account is the main one?\n")
+    output.write("The other accounts will copy its pins and groups.\n\n")
+    output.write("".join(line + "\n" for line in _account_lines(rows)))
+    output.write("\n")
+    number = _choose_row(rows, stdin, output)
+    if number is None:
+        output.write("\nNo account chosen. The first sync decides.\n")
+        return
+    request_adoption(config.state_dir, rows[number - 1].scope)
+    output.write(
+        "Account {} is the main one. The others copy its pins and groups "
+        "the next time Claude closes.\n\n".format(number)
+    )
+
+
+def _choose_row(rows: Sequence[Any], stdin: TextIO, output: TextIO) -> Optional[int]:
+    """Read a row number with groups; Enter means the signed-in row. None at end of input."""
+
+    default = next(
+        (index for index, row in enumerate(rows, 1) if row.is_signed_in and row.groups), None
+    )
+    prompt = "Type a number: " if default is None else "Press Enter for {}, or type a number: ".format(default)
+    while True:
+        output.write(prompt)
+        output.flush()
+        answer = stdin.readline()
+        if not answer:
+            return None
+        answer = answer.strip()
+        number = int(answer) if answer.isdigit() else None
+        if not answer:
+            number = default
+        if number is not None and 1 <= number <= len(rows) and rows[number - 1].groups:
+            return number
+        output.write("Choose a number from the list that has groups.\n")
+
+
 def _chat_run_summary(run: Any, duration_ms: int) -> dict:
     plan = run.plan
     if plan.invalid_replicas or run.receipt is None:
@@ -896,12 +977,14 @@ def run(
     dependencies: Optional[CliDependencies] = None,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
+    stdin: Optional[TextIO] = None,
 ) -> int:
     """Run one command and return an exit status without terminating tests."""
 
     deps = dependencies or CliDependencies()
     output = stdout or sys.stdout
     errors = stderr or sys.stderr
+    answers = stdin or sys.stdin
     try:
         with contextlib.redirect_stderr(errors):
             arguments = _parser().parse_args(argv)
@@ -943,9 +1026,17 @@ def run(
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
             )
+            ask = None
+            if arguments.ask_main_account and arguments.apply:
+                desired_config = _validate_config_data(desired)
+
+                def ask(helper: Path) -> None:
+                    _ask_main_account(desired_config, deps, helper, answers, output)
+
             report = installer.setup(
                 dry_run=arguments.dry_run,
                 config_data=desired,
+                before_activation=ask,
             )
             _write(
                 {

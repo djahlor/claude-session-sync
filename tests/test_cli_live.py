@@ -35,6 +35,13 @@ class FakeProbe:
         return (SimpleNamespace(pid=4242, user_data_dir=self.test.data_root, argv=()),)
 
 
+class Terminal(io.StringIO):
+    """Typed answers on what looks like a terminal."""
+
+    def isatty(self):
+        return True
+
+
 class LiveCliTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -388,6 +395,126 @@ class LiveCliTests(unittest.TestCase):
 
         self.assertEqual(1, code)
         self.assertIn("sidebar-sync-off", out)
+
+
+    def install(self, answers, *, tty=True):
+        from claude_session_sync.installer import InstallReport
+
+        test = self
+        document = {
+            "version": 1,
+            "approved_targets": [
+                {"profile": "Work", "account": A_ACCOUNT, "workspace": A_ORG},
+                {"profile": "Work", "account": B_ACCOUNT, "workspace": B_ORG},
+            ],
+            "profiles": [
+                {"name": "Work", "data_root": str(self.data_root), "launch_command": ["open"], "is_default": True}
+            ],
+            "state_dir": str(self.config.state_dir),
+            "retention": 5,
+            "acknowledge_cross_profile_copy": False,
+            "acknowledge_cross_account_copy": True,
+            "target_policy": "logins",
+            "claude_executable": str(self.config.claude_executable),
+        }
+        config_path = self.root / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        class Installer:
+            def default_config_data(self):
+                raise AssertionError("the config file exists")
+
+            def setup(self, *, dry_run, config_data=None, before_activation=None):
+                if before_activation is not None:
+                    before_activation(test.root / "bin" / "layoutdb")
+                return InstallReport("installed", ())
+
+        out = io.StringIO()
+        dependencies = CliDependencies(
+            planner_factory=lambda _config: Planner(app_log=self.app_log),
+            installer_factory=lambda _path: Installer(),
+        )
+        code = run(
+            ["--config", str(config_path), "setup", "--automatic-targets", "--sync-layout",
+             "--ask-main-account", "--apply"],
+            dependencies=dependencies,
+            stdout=out,
+            stderr=io.StringIO(),
+            stdin=(Terminal if tty else io.StringIO)(answers),
+        )
+        return code, out.getvalue()
+
+    def pending(self):
+        from claude_session_sync.layout import read_pending_adoption
+
+        return read_pending_adoption(self.config.state_dir)
+
+    def two_grouped_accounts(self):
+        self.write(self.a, X)
+        self.write(self.b, Y)
+        return self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Old"]}, signed_in=A_ACCOUNT
+        )
+
+    def test_the_question_shows_the_accounts_and_keeps_the_typed_one(self):
+        with self.two_grouped_accounts():
+            code, out = self.install("2\n")
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "\nWhich account is the main one?\n"
+            "The other accounts will copy its pins and groups.\n\n"
+            "  1  signed in     2 groups     0 pins       1 chat\n"
+            "  2                1 group      0 pins       1 chat\n\n"
+            "Press Enter for 1, or type a number: "
+            "Account 2 is the main one. The others copy its pins and groups "
+            "the next time Claude closes.\n\n",
+            out[: out.index("state=")],
+        )
+        self.assertEqual("{}/{}".format(B_ACCOUNT, B_ORG), self.pending())
+
+    def test_enter_keeps_the_signed_in_account_after_a_wrong_answer(self):
+        with self.two_grouped_accounts():
+            code, out = self.install("9\n\n")
+
+        self.assertEqual(0, code)
+        self.assertIn("Choose a number from the list that has groups.\n", out)
+        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), self.pending())
+
+    def test_no_question_without_a_terminal(self):
+        with self.two_grouped_accounts():
+            code, out = self.install("2\n", tty=False)
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
+    def test_no_question_when_only_one_account_has_groups(self):
+        self.write(self.a, X)
+        with self.sidebar({(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): []}, signed_in=A_ACCOUNT):
+            code, out = self.install("2\n")
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
+    def test_no_question_once_an_account_was_adopted(self):
+        state_dir = self.config.state_dir
+        state_dir.mkdir(parents=True)
+        (state_dir / "sidebar-layout-0.json").write_text(
+            json.dumps({"version": 1, "adopted_scope": "{}/{}".format(A_ACCOUNT, A_ORG)})
+        )
+        with self.two_grouped_accounts():
+            code, out = self.install("2\n")
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertNotIn("Which account", out)
+
+    def test_an_unreadable_sidebar_skips_the_question_and_installs(self):
+        self.write(self.a, X)
+        code, out = self.install("2\n")  # no sidebar database or helper
+
+        self.assertEqual((0, None), (code, self.pending()))
+        self.assertIn("Could not read pins and groups to ask about them: sidebar helper is not installed\n", out)
+        self.assertIn("state=installed", out)
 
 
 if __name__ == "__main__":
