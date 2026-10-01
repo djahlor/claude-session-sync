@@ -1,4 +1,4 @@
-"""The chat state file, the live-folder check, and login-based folder selection."""
+"""The chat state file, Claude's logins, and login-based folder selection."""
 
 import json
 import os
@@ -19,18 +19,20 @@ from claude_session_sync.chat_state import (
 from claude_session_sync.config import ApprovedTarget, Config
 from claude_session_sync.enrollment import new_login_targets, select_targets
 from claude_session_sync.fingerprint import normalisation
-from claude_session_sync.liveness import (
-    SWITCH_GRACE_MS,
-    is_live,
+from claude_session_sync.logins import (
     last_known_account,
-    login_dated_by_app,
-    observe_logins,
+    logins_in_app_log,
+    record_logins,
 )
 from claude_session_sync.model import Profile, Target
 
 ACCOUNT = "aaaaaaaa-0000-4000-8000-000000000001"
 OTHER = "bbbbbbbb-0000-4000-8000-000000000002"
 NOW_MS = 1_800_000_000_000
+
+
+def local_ms(stamp: str) -> int:
+    return int(time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))) * 1000
 
 
 def login_line(stamp: str, before: str, after: str) -> str:
@@ -46,9 +48,8 @@ class ChatStateTests(unittest.TestCase):
             path = Path(directory) / "state" / "chat-state.json"
             state = ChatState(
                 sync=SyncState(synced={"k": {"x": "h"}}, seen={"k": {"x"}}),
-                logins={"/root": (ACCOUNT, 5)},
+                logins={"/root": {ACCOUNT: 5, OTHER: 7}},
                 enrolled=["Work/a/b"],
-                live_creates={"k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}},
                 last_success_ms=9,
             )
 
@@ -89,7 +90,45 @@ class ChatStateTests(unittest.TestCase):
                     self.assertEqual({"k": {"x"}}, state.sync.seen)
 
 
-class LivenessTests(unittest.TestCase):
+    def test_a_state_saved_while_claude_synced_open_loads_and_drops_live_creates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chat-state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "normalisation": normalisation(),
+                        "synced": {"k": {"x": "h"}},
+                        "seen": {"k": ["x"]},
+                        "enrolled": ["Work/a/b"],
+                        "live_creates": {
+                            "k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = load_state(path)
+            save_state(path, state)
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual({"k": {"x": "h"}}, saved["synced"])
+            self.assertEqual(["Work/a/b"], saved["enrolled"])
+            self.assertNotIn("live_creates", saved)
+
+
+    def test_a_login_an_older_version_saved_is_kept_as_a_recorded_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chat-state.json"
+            path.write_text(
+                json.dumps({"version": 2, "logins": {"/root": [ACCOUNT, 5]}}), encoding="utf-8"
+            )
+
+            self.assertEqual({"/root": {ACCOUNT: 5}}, load_state(path).logins)
+
+
+class LoginTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -108,61 +147,62 @@ class LivenessTests(unittest.TestCase):
 
         self.assertEqual(ACCOUNT, last_known_account(self.root))
 
-    def test_nothing_is_live_while_claude_is_closed(self):
-        self.sign_in(ACCOUNT)
-
-        self.assertFalse(is_live(self.root, ACCOUNT, False, NOW_MS, {}))
-
-    def test_the_signed_in_accounts_folders_are_live(self):
-        self.sign_in(ACCOUNT)
-        logins = {str(self.root): (ACCOUNT, NOW_MS - 10 * SWITCH_GRACE_MS)}
-
-        self.assertTrue(is_live(self.root, ACCOUNT, True, NOW_MS, logins))
-        self.assertFalse(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_every_folder_is_live_for_two_minutes_after_a_switch(self):
-        self.sign_in(ACCOUNT)
-        logins = {str(self.root): (ACCOUNT, NOW_MS - SWITCH_GRACE_MS + 1)}
-
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_an_undated_login_or_a_config_write_in_flight_counts_as_live(self):
-        self.sign_in(ACCOUNT)
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, {}))
-        logins = {str(self.root): (ACCOUNT, 0)}
-        (self.root / "config.json.journal").write_text("", encoding="utf-8")
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, logins))
-
-    def test_an_unreadable_login_counts_as_live(self):
-        self.assertTrue(is_live(self.root, OTHER, True, NOW_MS, {}))
-
-    def test_claudes_log_dates_a_login_and_ignores_a_later_logout(self):
+    def test_every_login_in_claudes_log_is_read_and_a_logout_is_not(self):
         log = self.root / "main.log"
-        stamp = "2026-09-22 14:56:48"
         log.write_text(
             login_line("2026-09-22 14:39:21", OTHER, ACCOUNT)
-            + login_line(stamp, ACCOUNT, OTHER)
+            + "2026-09-22 14:50:00 [info] [account] Login-state transition (loggedOut: false → true, "
+            "uuid: {} → <none>), clearing oauth cache\n".format(ACCOUNT)
+            + login_line("2026-09-22 14:56:48", ACCOUNT, OTHER)
+            + login_line("2026-09-22 15:00:00", OTHER, ACCOUNT.upper()),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            [
+                (ACCOUNT, local_ms("2026-09-22 14:39:21")),
+                (OTHER, local_ms("2026-09-22 14:56:48")),
+                (ACCOUNT, local_ms("2026-09-22 15:00:00")),
+            ],
+            logins_in_app_log(log, NOW_MS),
+        )
+
+    def test_each_account_keeps_its_first_login_after_the_log_rotates(self):
+        log = self.root / "main.log"
+        log.write_text(login_line("2026-09-22 14:39:21", OTHER, ACCOUNT), encoding="utf-8")
+        logins = {}
+        record_logins([self.root], logins, NOW_MS, lambda _root: log)
+
+        log.write_text(
+            login_line("2026-09-22 14:56:48", ACCOUNT, OTHER)
             + login_line("2026-09-22 15:00:00", OTHER, ACCOUNT),
             encoding="utf-8",
         )
-        expected = int(time.mktime(time.strptime("2026-09-22 15:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000
+        record_logins([self.root], logins, NOW_MS, lambda _root: log)
 
-        self.assertEqual(expected, login_dated_by_app(log, ACCOUNT, NOW_MS))
-        self.assertIsNone(login_dated_by_app(log, OTHER, NOW_MS))
+        self.assertEqual(
+            {
+                str(self.root): {
+                    ACCOUNT: local_ms("2026-09-22 14:39:21"),
+                    OTHER: local_ms("2026-09-22 14:56:48"),
+                }
+            },
+            logins,
+        )
 
-    def test_a_login_the_log_does_not_name_is_dated_at_first_sight(self):
+    def test_a_login_the_log_does_not_name_counts_from_first_sight(self):
         self.sign_in(ACCOUNT)
-        logins = {}
+        logins = {str(self.root): {OTHER: 5}}
 
-        observe_logins([self.root], logins, NOW_MS, lambda _root: None)
+        record_logins([self.root], logins, NOW_MS, lambda _root: None)
 
-        self.assertEqual((ACCOUNT, NOW_MS), logins[str(self.root)])
+        self.assertEqual({str(self.root): {OTHER: 5, ACCOUNT: NOW_MS}}, logins)
 
     def test_a_login_time_in_the_future_is_read_as_now(self):
         log = self.root / "main.log"
         log.write_text(login_line("2099-01-01 00:00:00", OTHER, ACCOUNT), encoding="utf-8")
 
-        self.assertEqual(NOW_MS, login_dated_by_app(log, ACCOUNT, NOW_MS))
+        self.assertEqual([(ACCOUNT, NOW_MS)], logins_in_app_log(log, NOW_MS))
 
 
 class EnrollmentTests(unittest.TestCase):
@@ -208,39 +248,51 @@ class EnrollmentTests(unittest.TestCase):
     def test_a_folder_joins_once_claude_writes_a_chat_there_after_the_login(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "config.json").write_text(
-                json.dumps({"lastKnownAccountUuid": ACCOUNT}), encoding="utf-8"
-            )
             fresh = self.target(root, ACCOUNT, "fresh")
             stale = self.target(root, ACCOUNT, "stale")
-            other = self.target(root, OTHER, "other")
             login_ms = int(time.time() * 1000) - 60_000
-            for target in (fresh, stale, other):
+            for target in (fresh, stale):
                 (target.path / "local_x.json").write_text("{}", encoding="utf-8")
             old = (login_ms - 60_000) / 1000
             os.utime(stale.path / "local_x.json", (old, old))
 
             joined = new_login_targets(
                 self.config(root),
-                [fresh, stale, other],
+                [fresh, stale],
                 set(),
-                {Path(os.path.abspath(root))},
-                {str(Path(os.path.abspath(root))): (ACCOUNT, login_ms)},
+                {str(Path(os.path.abspath(root))): {ACCOUNT: login_ms}},
             )
 
             self.assertEqual(["Work/{}/fresh".format(ACCOUNT)], joined)
 
-    def test_nothing_joins_while_claude_is_closed(self):
+    def test_an_account_that_logged_in_earlier_joins_while_another_is_signed_in(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            # A is signed in now. B logged in earlier and Claude saved a chat for B.
             (root / "config.json").write_text(
                 json.dumps({"lastKnownAccountUuid": ACCOUNT}), encoding="utf-8"
             )
-            fresh = self.target(root, ACCOUNT, "fresh")
-            (fresh.path / "local_x.json").write_text("{}", encoding="utf-8")
+            folder = self.target(root, OTHER, "b")
+            (folder.path / "local_x.json").write_text("{}", encoding="utf-8")
+            now_ms = int(time.time() * 1000)
 
             joined = new_login_targets(
-                self.config(root), [fresh], set(), set(), {str(root): (ACCOUNT, 0)}
+                self.config(root),
+                [folder],
+                set(),
+                {str(root): {OTHER: now_ms - 600_000, ACCOUNT: now_ms - 60_000}},
+            )
+
+            self.assertEqual(["Work/{}/b".format(OTHER)], joined)
+
+    def test_a_folder_of_an_account_with_no_login_here_stays_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            leftover = self.target(root, "cccccccc-0000-4000-8000-000000000003", "w")
+            (leftover.path / "local_x.json").write_text("{}", encoding="utf-8")
+
+            joined = new_login_targets(
+                self.config(root), [leftover], set(), {str(root): {ACCOUNT: 0}}
             )
 
             self.assertEqual([], joined)

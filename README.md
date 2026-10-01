@@ -31,23 +31,20 @@ Tools, Apple's build tools.
 
 The installer adds a background helper and a small **Sync** menu-bar item.
 It does not replace the Claude app.
-A new account joins the sync once you start a chat in it.
+A new account joins the sync after you chat in it and then switch accounts or
+quit Claude.
 
 ## Switch accounts
 
 1. Sign out of Claude.
 2. Sign in to the other account.
-3. Keep working. Chats sync when you switch accounts and when you quit
-   Claude, not every time a chat saves.
+3. Claude closes, syncs, and opens again by itself.
 
-With pin and group sync on, Claude restarts once right after the switch. Claude
-keeps pins and groups in its own locked database and reloads each account's
-groups from its servers at sign-in, so they can only be carried over with
-Claude closed. The restart copies the organization from the account you just
-left.
-
-Without it, if chats arrive after Claude loaded the new account, the **Sync**
-menu says how many and offers **Restart Claude now**.
+Chats sync when you switch accounts and when you quit Claude. Nothing syncs
+while Claude is open. Claude keeps your chats in memory and keeps pins and
+groups in a database it locks while it runs, so sync waits until Claude is
+closed. The restart after a switch also copies pins and groups from the account
+you just left.
 
 A small status window shows what is happening, even if macOS hides notifications.
 The **Sync** menu keeps the latest status.
@@ -61,9 +58,9 @@ The **Sync** menu keeps the latest status.
 - Only folders of accounts you really use take part. Leftover folders from an
   old Mac are ignored.
 
-Pins and groups follow the account you use: the one you just left is the
-source when you switch, and the one you are signed into wins otherwise.
-Routines sync when Claude quits.
+Pins and groups follow the account you use. When you switch, the account you
+just left is the source. Otherwise the account you are signed into wins.
+Routines sync at the same moments as chats.
 
 ## Update
 

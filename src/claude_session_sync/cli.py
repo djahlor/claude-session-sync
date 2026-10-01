@@ -7,7 +7,6 @@ import contextlib
 import math
 import os
 import subprocess
-import stat
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -32,8 +31,6 @@ LayoutFactory = Callable[[Config], Any]
 RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
-LAUNCH_CONFIRMATION_TIMEOUT_SECONDS = 5.0
-LAUNCH_GUARD_FILENAME = "launch-pending.json"
 SWITCH_WRITER_WAIT_SECONDS = 15.0
 SWITCH_REVALIDATION_RETRIES = 2
 
@@ -97,9 +94,8 @@ class CliDependencies:
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
-    launch_confirmation_timeout: float = LAUNCH_CONFIRMATION_TIMEOUT_SECONDS
-    # Live sync needs the built-in planner, which knows the chat state and
-    # which folders a running Claude holds. None means: use it when it is built in.
+    # Chat sync with state needs the built-in planner, which knows the chat
+    # state. None means: use it when it is built in.
     live_sync: Optional[bool] = None
 
 
@@ -281,13 +277,6 @@ def _parser() -> argparse.ArgumentParser:
     setup_mode = setup.add_mutually_exclusive_group(required=True)
     setup_mode.add_argument("--dry-run", action="store_true")
     setup_mode.add_argument("--apply", action="store_true")
-    clear_guard = commands.add_parser(
-        "clear-launch-guard",
-        help="clear a failed launch guard after confirming Claude is stopped",
-    )
-    clear_guard_mode = clear_guard.add_mutually_exclusive_group(required=True)
-    clear_guard_mode.add_argument("--dry-run", action="store_true")
-    clear_guard_mode.add_argument("--apply", action="store_true")
     for name in ("install", "uninstall"):
         installer = commands.add_parser(name, help="{} macOS adapters".format(name))
         mode = installer.add_mutually_exclusive_group(required=True)
@@ -419,169 +408,6 @@ def _normalized_path(path: Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
-def _wait_for_managed_profile_to_start(
-    config: Config,
-    dependencies: CliDependencies,
-    profile: Any,
-    timeout: float,
-) -> str:
-    if timeout <= 0:
-        return "disabled"
-    selected_root = _normalized_path(Path(profile.data_root))
-    deadline = dependencies.monotonic() + timeout
-    while True:
-        remaining = deadline - dependencies.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        try:
-            processes = _running_processes(
-                config,
-                dependencies,
-                timeout=max(
-                    0.001,
-                    min(PROCESS_PROBE_TIMEOUT_SECONDS, remaining),
-                ),
-            )
-        except subprocess.TimeoutExpired:
-            return "probe-timeout"
-        if any(
-            _normalized_path(Path(getattr(process, "user_data_dir"))) == selected_root
-            for process in processes
-            if getattr(process, "user_data_dir", None) is not None
-        ):
-            return "confirmed"
-        if processes:
-            return "wrong-profile"
-        remaining = deadline - dependencies.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
-
-
-def _launch_guard_path(config: Config) -> Path:
-    return config.state_dir / LAUNCH_GUARD_FILENAME
-
-
-def _write_launch_guard(config: Config, profile_name: str) -> None:
-    from .filesystem import atomic_write_bytes, ensure_private_directory
-
-    ensure_private_directory(config.state_dir)
-    document = {
-        "profile": profile_name,
-        "version": 1,
-    }
-    encoded = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
-    path = _launch_guard_path(config)
-    atomic_write_bytes(path, encoded)
-    os.chmod(str(path), 0o600)
-
-
-def _valid_launch_guard(config: Config) -> Optional[str]:
-    path = _launch_guard_path(config)
-    if not os.path.lexists(str(path)):
-        return None
-    metadata = os.lstat(str(path))
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2_048:
-        raise ValueError("launch guard is invalid")
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(document, dict)
-        or document.get("version") != 1
-        or not isinstance(document.get("profile"), str)
-        or not document["profile"]
-    ):
-        raise ValueError("launch guard is invalid")
-    return document["profile"]
-
-
-def _clear_launch_guard(config: Config) -> None:
-    from .filesystem import durable_unlink
-
-    path = _launch_guard_path(config)
-    if _valid_launch_guard(config) is None:
-        return
-    durable_unlink(path)
-
-
-def _reconcile_launch_guard(
-    config: Config,
-    dependencies: CliDependencies,
-) -> bool:
-    guarded_profile_name = _valid_launch_guard(config)
-    if guarded_profile_name is None:
-        return True
-    guarded_profile = next(
-        (
-            profile
-            for profile in config.profiles
-            if profile.name == guarded_profile_name
-        ),
-        None,
-    )
-    if guarded_profile is None:
-        return False
-    try:
-        running = _running_processes(config, dependencies)
-    except subprocess.TimeoutExpired:
-        return False
-    guarded_root = _normalized_path(Path(guarded_profile.data_root))
-    guarded_running = any(
-        _normalized_path(Path(getattr(process, "user_data_dir"))) == guarded_root
-        for process in running
-        if getattr(process, "user_data_dir", None) is not None
-    )
-    if not guarded_running:
-        return False
-    _clear_launch_guard(config)
-    return True
-
-
-def _launch_guard_failure(config: Config) -> int:
-    try:
-        return int(_valid_launch_guard(config) is not None)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-        return 1
-
-
-def _clear_launch_guard_command(
-    config: Config,
-    dependencies: CliDependencies,
-    *,
-    apply: bool,
-) -> tuple[dict, int]:
-    from .locking import ExclusiveFileLock, LockUnavailableError
-
-    handoff = ExclusiveFileLock(
-        config.state_dir / "switch-handoff.lock",
-        mode="auto",
-        timeout=0,
-    )
-    try:
-        handoff.acquire()
-    except LockUnavailableError:
-        return {"state": "blocked_switch", "reason": "handoff-running"}, 1
-    try:
-        try:
-            if _running_processes(config, dependencies):
-                return {"state": "blocked_app", "reason": "app-running"}, 1
-        except subprocess.TimeoutExpired:
-            return {"state": "blocked_probe", "reason": "process-timeout"}, 1
-        try:
-            pending = _valid_launch_guard(config) is not None
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            return {"state": "blocked_invalid", "reason": "invalid-guard"}, 1
-        if not pending:
-            return {"state": "noop", "counts": {"guards": 0}}, 0
-        if apply:
-            _clear_launch_guard(config)
-        return {
-            "state": "cleared" if apply else "planned",
-            "counts": {"guards": 1},
-        }, 0
-    finally:
-        handoff.release()
-
-
 def _switch_chat_result(
     config: Config, dependencies: CliDependencies, started: float
 ) -> dict:
@@ -656,13 +482,6 @@ def _run_switch(
         return 1
 
     try:
-        if not _reconcile_launch_guard(config, dependencies):
-            _write(
-                {"state": "blocked_switch", "reason": "launch-unconfirmed"},
-                as_json=as_json,
-                stream=output,
-            )
-            return 1
         if not _wait_for_managed_processes_to_exit(
             config,
             dependencies,
@@ -676,56 +495,47 @@ def _run_switch(
             return 1
         record_progress(config, "syncing")
         started = dependencies.clock()
-        payload = _switch_chat_result(config, dependencies, started)
-        payload.update(
-            run_adapters(
-                config,
-                dependencies,
-                lambda: bool(_running_processes(config, dependencies)),
-                adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
-                after_account_switch=getattr(arguments, "after_account_switch", False),
-            )
-        )
-        payload["progress"] = finish_progress(config, payload)
-        if payload["progress"] == "needs-attention":
-            _write(payload, as_json=as_json, stream=output)
-            return 1
-        if not arguments.no_launch:
-            confirmation_enabled = dependencies.launch_confirmation_timeout > 0
-            if confirmation_enabled:
-                _write_launch_guard(config, profile.name)
-            if dependencies.launcher is None:
-                from .launcher import Launcher
-
-                Launcher().launch(profile.launch_command)
-            else:
-                dependencies.launcher.launch(profile.launch_command)
-            if confirmation_enabled:
-                confirmation = _wait_for_managed_profile_to_start(
+        try:
+            payload = _switch_chat_result(config, dependencies, started)
+            payload.update(
+                run_adapters(
                     config,
                     dependencies,
-                    profile,
-                    dependencies.launch_confirmation_timeout,
+                    lambda: bool(_running_processes(config, dependencies)),
+                    adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
+                    after_account_switch=getattr(arguments, "after_account_switch", False),
                 )
-                if confirmation != "confirmed":
-                    _write(
-                        {
-                            "state": "launch_unconfirmed",
-                            "reason": confirmation,
-                        },
-                        as_json=as_json,
-                        stream=output,
-                    )
-                    return 1
-                _clear_launch_guard(config)
-        _write(
-            payload,
-            as_json=as_json,
-            stream=output,
-        )
-        return 0
+            )
+            payload["progress"] = finish_progress(config, payload)
+        finally:
+            # Claude was closed for this switch. It reopens even when the sync
+            # failed, so a failed sync never leaves Claude closed.
+            launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
+        if launch_failed:
+            _write(
+                {"state": "launch_failed", "reason": "launch-command-failed"},
+                as_json=as_json,
+                stream=output,
+            )
+            return 1
+        if not arguments.no_launch:
+            payload["launch"] = "started"
+        _write(payload, as_json=as_json, stream=output)
+        return 0 if payload["progress"] == "finished" else 1
     finally:
         handoff.release()
+
+
+def _launch(profile: Any, dependencies: CliDependencies) -> bool:
+    """Start the profile's Claude. False when the launch command failed."""
+
+    from .launcher import LaunchError, Launcher
+
+    try:
+        (dependencies.launcher or Launcher()).launch(profile.launch_command)
+    except LaunchError:
+        return False
+    return True
 
 
 def _find_profile(config: Config, requested_name: str) -> Any:
@@ -740,7 +550,7 @@ def _busy_reason(error: Exception) -> Optional[str]:
     if name in ("TransactionBusyError", "BlockingIOError", "TimeoutError"):
         return "busy"
     if name == "AppRunningError":
-        return "app-running"
+        return "claude-open"
     return None
 
 
@@ -784,7 +594,7 @@ def _keep_sidebar(config: Config, *, apply: bool) -> tuple:
 
     from .enrollment import selected_targets
     from .layout import request_adoption
-    from .liveness import last_known_account
+    from .logins import last_known_account
     from .store import SessionStore
 
     if not config.sync_sidebar_layout:
@@ -815,9 +625,10 @@ def _chat_run_summary(run: Any, duration_ms: int) -> dict:
     counts = {
         "operations": receipt.operation_count,
         "planned": len(plan.operations),
-        "skipped": receipt.skipped_count,
     }
     counts.update(_problem_counts(run))
+    if run.recovered_runs:
+        counts["recovered_runs"] = run.recovered_runs
     payload = {
         "bytes": receipt.bytes_copied,
         "counts": counts,
@@ -826,8 +637,6 @@ def _chat_run_summary(run: Any, duration_ms: int) -> dict:
         "run_id": receipt.run_id,
         "state": receipt.status,
     }
-    if run.restart_suggested:
-        payload["restart_suggested"] = run.restart_suggested
     if any(run.problems.get(kind) for kind in ("tied", "lost", "unreadable", "future")):
         payload["next_action"] = "run-plan-report"
     return payload
@@ -840,15 +649,13 @@ def _chat_plan_summary(run: Any, duration_ms: int) -> dict:
     for kind in ("create", "replace", "retire"):
         counts[kind + "s"] = sum(1 for operation in plan.operations if operation.kind == kind)
     counts.update(_problem_counts(run))
-    if run.restart_suggested:
-        payload["restart_suggested"] = run.restart_suggested
     return payload
 
 
 def _problem_counts(run: Any) -> dict:
     counts = {
         kind: run.problems[kind]
-        for kind in ("live", "tied", "lost", "unreadable", "future")
+        for kind in ("tied", "lost", "unreadable", "future")
         if run.problems.get(kind)
     }
     if run.plan.ignored_targets:
@@ -900,7 +707,6 @@ def _write_plan_report(config: Config, run: Any) -> None:
                 }
                 for problem in plan.problems
             ],
-            "live_folders": sorted(labels.get(key, "?") for key in plan.live_targets),
             "ignored_folders": plan.ignored_targets,
         },
     )
@@ -917,7 +723,6 @@ def _live_chat_payload(arguments: Any, config: Config, deps: CliDependencies) ->
             deps.engine_factory(config),
             prefer=getattr(arguments, "prefer", None),
             prefer_session=getattr(arguments, "session", None),
-            running_processes=lambda loaded: _running_processes(loaded, deps),
         )
     except ChatStateError:
         return {
@@ -965,18 +770,8 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         except subprocess.TimeoutExpired as error:
             _write(_chat_failure(error), as_json=arguments.as_json, stream=output)
             return 1
-        if running and not live:
-            record_progress(config, "waiting-for-Claude")
-            _write(
-                {
-                    "state": "skipped",
-                    "reason": "app-running",
-                    "progress": "waiting-for-Claude",
-                },
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0 if arguments.command == "auto" else 1
+        if running:
+            return _report_waiting(arguments, config, output, "claude-open")
         record_progress(config, "syncing")
         started = deps.clock()
         try:
@@ -996,18 +791,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         except Exception as error:
             reason = _busy_reason(error)
             if reason is not None:
-                state = (
-                    "waiting-for-Claude"
-                    if reason == "app-running"
-                    else "waiting-for-sync"
-                )
-                record_progress(config, state)
-                _write(
-                    {"state": "skipped", "reason": reason, "progress": state},
-                    as_json=arguments.as_json,
-                    stream=output,
-                )
-                return 0 if arguments.command == "auto" else 1
+                return _report_waiting(arguments, config, output, reason)
             payload = _chat_failure(error)
         payload.update(
             run_adapters(
@@ -1019,7 +803,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         )
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
-        return 0 if payload["progress"] == "finished" else 1
+        return _exit_code(arguments, payload["progress"])
     except Exception:
         record_progress(
             config, "needs-attention", reason="sync-error", next_action="run-doctor"
@@ -1027,6 +811,30 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         raise
     finally:
         handoff.release()
+
+
+def _report_waiting(arguments, config: Config, output: TextIO, reason: str) -> int:
+    """Nothing was written. The next quit, switch, or retry syncs."""
+
+    if reason == "claude-open":
+        payload = {"state": "waiting", "reason": reason, "progress": "waiting-for-Claude"}
+    else:
+        payload = {"state": "skipped", "reason": reason, "progress": "waiting-for-sync"}
+    record_progress(config, payload["progress"])
+    _write(payload, as_json=arguments.as_json, stream=output)
+    return _exit_code(arguments, payload["progress"])
+
+
+def _exit_code(arguments, progress: str) -> int:
+    """`auto` succeeds while it waits, because the watcher runs it again.
+
+    A manual `sync` succeeds only when everything finished.
+    """
+
+    if progress == "finished":
+        return 0
+    waiting = progress in ("waiting-for-Claude", "waiting-for-sync")
+    return 0 if waiting and arguments.command == "auto" else 1
 
 
 def run(
@@ -1156,11 +964,7 @@ def run(
             if _live_sync(deps):
                 from .chat_sync import plan_chat_sync
 
-                chat_run = plan_chat_sync(
-                    config,
-                    deps.planner_factory(config),
-                    running_processes=lambda loaded: _running_processes(loaded, deps),
-                )
+                chat_run = plan_chat_sync(config, deps.planner_factory(config))
                 plan = chat_run.plan
                 if arguments.report:
                     _write_plan_report(config, chat_run)
@@ -1211,14 +1015,6 @@ def run(
             return _run_sync(arguments, config, deps, output)
         if arguments.command == "switch":
             return _run_switch(arguments, config, deps, output)
-        if arguments.command == "clear-launch-guard":
-            payload, exit_code = _clear_launch_guard_command(
-                config,
-                deps,
-                apply=arguments.apply,
-            )
-            _write(payload, as_json=False, stream=output)
-            return exit_code
         if arguments.command == "rollback":
             started = deps.clock()
             receipt = deps.engine_factory(config).rollback(arguments.run_id)
@@ -1232,16 +1028,13 @@ def run(
         if arguments.command == "status":
             running = _running_processes(config, deps)
             watcher_error = watcher_failure(config.state_dir)
-            launch_guard_failure = _launch_guard_failure(config)
             layout_failure = adapter_failure(config, "layout")
             routine_failure = adapter_failure(config, "routines")
             abandoned = abandoned_preparation_count(config.state_dir)
             progress = current_progress(
                 config,
                 app_running=bool(running),
-                live=_live_sync(deps),
                 failures=watcher_error
-                + launch_guard_failure
                 + layout_failure
                 + routine_failure
                 + abandoned,
@@ -1253,7 +1046,6 @@ def run(
                     "bytes": 0,
                     "counts": {
                         "abandoned_preparations": abandoned,
-                        "launch_guards": launch_guard_failure,
                         "layout_failures": layout_failure,
                         "profiles": len(config.profiles),
                         "routine_failures": routine_failure,
@@ -1265,8 +1057,6 @@ def run(
                     "state": (
                         "app-running"
                         if running
-                        else "launch-unconfirmed"
-                        if launch_guard_failure
                         else "layout-failed"
                         if layout_failure
                         else "routines-failed"
@@ -1285,7 +1075,6 @@ def run(
                 config,
                 deps,
                 lambda: bool(_running_processes(config, deps)),
-                _launch_guard_failure(config),
             )
             _write(
                 payload,

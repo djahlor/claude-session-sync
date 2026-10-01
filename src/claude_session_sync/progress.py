@@ -25,22 +25,22 @@ def record_progress(config, state: str, **fields) -> dict:
 
 
 def finish_progress(config, payload: dict) -> str:
-    outcomes = [payload.get("state")]
-    outcomes.extend(
-        payload[key].get("state") for key in ("routines", "layout") if key in payload
-    )
+    """Record how a sync ended. A component deferred because Claude reopened is unfinished."""
+
+    adapters = [payload[key] for key in ("routines", "layout") if key in payload]
+    outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
     attention = any(
-        value not in ("committed", "partial", "synced", "noop", "disabled", "deferred")
+        value not in ("committed", "synced", "noop", "disabled", "deferred")
         for value in outcomes
     )
-    attention = attention or any(
-        payload.get(key, {}).get("reporting_error") for key in ("routines", "layout")
-    )
-    state = "needs-attention" if attention else "finished"
-    fields = {"result": payload}
-    if payload.get("restart_suggested"):
-        fields["restart_suggested"] = payload["restart_suggested"]
-    record_progress(config, state, **fields)
+    attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
+    if attention:
+        state = "needs-attention"
+    elif any(adapter.get("state") == "deferred" for adapter in adapters):
+        state = "waiting-for-Claude"
+    else:
+        state = "finished"
+    record_progress(config, state, result=payload)
     return state
 
 
@@ -63,8 +63,8 @@ def _writer_active(config) -> bool:
         os.close(descriptor)
 
 
-def current_progress(config, *, app_running: bool, failures: int = 0, live: bool = False) -> dict:
-    """Aggregate status. With live sync an open Claude is normal, not a wait."""
+def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
+    """Aggregate status. Nothing syncs while Claude is open, so an open Claude is a wait."""
 
     payload = read_status(config.state_dir, "sync-progress.json")
     watcher = read_status(config.state_dir, "watcher-status.json")
@@ -90,7 +90,7 @@ def current_progress(config, *, app_running: bool, failures: int = 0, live: bool
         state = "needs-attention"
     elif failures or saved_state in ("needs-attention", "unreadable"):
         state = "needs-attention"
-    elif app_running and not live:
+    elif app_running:
         state = "waiting-for-Claude"
     elif saved_state == "finished":
         state = "finished"
@@ -107,9 +107,6 @@ def current_progress(config, *, app_running: bool, failures: int = 0, live: bool
         "checking-account": "wait-for-automatic-restart",
     }
     result = {"progress": state, "last_success_at": payload.get("last_success_at")}
-    if live and payload.get("restart_suggested"):
-        result["restart_suggested"] = payload["restart_suggested"]
-        actions["finished"] = "restart-claude-to-see-new-chats"
     if watcher.get("automatic_restart") is True:
         result["automatic_restart"] = True
         result["restart_phase"] = restart_phase

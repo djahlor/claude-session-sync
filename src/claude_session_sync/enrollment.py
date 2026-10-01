@@ -1,15 +1,17 @@
 """Choose which sidebar folders take part in sync.
 
 Under the ``logins`` policy only real logins take part: the approved targets,
-plus any folder Claude itself wrote a chat to after a login on this Mac.
-Leftover folders from other Macs or from account switches are ignored.
+plus any folder Claude itself wrote a chat to after its account logged in on
+this Mac. Leftover folders from other Macs never had a login here, so they
+stay out. Whether Claude runs, and which account is signed in now, do not
+matter.
 """
 
 import os
 from pathlib import Path
 from typing import Iterable, List, Sequence, Set, Tuple
 
-from .liveness import Logins, last_known_account
+from .logins import Logins
 
 
 # A chat Claude saved this long after the login began was written by Claude,
@@ -60,32 +62,26 @@ def new_login_targets(
     config,
     targets: Sequence,
     selected_keys: Set[str],
-    running_roots: Set[Path],
     logins: Logins,
 ) -> List[str]:
-    """Folders of the signed-in account that Claude wrote a chat to after the login began."""
+    """Folders outside sync holding a chat Claude saved after their account's first login here."""
 
     if config.target_policy != "logins":
         return []
-    profiles = {profile.name: profile for profile in config.profiles}
+    roots = {
+        profile.name: Path(os.path.abspath(os.path.expanduser(os.fspath(profile.data_root))))
+        for profile in config.profiles
+    }
     found = []
     for target in targets:
         key = target_key(target)
-        if key in selected_keys:
+        root = roots.get(target.profile_name)
+        if key in selected_keys or root is None:
             continue
-        profile = profiles.get(target.profile_name)
-        if profile is None:
+        first_login = logins.get(str(root), {}).get(target.account_id.lower())
+        if first_login is None:
             continue
-        root = Path(os.path.abspath(os.path.expanduser(os.fspath(profile.data_root))))
-        if root not in running_roots:
-            continue
-        account = last_known_account(root)
-        login = logins.get(str(root))
-        if account is None or login is None or login[0] != account:
-            continue
-        if target.account_id.lower() != account:
-            continue
-        if _written_since(Path(target.path), login[1] + LOGIN_SETTLE_MS):
+        if _written_since(Path(target.path), first_login + LOGIN_SETTLE_MS):
             found.append(key)
     return sorted(found)
 

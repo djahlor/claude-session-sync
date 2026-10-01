@@ -392,25 +392,29 @@ class CliAutomaticTests(unittest.TestCase):
                 "plan_id=plan-auto run_id=run-auto state=committed progress=finished\n",
             )
 
-    def test_auto_succeeds_with_explicit_skip_while_app_is_running(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: config(root),
-                planner_factory=lambda _config: self.fail("planner must not run"),
-                process_probe=FakeProcessProbe((object(),)),
-            )
+    def test_a_sync_waits_without_writing_while_claude_is_open(self):
+        for command, expected_exit in (("auto", 0), ("sync", 1)):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                out = io.StringIO()
+                dependencies = CliDependencies(
+                    config_loader=lambda path: config(root),
+                    planner_factory=lambda _config: self.fail("planner must not run"),
+                    process_probe=FakeProcessProbe((object(),)),
+                )
 
-            exit_code = run(
-                ["--config", str(root / "config.json"), "auto"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
+                exit_code = run(
+                    ["--config", str(root / "config.json"), command],
+                    dependencies=dependencies,
+                    stdout=out,
+                    stderr=io.StringIO(),
+                )
 
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(out.getvalue(), "state=skipped reason=app-running progress=waiting-for-Claude\n")
+                self.assertEqual(expected_exit, exit_code)
+                self.assertEqual(
+                    "state=waiting reason=claude-open progress=waiting-for-Claude\n",
+                    out.getvalue(),
+                )
 
     def test_auto_succeeds_with_explicit_skip_when_transaction_is_busy(self):
         class TransactionBusyError(Exception):
@@ -533,7 +537,6 @@ class CliSwitchTests(unittest.TestCase):
                 clock=lambda: next(ticks),
                 monotonic=wait_clock,
                 sleeper=wait_clock.sleep,
-                launch_confirmation_timeout=0,
             )
 
             exit_code = run(
@@ -625,7 +628,6 @@ class CliSwitchTests(unittest.TestCase):
                 process_probe=FakeProcessProbe(),
                 launcher=FakeLauncher(launches),
                 clock=lambda: 2.0,
-                launch_confirmation_timeout=0,
             )
             second_dependencies = CliDependencies(
                 config_loader=lambda path: loaded,
@@ -634,7 +636,6 @@ class CliSwitchTests(unittest.TestCase):
                 ),
                 process_probe=FakeProcessProbe(),
                 launcher=FakeLauncher(launches),
-                launch_confirmation_timeout=0,
             )
 
             first = threading.Thread(
@@ -678,180 +679,59 @@ class CliSwitchTests(unittest.TestCase):
             )
             self.assertEqual(len(launches), 1)
 
-    def test_switch_confirms_the_selected_profile_before_success(self):
-        class RunningProfile:
-            def __init__(self, data_root):
-                self.user_data_dir = data_root
-
+    def test_a_failed_launch_command_reports_a_launch_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            process_probe = SequencedProcessProbe(
-                ((), (RunningProfile(loaded.profiles[0].data_root),))
-            )
-            wait_clock = ManualClock()
-            launches = []
-            ticks = iter((2.0, 2.001, 2.003))
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=process_probe,
-                launcher=FakeLauncher(launches),
-                clock=lambda: next(ticks),
-                monotonic=wait_clock,
-                sleeper=wait_clock.sleep,
-                launch_confirmation_timeout=1,
-            )
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(launches), 1)
-            self.assertFalse((loaded.state_dir / "launch-pending.json").exists())
-
-    def test_unconfirmed_launch_fails_closed_and_blocks_another_switch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            wait_clock = ManualClock()
-            launches = []
-            planner = FakePlanner(planned)
+            work = replace(config(root).profiles[0], launch_command=("/bin/sh", "-c", "exit 3"))
+            loaded = replace(config(root), profiles=(work, config(root).profiles[1]))
+            planner = FakePlanner(Plan(1, "digest", (), (), (), "plan-safe", 0))
             dependencies = CliDependencies(
                 config_loader=lambda path: loaded,
                 planner_factory=lambda _config: planner,
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=FakeProcessProbe(),
-                launcher=FakeLauncher(launches),
-                clock=lambda: 2.0,
-                monotonic=wait_clock,
-                sleeper=wait_clock.sleep,
-                launch_confirmation_timeout=0.2,
-            )
-            first_out = io.StringIO()
-
-            first_result = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=first_out,
-                stderr=io.StringIO(),
-            )
-            second_out = io.StringIO()
-            second_result = run(
-                ["--config", str(root / "config.json"), "switch", "Personal"],
-                dependencies=dependencies,
-                stdout=second_out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(first_result, 1)
-            self.assertEqual(
-                first_out.getvalue(),
-                "state=launch_unconfirmed reason=timeout\n",
-            )
-            self.assertTrue((loaded.state_dir / "launch-pending.json").is_file())
-            self.assertEqual(second_result, 1)
-            self.assertEqual(
-                second_out.getvalue(),
-                "state=blocked_switch reason=launch-unconfirmed\n",
-            )
-            self.assertEqual(len(launches), 1)
-            self.assertEqual(len(planner.requests), 1)
-
-    def test_wrong_profile_confirmation_fails_closed(self):
-        class RunningProfile:
-            def __init__(self, data_root):
-                self.user_data_dir = data_root
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            planned = Plan(1, "digest", (), (), (), "plan-safe", 0)
-            receipt = RunReceipt(None, "noop", "plan-safe", 0, 0)
-            process_probe = SequencedProcessProbe(
-                ((), (RunningProfile(loaded.profiles[1].data_root),))
-            )
-            wait_clock = ManualClock()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: FakePlanner(planned),
-                engine_factory=lambda _config: FakeEngine(receipt),
-                process_probe=process_probe,
-                launcher=FakeLauncher([]),
-                clock=lambda: 2.0,
-                monotonic=wait_clock,
-                sleeper=wait_clock.sleep,
-                launch_confirmation_timeout=1,
-            )
-            out = io.StringIO()
-
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(
-                out.getvalue(),
-                "state=launch_unconfirmed reason=wrong-profile\n",
-            )
-            self.assertTrue((loaded.state_dir / "launch-pending.json").is_file())
-
-            second_out = io.StringIO()
-            second_result = run(
-                ["--config", str(root / "config.json"), "switch", "Personal"],
-                dependencies=dependencies,
-                stdout=second_out,
-                stderr=io.StringIO(),
-            )
-            self.assertEqual(second_result, 1)
-            self.assertEqual(
-                second_out.getvalue(),
-                "state=blocked_switch reason=launch-unconfirmed\n",
-            )
-            self.assertTrue((loaded.state_dir / "launch-pending.json").is_file())
-
-    def test_guard_for_a_removed_profile_stays_fail_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            loaded.state_dir.mkdir(parents=True)
-            guard = loaded.state_dir / "launch-pending.json"
-            guard.write_text(
-                json.dumps({"profile": "Removed", "version": 1}) + "\n",
-                encoding="utf-8",
-            )
-            out = io.StringIO()
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                planner_factory=lambda _config: self.fail("planner must not run"),
+                engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan-safe", 0, 0)),
                 process_probe=FakeProcessProbe(),
             )
+            outputs = []
+            for _attempt in range(2):
+                out = io.StringIO()
+                exit_code = run(
+                    ["--config", str(root / "config.json"), "switch", "Work"],
+                    dependencies=dependencies,
+                    stdout=out,
+                    stderr=io.StringIO(),
+                )
+                outputs.append((exit_code, out.getvalue()))
 
-            exit_code = run(
-                ["--config", str(root / "config.json"), "switch", "Work"],
-                dependencies=dependencies,
-                stdout=out,
-                stderr=io.StringIO(),
-            )
-
-            self.assertEqual(exit_code, 1)
             self.assertEqual(
-                out.getvalue(),
-                "state=blocked_switch reason=launch-unconfirmed\n",
+                [(1, "state=launch_failed reason=launch-command-failed\n")] * 2, outputs
             )
-            self.assertTrue(guard.is_file())
+            self.assertEqual(2, len(planner.requests), "a failed launch must not block the next switch")
+
+    def test_a_claude_that_has_not_shown_up_yet_does_not_block_the_next_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The command succeeds, but Claude never shows up in the process list.
+            work = replace(config(root).profiles[0], launch_command=("/usr/bin/true",))
+            loaded = replace(config(root), profiles=(work, config(root).profiles[1]))
+            planner = FakePlanner(Plan(1, "digest", (), (), (), "plan-safe", 0))
+            dependencies = CliDependencies(
+                config_loader=lambda path: loaded,
+                planner_factory=lambda _config: planner,
+                engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan-safe", 0, 0)),
+                process_probe=FakeProcessProbe(),
+            )
+            exit_codes = [
+                run(
+                    ["--config", str(root / "config.json"), "switch", "Work"],
+                    dependencies=dependencies,
+                    stdout=io.StringIO(),
+                    stderr=io.StringIO(),
+                )
+                for _attempt in range(2)
+            ]
+
+            self.assertEqual([0, 0], exit_codes)
+            self.assertEqual(2, len(planner.requests))
 
     def test_switch_waits_for_the_automatic_writer_then_retries(self):
         class TransactionBusyError(Exception):
@@ -881,7 +761,6 @@ class CliSwitchTests(unittest.TestCase):
                 launcher=FakeLauncher(events),
                 clock=lambda: next(ticks),
                 sleeper=sleeps.append,
-                launch_confirmation_timeout=0,
             )
 
             exit_code = run(
@@ -936,7 +815,6 @@ class CliSwitchTests(unittest.TestCase):
                 launcher=FakeLauncher(events),
                 clock=lambda: next(ticks),
                 sleeper=lambda _seconds: None,
-                launch_confirmation_timeout=0,
             )
 
             exit_code = run(
@@ -978,7 +856,6 @@ class CliSwitchTests(unittest.TestCase):
                 process_probe=FakeProcessProbe(),
                 launcher=FakeLauncher(events),
                 clock=lambda: next(ticks),
-                launch_confirmation_timeout=0,
             )
 
             out = io.StringIO()
@@ -993,6 +870,69 @@ class CliSwitchTests(unittest.TestCase):
             self.assertEqual(events[0], ("apply", "plan-safe"))
             self.assertEqual(events[1], ("launch", loaded.profiles[1].launch_command))
             self.assertEqual("finished", json.loads(out.getvalue())["progress"])
+
+    def test_a_failed_switch_sync_still_reopens_claude_and_reports_it(self):
+        class BrokenEngine(FakeEngine):
+            def apply(self, plan):
+                raise RuntimeError("private engine detail")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            invalid = Plan(1, "digest", (), (), (InvalidReplica(root / "bad", "malformed JSON"),), "plan", 0)
+            valid = Plan(1, "digest", (), (), (), "plan", 0)
+            for plan, engine, expected_state in (
+                (invalid, FakeEngine(None), "blocked_invalid"),
+                (valid, BrokenEngine(None), "failed"),
+            ):
+                with self.subTest(expected_state=expected_state):
+                    events = []
+                    out = io.StringIO()
+                    exit_code = run(
+                        ["--config", str(root / "config.json"), "switch", "Work", "--json"],
+                        dependencies=CliDependencies(
+                            config_loader=lambda path: loaded,
+                            planner_factory=lambda _config, plan=plan: FakePlanner(plan),
+                            engine_factory=lambda _config, engine=engine: engine,
+                            process_probe=FakeProcessProbe(),
+                            launcher=FakeLauncher(events),
+                        ),
+                        stdout=out,
+                        stderr=io.StringIO(),
+                    )
+
+                    payload = json.loads(out.getvalue())
+                    self.assertEqual(1, exit_code)
+                    self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
+                    self.assertEqual(expected_state, payload["state"])
+                    self.assertEqual("needs-attention", payload["progress"])
+                    self.assertEqual("started", payload["launch"])
+
+    def test_claude_reopens_even_when_the_switch_crashes_after_it_closed(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = config(root)
+            events = []
+            errors = io.StringIO()
+            with mock.patch("claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")):
+                exit_code = run(
+                    ["--config", str(root / "config.json"), "switch", "Work"],
+                    dependencies=CliDependencies(
+                        config_loader=lambda path: loaded,
+                        planner_factory=lambda _config: FakePlanner(Plan(1, "digest", (), (), (), "plan", 0)),
+                        engine_factory=lambda _config: FakeEngine(RunReceipt(None, "noop", "plan", 0, 0)),
+                        process_probe=FakeProcessProbe(),
+                        launcher=FakeLauncher(events),
+                    ),
+                    stdout=io.StringIO(),
+                    stderr=errors,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("disk full", errors.getvalue())
+            self.assertEqual([("launch", loaded.profiles[0].launch_command)], events)
 
     def test_switch_refuses_to_sync_or_launch_while_managed_app_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1019,63 +959,6 @@ class CliSwitchTests(unittest.TestCase):
 
 
 class CliRecoveryAndHealthTests(unittest.TestCase):
-    def test_clear_launch_guard_supports_dry_run_then_explicit_recovery(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            loaded = config(root)
-            loaded.state_dir.mkdir(parents=True)
-            guard = loaded.state_dir / "launch-pending.json"
-            guard.write_text(
-                json.dumps({"profile": "Work", "version": 1}) + "\n",
-                encoding="utf-8",
-            )
-            dependencies = CliDependencies(
-                config_loader=lambda path: loaded,
-                process_probe=FakeProcessProbe(),
-            )
-            dry_run_out = io.StringIO()
-
-            self.assertEqual(
-                run(
-                    [
-                        "--config",
-                        str(root / "config.json"),
-                        "clear-launch-guard",
-                        "--dry-run",
-                    ],
-                    dependencies=dependencies,
-                    stdout=dry_run_out,
-                    stderr=io.StringIO(),
-                ),
-                0,
-            )
-            self.assertTrue(guard.exists())
-            self.assertEqual(
-                dry_run_out.getvalue(),
-                "state=planned counts={'guards': 1}\n",
-            )
-
-            apply_out = io.StringIO()
-            self.assertEqual(
-                run(
-                    [
-                        "--config",
-                        str(root / "config.json"),
-                        "clear-launch-guard",
-                        "--apply",
-                    ],
-                    dependencies=dependencies,
-                    stdout=apply_out,
-                    stderr=io.StringIO(),
-                ),
-                0,
-            )
-            self.assertFalse(guard.exists())
-            self.assertEqual(
-                apply_out.getvalue(),
-                "state=cleared counts={'guards': 1}\n",
-            )
-
     def test_rollback_json_reports_only_recovery_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1144,7 +1027,6 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                     "bytes": 0,
                     "counts": {
                         "abandoned_preparations": 0,
-                        "launch_guards": 0,
                         "layout_failures": 0,
                         "profiles": 2,
                         "routine_failures": 0,

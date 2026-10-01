@@ -12,11 +12,10 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
 from .filesystem import sweep_stale_stages
-from .liveness import last_known_account
 from .model import Plan, RunReceipt, SyncRequest
 
 
@@ -29,8 +28,9 @@ class ChatRun:
     plan: Plan
     receipt: Optional[RunReceipt] = None
     problems: Dict[str, int] = field(default_factory=dict)
-    restart_suggested: int = 0
     newly_enrolled: int = 0
+    # Runs a killed process left open, closed before this run applied.
+    recovered_runs: int = 0
 
 
 def plan_chat_sync(
@@ -39,13 +39,12 @@ def plan_chat_sync(
     *,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
-    running_processes: Optional[Callable] = None,
 ) -> ChatRun:
     """Plan without writing anything, including the state file."""
 
     state = _load(config)
-    plan = _plan(planner, config, state, prefer, prefer_session, running_processes)
-    return _summary(plan, state)
+    plan = _plan(planner, config, state, prefer, prefer_session)
+    return _summary(plan)
 
 
 def run_chat_sync(
@@ -55,22 +54,23 @@ def run_chat_sync(
     *,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
-    running_processes: Optional[Callable] = None,
     clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
 ) -> ChatRun:
     path = state_path(config.state_dir)
     state = _load(config)
     on_disk = encode_state(state)
-    plan = _plan(planner, config, state, prefer, prefer_session, running_processes)
+    plan = _plan(planner, config, state, prefer, prefer_session)
     context = plan.context
     if context is None:
         # A planner without chat state: apply as the engine always did.
         receipt = engine.apply(plan) if not plan.invalid_replicas else None
         return ChatRun(plan, receipt)
     if plan.invalid_replicas:
-        return _summary(plan, state)
+        return _summary(plan)
 
-    _forget_stale_live_creates(state, context)
+    # Before anything is recorded: files a half-undone run left must not be
+    # remembered as seen, or undoing that run would make them look lost.
+    recovered_runs = engine.close_interrupted_runs()
     for snapshot in context.snapshots:
         state.sync.seen.setdefault(snapshot.key, set()).update(snapshot.records)
     if encode_state(state) != on_disk:
@@ -80,16 +80,17 @@ def run_chat_sync(
         on_disk = encode_state(state)
 
     sweep_stale_stages((target.path for target in context.targets.values()), time.time())
-    receipt = engine.apply(plan, live_guard=context.is_live_path)
+    receipt = engine.apply(plan)
     _remember_placements(state, context, receipt)
 
     state.sync = _settle(state.sync, context.rescan())
-    if receipt.status in ("committed", "partial", "noop"):
+    if receipt.status in ("committed", "noop"):
         state.last_success_ms = clock_ms()
     if encode_state(state) != on_disk:
         save_state(path, state)
-    run = _summary(plan, state)
+    run = _summary(plan)
     run.receipt = receipt
+    run.recovered_runs = recovered_runs
     return run
 
 
@@ -132,7 +133,7 @@ def _load(config):
         raise ChatStateError(str(error)) from error
 
 
-def _plan(planner, config, state, prefer, prefer_session, running_processes) -> Plan:
+def _plan(planner, config, state, prefer, prefer_session) -> Plan:
     request = SyncRequest(config)
     try:
         parameters = inspect.signature(planner.plan).parameters
@@ -142,10 +143,7 @@ def _plan(planner, config, state, prefer, prefer_session, running_processes) -> 
         if prefer is not None or prefer_session is not None:
             raise ValueError("this planner cannot settle ties")
         return planner.plan(request)
-    options: Dict[str, Any] = {"state": state, "prefer": prefer, "prefer_session": prefer_session}
-    if running_processes is not None and "running_processes" in parameters:
-        options["running_processes"] = running_processes
-    return planner.plan(request, **options)
+    return planner.plan(request, state=state, prefer=prefer, prefer_session=prefer_session)
 
 
 def _settle(sync, snapshots):
@@ -154,50 +152,13 @@ def _settle(sync, snapshots):
     return settle(sync, snapshots)
 
 
-def _summary(plan: Plan, state) -> ChatRun:
+def _summary(plan: Plan) -> ChatRun:
     context = plan.context
     run = ChatRun(plan)
     run.problems = dict(Counter(problem.kind for problem in plan.problems))
     if context is not None:
         run.newly_enrolled = len(context.newly_enrolled)
-        run.restart_suggested = sum(
-            len(entry.get("ids", ()))
-            for key, entry in state.live_creates.items()
-            if key in context.data_roots
-            and context.running_pids.get(str(context.data_roots[key]))
-        )
     return run
-
-
-def _signed_in(state, context, key: str):
-    """(account, login time, pids) for a folder of the signed-in account, else None."""
-
-    root = context.data_roots.get(key)
-    if root is None:
-        return None
-    pids = context.running_pids.get(str(root))
-    login = state.logins.get(str(root))
-    account = last_known_account(Path(root))
-    target = context.targets[key]
-    if not pids or login is None or account is None or login[0] != account:
-        return None
-    if target.account_id.lower() != account:
-        return None
-    return account, login[1], list(pids)
-
-
-def _forget_stale_live_creates(state, context) -> None:
-    """Claude reads a folder again when it restarts or the login changes."""
-
-    for key in list(state.live_creates):
-        entry = state.live_creates[key]
-        current = _signed_in(state, context, key)
-        if current is None or (
-            current[0] != entry["account"]
-            or current[1] != entry["login_ms"]
-            or sorted(current[2]) != sorted(entry["pids"])
-        ):
-            del state.live_creates[key]
 
 
 def _remember_placements(state, context, receipt: RunReceipt) -> None:
@@ -211,16 +172,5 @@ def _remember_placements(state, context, receipt: RunReceipt) -> None:
         if operation.source_state_hash is not None:
             # What sync placed is this folder's version in step with the others.
             state.sync.synced.setdefault(key, {})[operation.session_id] = operation.source_state_hash
-        if operation.kind != "create":
-            continue
-        state.sync.seen.setdefault(key, set()).add(operation.session_id)
-        if key not in context.live:
-            continue
-        current = _signed_in(state, context, key)
-        if current is None:
-            continue  # a folder of another account, read when that account signs in
-        entry = state.live_creates.get(key)
-        if entry is None or (entry["account"], entry["login_ms"]) != current[:2]:
-            entry = {"account": current[0], "login_ms": current[1], "pids": current[2], "ids": []}
-            state.live_creates[key] = entry
-        entry["ids"] = sorted(set(entry["ids"]) | {operation.session_id})
+        if operation.kind == "create":
+            state.sync.seen.setdefault(key, set()).add(operation.session_id)

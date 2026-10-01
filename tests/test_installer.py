@@ -45,6 +45,13 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(str(Path(document["profiles"][0]["data_root"]) / "config.json"), automatic[automatic.index("--account-file") + 1])
             self.assertEqual("Work", automatic[automatic.index("--profile") + 1])
             self.assertLess(automatic.index("--profile"), automatic.index("--"))
+            document["sync_sidebar_layout"] = True
+            with_layout = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            self.assertEqual(
+                automatic[: automatic.index("--")],
+                with_layout[: with_layout.index("--")],
+                "a switch restarts Claude whether or not pins and groups sync",
+            )
 
     def test_dry_run_describes_install_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -361,6 +368,22 @@ class InstallerTests(unittest.TestCase):
 
             launch_agent = layout.launch_agent.read_text(encoding="utf-8")
             self.assertIn(str(custom_state / "watcher-status.json"), launch_agent)
+
+    def test_setup_removes_a_launch_guard_an_older_version_left(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            layout = self.layout(home)
+            installer = Installer(layout, runner=FakeCommandRunner())
+            installer.install(dry_run=False)
+            guard = load_config(layout.config_path).state_dir / "launch-pending.json"
+            guard.parent.mkdir(parents=True, exist_ok=True)
+            guard.write_text('{"profile": "Work", "version": 1}\n', encoding="utf-8")
+
+            installer.setup(dry_run=True)
+            self.assertTrue(guard.exists(), "a dry run changes nothing")
+            installer.setup(dry_run=False)
+
+            self.assertFalse(guard.exists())
 
     def test_setup_applies_supplied_config_in_the_same_transaction(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -10,7 +10,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import strict_json as json
 from .chat_model import (
@@ -27,7 +27,7 @@ from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
 from .hash_cache import HashCache
-from .liveness import Liveness, default_app_log, observe_logins
+from .logins import default_app_log, record_logins
 from .model import (
     Conflict,
     Discovery,
@@ -47,36 +47,13 @@ PLAN_VERSION = 2
 
 @dataclass
 class PlanContext:
-    """What the run needs after planning: state, liveness, and a way to rescan."""
+    """What the run needs after planning: state, the folders, and a way to rescan."""
 
     state: ChatState
     targets: Dict[str, Target]
-    data_roots: Dict[str, Path]
     snapshots: List[Snapshot]
-    live: Set[str]
-    liveness: Liveness
-    running_pids: Dict[str, Tuple[int, ...]]
     newly_enrolled: List[str] = field(default_factory=list)
     rescan: Optional[Callable[[], List[Snapshot]]] = None
-
-    def is_live_path(self, destination: Path) -> bool:
-        """Whether the folder holding destination may be held in memory by Claude now."""
-
-        folder = str(Path(destination).parent)
-        for key, target in self.targets.items():
-            if str(target.path) == folder:
-                return self.liveness.partition_is_live(
-                    self.data_roots[key], target.account_id
-                )
-        return True  # an unknown folder is never safe to change
-
-
-def default_running_processes(config: Config) -> tuple:
-    from .processes import managed_processes
-
-    return managed_processes(
-        config.profiles, executable=config.claude_executable, timeout=5.0
-    )
 
 
 class Planner:
@@ -84,13 +61,11 @@ class Planner:
         self,
         store: Optional[SessionStore] = None,
         *,
-        running_processes: Optional[Callable[[Config], Sequence[Any]]] = None,
         clock_ns: Callable[[], int] = time.time_ns,
         app_log: Optional[Path] = None,
         state: Optional[ChatState] = None,
     ) -> None:
         self._store = store
-        self._running_processes = running_processes or default_running_processes
         self._clock_ns = clock_ns
         self._app_log = app_log
         self._state = state
@@ -102,11 +77,8 @@ class Planner:
         state: Optional[ChatState] = None,
         prefer: Optional[str] = None,
         prefer_session: Optional[str] = None,
-        running_processes: Optional[Callable[[Config], Sequence[Any]]] = None,
     ) -> Plan:
         config = request.config
-        if running_processes is not None:
-            self._running_processes = running_processes
         if len(config.profiles) > 1 and not config.acknowledge_cross_profile_copy:
             raise ConfigError(
                 "acknowledge_cross_profile_copy must be true when multiple profiles are enabled"
@@ -134,24 +106,8 @@ class Planner:
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
 
-        def running_processes() -> Sequence[Any]:
-            return tuple(self._running_processes(config))
-
-        def running_roots() -> Set[Path]:
-            return {
-                _normalized(process.user_data_dir)
-                for process in running_processes()
-                if getattr(process, "user_data_dir", None) is not None
-            }
-
-        processes = running_processes()
-        running = {
-            _normalized(process.user_data_dir)
-            for process in processes
-            if getattr(process, "user_data_dir", None) is not None
-        }
         app_log = self._app_log or default_app_log()
-        observe_logins(
+        record_logins(
             roots.values(),
             state.logins,
             now_ms,
@@ -163,7 +119,6 @@ class Planner:
             config,
             found.targets,
             {target_key(target) for target in selected},
-            running,
             state.logins,
         )
         if newly:
@@ -189,22 +144,10 @@ class Planner:
         scanned = store.scan_targets(selected)
         invalid.extend(scanned.invalid_replicas)
         targets = {target_key(target): target for target in selected}
-        data_roots = {key: roots[target.profile_name] for key, target in targets.items()}
         snapshots, index = _snapshots(targets, scanned)
 
-        liveness = Liveness(running_roots, state.logins, clock_ms=lambda: self._clock_ns() // 1_000_000)
-        live = {
-            key
-            for key, target in targets.items()
-            if liveness.partition_is_live(data_roots[key], target.account_id)
-        }
-        pids: Dict[str, List[int]] = {}
-        for process in processes:
-            if getattr(process, "user_data_dir", None) is not None:
-                pids.setdefault(str(_normalized(process.user_data_dir)), []).append(process.pid)
-
         prefer_key = _resolve_prefer(prefer, targets)
-        decided = plan_rules(snapshots, state.sync, live, prefer_key, prefer_session)
+        decided = plan_rules(snapshots, state.sync, prefer_key, prefer_session)
         operations = tuple(_operation(action, targets, index) for action in decided.actions)
 
         invalid_tuple = tuple(
@@ -231,11 +174,7 @@ class Planner:
         context = PlanContext(
             state=state,
             targets=targets,
-            data_roots=data_roots,
             snapshots=snapshots,
-            live=live,
-            liveness=liveness,
-            running_pids={root: tuple(sorted(values)) for root, values in pids.items()},
             newly_enrolled=list(newly),
             rescan=rescan,
         )
@@ -248,7 +187,6 @@ class Planner:
             hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest(),
             total_bytes,
             problems=tuple(decided.problems),
-            live_targets=tuple(sorted(live)),
             ignored_targets=len(ignored),
             context=context,
         )

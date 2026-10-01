@@ -112,10 +112,9 @@ class Plan:
     invalid_replicas: Tuple[InvalidReplica, ...]
     plan_id: str
     total_bytes: int
-    # Sessions left alone on purpose (live, tied, lost, unreadable, future).
+    # Sessions left alone on purpose (tied, lost, unreadable, future).
     # They never block the rest of the plan.
     problems: Tuple[Any, ...] = ()
-    live_targets: Tuple[str, ...] = ()
     ignored_targets: int = 0
     context: Any = field(default=None, compare=False, repr=False)
 
@@ -132,8 +131,6 @@ class RunReceipt:
     plan_id: str
     operation_count: int
     bytes_copied: int
-    # Operations left for the next run because a file moved on or turned live.
-    skipped_count: int = 0
     applied: Tuple[Operation, ...] = ()
 
 

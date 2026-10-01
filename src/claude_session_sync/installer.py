@@ -264,9 +264,6 @@ class Installer:
                     "--account-file", str(defaults[0].data_root / "config.json"),
                     "--profile", defaults[0].name,
                 )
-                if configured.sync_sidebar_layout:
-                    # Pins and groups move only with Claude closed.
-                    account_arguments += ("--restart-on-switch", "1")
         arguments = (
             (
                 str(self.layout.watcher_binary),
@@ -654,6 +651,7 @@ class Installer:
                     self._stage_layout_helper(helper)
                 self._validate_staged_plists(staging, config_data)
                 transaction.stop_watcher()
+                self._remove_retired_launch_guard(config_data)
                 report = self._apply_setup(actions, config_data, watcher, helper)
                 remaining = self._planned_actions(config_data)
                 if remaining:
@@ -666,6 +664,17 @@ class Installer:
                 return report
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def _remove_retired_launch_guard(self, config_data: Optional[bytes]) -> None:
+        """Older versions left this file after a slow launch. Nothing reads it now."""
+
+        if config_data is not None:
+            state_dir = self._load_config_bytes(config_data).state_dir
+        elif self.layout.config_path.exists():
+            state_dir = load_config(self.layout.config_path).state_dir
+        else:
+            return
+        (state_dir / "launch-pending.json").unlink(missing_ok=True)
 
     def _validate_staged_plists(
         self, staging: Path, config_data: Optional[bytes]

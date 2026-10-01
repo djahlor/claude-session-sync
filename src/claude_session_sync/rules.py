@@ -2,11 +2,12 @@
 
 Ported from vinlim/claude-desktop-sync (0BSD). Rule numbers follow its DESIGN.md:
 R3 one side changed, R4 both changed, R5 new records, R6 deletes, R7 lost
-records, R8 kept copies, R9 live partitions, R11 unreadable or future copies.
+records, R8 kept copies, R11 unreadable or future copies. R9, live partitions,
+does not apply here, because every sync runs with Claude closed.
 Actions for one session are emitted in the order they must happen.
 """
 
-from typing import List, Optional, Set
+from typing import List, Optional
 
 from .chat_model import (
     CreateRecord,
@@ -25,7 +26,6 @@ from .chat_model import (
 def plan(
     snapshots: List[Snapshot],
     state: SyncState,
-    live: Set[str],
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
 ) -> RulePlan:
@@ -37,11 +37,11 @@ def plan(
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
         preferred = prefer if prefer_session in (None, session_id) else None
-        _plan_session(session_id, snapshots, state, live, preferred, result)
+        _plan_session(session_id, snapshots, state, preferred, result)
     return result
 
 
-def _plan_session(session_id, snapshots, state, live, prefer, result) -> None:
+def _plan_session(session_id, snapshots, state, prefer, result) -> None:
     holders = [s for s in snapshots if session_id in s.records]
     unusable = [s for s in holders if not s.records[session_id].usable]
     if unusable:  # R11: nothing about this session can be judged
@@ -59,8 +59,7 @@ def _plan_session(session_id, snapshots, state, live, prefer, result) -> None:
     if not entombed:
         if holders:
             _plan_record(
-                session_id, snapshots, holders, state, live, prefer, result,
-                explained=set(),
+                session_id, snapshots, holders, state, prefer, result, explained=set()
             )
         return
 
@@ -68,20 +67,18 @@ def _plan_session(session_id, snapshots, state, live, prefer, result) -> None:
         # Only a folder holding the marker has an explained absence. A folder
         # that lost the chat without one is still reported as lost.
         chosen = _plan_record(
-            session_id, snapshots, holders, state, live, prefer, result,
+            session_id, snapshots, holders, state, prefer, result,
             explained={s.key for s in entombed},
         )
         # With the copies tied nothing can be put back, so the tombstone stays.
         # Without it, the deleting partition would read as having lost the record.
         if chosen:
-            for snapshot in entombed:
-                _unless_live(
-                    snapshot, session_id, live, result,
-                    RetireTombstone(session_id, target=snapshot.key),
-                )
+            result.actions.extend(
+                RetireTombstone(session_id, target=snapshot.key) for snapshot in entombed
+            )
         return
 
-    _plan_delete(session_id, snapshots, entombed[0], live, result)
+    _plan_delete(session_id, snapshots, entombed[0], result)
 
 
 def _used_after_delete(session_id, holders, entombed) -> bool:
@@ -91,38 +88,19 @@ def _used_after_delete(session_id, holders, entombed) -> bool:
     return max(s.records[session_id].last_activity_at for s in holders) > deleted_at
 
 
-def _plan_delete(session_id, snapshots, tombstone_source, live, result) -> None:
+def _plan_delete(session_id, snapshots, tombstone_source, result) -> None:
     for snapshot in snapshots:
-        record_remains = False
         if session_id in snapshot.records:
-            record_remains = not _unless_live(
-                snapshot, session_id, live, result,
-                RetireRecord(session_id, target=snapshot.key),
-            )
+            result.actions.append(RetireRecord(session_id, target=snapshot.key))
         elif session_id in snapshot.orphan_tmps:
-            _unless_live(
-                snapshot, session_id, live, result,
-                RetireTmp(session_id, target=snapshot.key),
-            )
-        if session_id not in snapshot.tombstones and not record_remains:
+            result.actions.append(RetireTmp(session_id, target=snapshot.key))
+        if session_id not in snapshot.tombstones:
             result.actions.append(
                 CreateTombstone(session_id, source=tombstone_source.key, target=snapshot.key)
             )
 
 
-def _unless_live(snapshot, session_id, live, result, action) -> bool:
-    """R9: an existing file in a live partition is left alone."""
-
-    if snapshot.key in live:
-        result.problems.append(Problem("live", session_id, snapshot.key))
-        return False
-    result.actions.append(action)
-    return True
-
-
-def _plan_record(
-    session_id, snapshots, holders, state, live, prefer, result, explained
-) -> bool:
+def _plan_record(session_id, snapshots, holders, state, prefer, result, explained) -> bool:
     """Return whether a version was chosen."""
 
     untouched = [s for s in holders if _still_as_synced(s, session_id, state)]
@@ -148,9 +126,8 @@ def _plan_record(
         if held.state_hash != winning.state_hash:
             # R8: only a copy still as synced and strictly behind holds nothing unique.
             superseded = target in untouched and winning.last_activity_at > held.last_activity_at
-            _unless_live(
-                target, session_id, live, result,
-                ReplaceRecord(session_id, source=winner.key, target=target.key, keep=not superseded),
+            result.actions.append(
+                ReplaceRecord(session_id, source=winner.key, target=target.key, keep=not superseded)
             )
 
     for target in snapshots:
