@@ -53,4 +53,5 @@ jobs:
           python -m pip install --no-deps --target "$wheel_root" dist/*.whl
           PYTHONPATH="$wheel_root" python -c 'from claude_session_sync.cli import main; raise SystemExit(main())' --config "$RUNNER_TEMP/test-config.json" setup --automatic-targets --sync-layout --sync-routines --dry-run
       - run: zsh -n install.sh
+      - run: zsh -n get.sh
       - run: zsh -n "Install Claude Session Sync.command"
