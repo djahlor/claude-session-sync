@@ -331,10 +331,11 @@ class RecoveryTests(ChatSyncFixture):
             ),
         )
 
-    def test_a_run_whose_rollback_also_failed_is_closed_and_the_folders_agree(self):
+    def test_a_run_whose_rollback_failed_blocks_chat_sync_until_it_is_rolled_back(self):
         from unittest.mock import patch
         from claude_session_sync import transaction
 
+        z = "33333333-3333-4333-8333-333333333333"
         self.write(self.a, X, title="from a", lastActivityAt=200)
         self.write(self.b, X, title="t", lastActivityAt=100)
         self.write(self.a, Y)
@@ -349,13 +350,41 @@ class RecoveryTests(ChatSyncFixture):
         ):
             with self.assertRaises(transaction.RecoveryError):
                 self.sync()
-        self.assertEqual("RECOVERY_REQUIRED", self.phases()[0])
+        self.assertEqual(["RECOVERY_REQUIRED"], self.phases())
+        self.write(self.a, z)
+
+        with self.assertRaises(transaction.RecoveryPendingError):
+            self.sync()
+
+        self.assertEqual(["RECOVERY_REQUIRED"], self.phases())
+        self.assertIsNone(self.read(self.b, z), "nothing more is written over a half-restored run")
+        run_id = next((self.config.state_dir / "runs").iterdir()).name
+        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(run_id)
+        self.assertEqual("t", self.read(self.b, X)["title"])
 
         run = self.sync()
 
-        self.assertEqual(1, run.recovered_runs)
+        self.assertEqual(0, run.recovered_runs)
         self.assertEqual("from a", self.read(self.b, X)["title"])
         self.assertIsNotNone(self.read(self.b, Y))
+        self.assertIsNotNone(self.read(self.b, z))
+
+    def test_a_rollback_cut_short_is_not_closed_as_recovered(self):
+        from unittest.mock import patch
+        from claude_session_sync import transaction
+        from claude_session_sync.journal import RunJournal
+
+        self.write(self.a, X)
+        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        run_id = next((self.config.state_dir / "runs").iterdir()).name
+        RunJournal.load(self.config.state_dir, run_id).set_phase("ABORTING")
+
+        with self.assertRaises(transaction.RecoveryPendingError):
+            self.sync()
+
+        self.assertEqual(["ABORTING"], self.phases())
 
     def test_staged_copies_left_by_a_killed_run_are_swept(self):
         leftover = self.b / ".local_{}.json.0123.stage".format(X)

@@ -32,6 +32,9 @@ from .model import RecoveryReceipt, RunReceipt
 PathLike = Union[str, os.PathLike]
 FaultInjector = Callable[[str, str], None]
 WRITE_KINDS = ("copy", "create", "replace")
+# Phases a killed process leaves behind mid-apply. ABORTING (a rollback cut
+# short) and RECOVERY_REQUIRED (a rollback that failed) need a rollback instead.
+APPLY_PHASES = ("JOURNALING", "STAGING", "COMMITTING", "VERIFYING")
 
 
 class TransactionError(RuntimeError):
@@ -141,22 +144,31 @@ class TransactionEngine:
             return receipt
 
     def close_interrupted_runs(self) -> int:
-        """Close runs a killed process left open, keeping what they wrote.
+        """Close runs a killed process left open mid-apply, keeping what they wrote.
 
         Each write is one atomic step toward a version the next plan works out
         again, so a run cut short equals a run whose other steps were skipped.
-        The same holds for a run whose automatic rollback also failed. The
-        journal keeps every file a run replaced or removed, for a manual
-        rollback. A run whose journal cannot be read stays open, and apply
-        refuses until it is recovered. Returns how many runs were closed.
+        The journal keeps every file a run replaced or removed, for a manual
+        rollback. Returns how many runs were closed.
+
+        Raises RecoveryPendingError while a run stays open: one that was
+        rolling back, one whose rollback failed, or one whose journal cannot
+        be read. The caller can then stop before it records anything.
         """
 
         with self._writer_lock():
             try:
                 pending = pending_recovery_runs(self.state_root)
-            except JournalError:
-                return 0
-            return self._finish_interrupted_runs(pending)
+            except JournalError as error:
+                raise RecoveryPendingError(
+                    "journal state is invalid; recovery is required before apply"
+                ) from error
+            closed = self._finish_interrupted_runs(pending)
+            if closed < len(pending):
+                raise RecoveryPendingError(
+                    "{} run(s) require recovery before apply".format(len(pending) - closed)
+                )
+            return closed
 
     @contextmanager
     def _writer_lock(self):
@@ -387,6 +399,8 @@ class TransactionEngine:
             try:
                 journal = RunJournal.load(self.state_root, run_id)
             except JournalError:
+                continue
+            if journal.phase not in APPLY_PHASES:
                 continue
             self._close_as_recovered(journal)
             closed += 1

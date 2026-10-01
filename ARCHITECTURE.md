@@ -69,9 +69,10 @@ window display progress without depending on Notification Center.
    managed Claude process stopped. The engine checks before journaling and
    again before the first write.
 6. A rollback verifies every preimage before it changes live data and never
-   suppresses restore failures. A chat run that a killed process left open is
-   closed by the next chat sync. It keeps what it wrote, and its journal keeps
-   every file it replaced or removed.
+   suppresses restore failures. A chat run that a killed process left open
+   mid-apply is closed by the next chat sync. It keeps what it wrote, and its
+   journal keeps every file it replaced or removed. A rollback that was cut
+   short or failed keeps blocking chat sync until it is finished.
 7. File times never decide. Unknown layouts and symlinks block the run;
    malformed records and equal-activity divergent copies freeze only their
    session instead of being guessed through.

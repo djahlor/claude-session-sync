@@ -68,6 +68,9 @@ def run_chat_sync(
     if plan.invalid_replicas:
         return _summary(plan)
 
+    # Before anything is recorded: files a half-undone run left must not be
+    # remembered as seen, or undoing that run would make them look lost.
+    recovered_runs = engine.close_interrupted_runs()
     for snapshot in context.snapshots:
         state.sync.seen.setdefault(snapshot.key, set()).update(snapshot.records)
     if encode_state(state) != on_disk:
@@ -77,7 +80,6 @@ def run_chat_sync(
         on_disk = encode_state(state)
 
     sweep_stale_stages((target.path for target in context.targets.values()), time.time())
-    recovered_runs = engine.close_interrupted_runs()
     receipt = engine.apply(plan)
     _remember_placements(state, context, receipt)
 
