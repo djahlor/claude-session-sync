@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from claude_session_sync.chat_state import load_state, save_state, state_path
@@ -233,6 +234,51 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual(1, run.newly_enrolled)
         self.assertIsNotNone(self.read(new_folder, X))
         self.assertIsNotNone(self.read(self.a, Y))
+
+    def test_a_new_account_enrolls_and_syncs_history_in_its_first_closed_run(self):
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        leftover_session = "33333333-3333-4333-8333-333333333333"
+        new_folder = self.folder(new_account, A_ORG)
+        leftover = self.b
+        self.config = replace(
+            self.config,
+            approved_targets=(ApprovedTarget("Work", A_ACCOUNT, A_ORG),),
+        )
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 600))
+        self.write(self.a, X)
+        self.write(new_folder, Y)
+        self.write(leftover, leftover_session)
+
+        first = self.sync()
+
+        new_key = "Work/{}/{}".format(new_account, A_ORG)
+        self.assertEqual("committed", first.receipt.status)
+        self.assertEqual(2, first.receipt.operation_count)
+        self.assertEqual(1, first.newly_enrolled)
+        self.assertEqual(1, first.plan.ignored_targets)
+        self.assertIsNotNone(self.read(new_folder, X))
+        self.assertIsNotNone(self.read(self.a, Y))
+        self.assertIsNone(self.read(self.a, leftover_session))
+        self.assertIsNone(self.read(new_folder, leftover_session))
+        self.assertIsNone(self.read(leftover, X))
+        self.assertIsNone(self.read(leftover, Y))
+        self.assertIn(new_key, load_state(state_path(self.config.state_dir)).enrolled)
+        synced_files = [
+            self.a / "local_{}.json".format(X),
+            self.a / "local_{}.json".format(Y),
+            new_folder / "local_{}.json".format(X),
+            new_folder / "local_{}.json".format(Y),
+        ]
+        mtimes = {path: path.stat().st_mtime_ns for path in synced_files}
+
+        repeated = self.sync()
+
+        self.assertEqual("noop", repeated.receipt.status)
+        self.assertEqual(0, repeated.receipt.operation_count)
+        self.assertEqual(0, repeated.newly_enrolled)
+        self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in synced_files})
 
     def test_a_login_stays_recorded_after_claudes_log_rotates(self):
         new_account = "dddddddd-0000-4000-8000-000000000004"

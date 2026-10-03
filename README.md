@@ -86,6 +86,16 @@ Routines sync at the same moments as chats.
 Run the same Terminal command again. Your sync history, backups, and main
 account stay as they are.
 
+Version 0.5.1 includes the new-account enrollment and completion-status fixes.
+Older installed builds can miss a new account during the account-switch restart
+and report completion while pins, groups, or routines still need another pass.
+Updating the repository alone does not update the installed background helper;
+run the installer again to replace it. Check the installed version with:
+
+```sh
+"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" --version
+```
+
 To remove it, run:
 
 ```sh
@@ -102,6 +112,10 @@ If no notification appears, open Terminal and run:
 
 Status tells you whether sync is waiting, running, finished, or needs attention.
 The menu-bar item and status window do not depend on macOS notification banners.
+
+If sync has finished but custom groups are not visible, open the sidebar
+**Filter** menu and choose **Group by → Custom groups**. Each account can have
+its own display setting; **None** hides groups even when their data has synced.
 
 If it needs attention, run:
 
