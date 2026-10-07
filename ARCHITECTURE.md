@@ -126,7 +126,8 @@ organization. The routine adapter discovers the same approved targets as chat
 sync and merges task records by ID after Claude terminates. A first run unions
 unique tasks and uses manifest modification time for differing copies. Later
 runs compare every target with a private snapshot, which makes deletions and new
-empty accounts unambiguous.
+empty accounts unambiguous. A routine's permission mode and saved approvals
+travel with it and merge field by field; run history stays with each account.
 
 The task instruction files stay in Claude's shared scheduled-task directory.
 Before any manifest write, the adapter confirms every selected instruction file

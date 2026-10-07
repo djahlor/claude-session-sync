@@ -110,16 +110,11 @@ class RoutineTransformTests(unittest.TestCase):
             {"value": 2}, result.documents[("Work", "b", "org")]["futureState"]
         )
 
-    def test_permissions_and_execution_state_never_travel(self):
+    def test_execution_state_never_travels(self):
         first = task("daily", cron="0 8 * * *")
-        first.update(
-            permissionMode="bypassPermissions",
-            lastRunAt="yesterday",
-            approvedPermissions=[{"toolName": "Bash"}],
-            futureField=True,
-        )
+        first.update(lastRunAt="yesterday", futureField=True)
         second = task("daily")
-        second.update(permissionMode="default", lastRunAt="today")
+        second.update(lastRunAt="today")
         result = transform_routine_manifests(
             (
                 sample("a", 10, manifest(first, runRetries={"daily": {"attempts": 3}})),
@@ -129,17 +124,124 @@ class RoutineTransformTests(unittest.TestCase):
         )
 
         first_after = result.documents[("Work", "a", "org")]["scheduledTasks"][0]
-        second_after = result.documents[("Work", "b", "org")]["scheduledTasks"][0]
         new_after = result.documents[("Work", "new", "org")]["scheduledTasks"][0]
         self.assertEqual("0 9 * * *", first_after["cronExpression"])
-        self.assertEqual("bypassPermissions", first_after["permissionMode"])
         self.assertEqual("yesterday", first_after["lastRunAt"])
         self.assertTrue(first_after["futureField"])
-        self.assertEqual("default", second_after["permissionMode"])
-        self.assertNotIn("approvedPermissions", second_after)
-        self.assertNotIn("permissionMode", new_after)
         self.assertNotIn("lastRunAt", new_after)
+        self.assertNotIn("futureField", new_after)
         self.assertNotIn("runRetries", result.documents[("Work", "new", "org")])
+
+    def test_permission_settings_reach_every_account(self):
+        baseline = manifest(task("daily"))
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), baseline
+        )
+        approved = [{"toolName": "Bash", "ruleContent": "git status"}]
+        chosen = dict(
+            task("daily"), permissionMode="auto", approvedPermissions=approved
+        )
+        newer_run = dict(task("daily"), lastRunAt="today")
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest(chosen)),
+                sample("b", 20, manifest(newer_run)),
+                sample("new", 0, None),
+            ),
+            snapshot=snapshot,
+        )
+
+        for name in ("a", "b", "new"):
+            after = result.documents[("Work", name, "org")]["scheduledTasks"][0]
+            self.assertEqual("auto", after["permissionMode"])
+            self.assertEqual(approved, after["approvedPermissions"])
+        self.assertEqual(
+            "today",
+            result.documents[("Work", "b", "org")]["scheduledTasks"][0]["lastRunAt"],
+        )
+
+    def test_permission_change_replaces_an_older_choice(self):
+        before = dict(task("daily"), permissionMode="bypassPermissions")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(before)
+        )
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest(dict(task("daily"), permissionMode="auto"))),
+                sample("b", 20, manifest(before)),
+            ),
+            snapshot=snapshot,
+        )
+
+        self.assertEqual(
+            "auto", result.manifest["scheduledTasks"][0]["permissionMode"]
+        )
+
+    def test_copy_without_a_mode_never_erases_one(self):
+        chosen = dict(task("daily"), permissionMode="bypassPermissions")
+        first_sync = transform_routine_manifests(
+            (sample("a", 10, manifest(chosen)), sample("b", 20, manifest(task("daily"))))
+        )
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), first_sync.manifest)
+        stale_new_account = transform_routine_manifests(
+            (
+                sample("a", 10, manifest(chosen)),
+                sample("new", 30, manifest(task("daily"))),
+            ),
+            snapshot=snapshot,
+        )
+
+        for result in (first_sync, stale_new_account):
+            for document in result.documents.values():
+                self.assertEqual(
+                    "bypassPermissions", document["scheduledTasks"][0]["permissionMode"]
+                )
+
+    def test_permission_and_schedule_edits_on_different_accounts_both_survive(self):
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(task("daily"))
+        )
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest(dict(task("daily"), permissionMode="auto"))),
+                sample("b", 20, manifest(task("daily", cron="0 10 * * *"))),
+            ),
+            snapshot=snapshot,
+        )
+
+        merged = result.manifest["scheduledTasks"][0]
+        self.assertEqual("0 10 * * *", merged["cronExpression"])
+        self.assertEqual("auto", merged["permissionMode"])
+
+    def test_removed_mode_propagates_from_a_known_account(self):
+        before = dict(task("daily"), permissionMode="auto")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(before)
+        )
+
+        result = transform_routine_manifests(
+            (sample("a", 10, manifest(task("daily"))), sample("b", 20, manifest(before))),
+            snapshot=snapshot,
+        )
+
+        self.assertNotIn("permissionMode", result.manifest["scheduledTasks"][0])
+
+    def test_malformed_permission_settings_are_rejected(self):
+        for field, value in (
+            ("permissionMode", 1),
+            ("approvedPermissions", {"toolName": "Bash"}),
+            ("approvedPermissions", [{"ruleContent": "git status"}]),
+            ("approvedPermissions", [{"toolName": "Bash", "ruleContent": 5}]),
+            ("approvedPermissions", [{"toolName": "Bash", "expired": "no"}]),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(RoutineError, "invalid"):
+                    transform_routine_manifests(
+                        (sample("a", 10, manifest(dict(task("daily"), **{field: value}))),)
+                    )
 
     def test_local_runtime_changes_do_not_override_a_definition_edit(self):
         baseline = manifest(task("daily"))
@@ -457,12 +559,16 @@ class RoutineSynchronizerTests(unittest.TestCase):
 
         self.assertFalse(self.config.state_dir.exists())
 
-    def test_real_sync_preserves_local_permissions_and_unknown_metadata(self):
+    def test_real_sync_copies_permissions_and_keeps_local_metadata(self):
         first = self.target("a")
         second = self.target("b")
+        approved = [{"toolName": "Read", "ruleContent": "//tmp/**"}]
         first_document = manifest(
             dict(
-                self.daily(), permissionMode="bypassPermissions", lastRunAt="yesterday"
+                self.daily(),
+                permissionMode="bypassPermissions",
+                approvedPermissions=approved,
+                lastRunAt="yesterday",
             ),
             futureState={"local": "a"},
         )
@@ -477,8 +583,10 @@ class RoutineSynchronizerTests(unittest.TestCase):
         second_after = json.loads(second_path.read_text())
         self.assertEqual(first_document, first_after)
         self.assertEqual({"local": "b"}, second_after["futureState"])
-        self.assertNotIn("permissionMode", second_after["scheduledTasks"][0])
-        self.assertNotIn("lastRunAt", second_after["scheduledTasks"][0])
+        copied = second_after["scheduledTasks"][0]
+        self.assertEqual("bypassPermissions", copied["permissionMode"])
+        self.assertEqual(approved, copied["approvedPermissions"])
+        self.assertNotIn("lastRunAt", copied)
         self.assertEqual("noop", self.synchronizer().sync().state)
 
     def test_post_commit_edit_is_detected_against_atomic_snapshot(self):
