@@ -34,7 +34,8 @@ TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 MISSING = object()
 TargetKey = Tuple[str, str, str]
 # Observed in Claude Desktop's CCDScheduledTasks schema. All other fields,
-# including future ones, belong to the destination account and never travel.
+# including run history and future fields, belong to the destination account
+# and never travel.
 DEFINITION_FIELDS = frozenset(
     (
         "id",
@@ -51,6 +52,11 @@ DEFINITION_FIELDS = frozenset(
         "disableJitter",
     )
 )
+# A routine without a permissionMode falls back to its folder's default, which
+# is usually manual. These fields travel too, but each merges on its own, so a
+# copy that never chose a mode cannot erase another account's choice.
+PERMISSION_FIELDS = ("permissionMode", "approvedPermissions")
+SYNCED_FIELDS = DEFINITION_FIELDS.union(PERMISSION_FIELDS)
 
 
 class RoutineError(RuntimeError):
@@ -136,7 +142,7 @@ def _definitions(document: Mapping[str, Any]) -> Dict[str, Any]:
             {
                 key: copy.deepcopy(value)
                 for key, value in task.items()
-                if key in DEFINITION_FIELDS
+                if key in SYNCED_FIELDS
             }
             for task in document["scheduledTasks"]
         ]
@@ -153,12 +159,24 @@ def _destination_manifest(
         local = {
             key: copy.deepcopy(value)
             for key, value in originals.get(definition["id"], {}).items()
-            if key not in DEFINITION_FIELDS
+            if key not in SYNCED_FIELDS
         }
         local.update(copy.deepcopy(definition))
         tasks.append(local)
     document["scheduledTasks"] = tasks
     return document
+
+
+def _valid_approval(rule: Any) -> bool:
+    # Mirrors Claude Desktop's own check for one saved approval.
+    return (
+        isinstance(rule, dict)
+        and isinstance(rule.get("toolName"), str)
+        and isinstance(rule.get("ruleContent", ""), str)
+        and all(
+            isinstance(rule.get(key, False), bool) for key in ("expired", "timeLimited")
+        )
+    )
 
 
 def _validate_manifest(value: Any, label: str) -> Dict[str, Any]:
@@ -189,12 +207,17 @@ def _validate_manifest(value: Any, label: str) -> Dict[str, Any]:
         created_at = task.get("createdAt")
         if isinstance(created_at, bool) or not isinstance(created_at, int):
             raise RoutineError("{} contains an invalid creation time".format(label))
-        for key in ("displayName", "model", "cwd", "sourceBranch"):
+        for key in ("displayName", "model", "cwd", "sourceBranch", "permissionMode"):
             if key in task and not isinstance(task[key], str):
                 raise RoutineError("{} contains an invalid {}".format(label, key))
         for key in ("useWorktree", "disableJitter"):
             if key in task and not isinstance(task[key], bool):
                 raise RoutineError("{} contains an invalid {}".format(label, key))
+        approved = task.get("approvedPermissions", [])
+        if not isinstance(approved, list) or not all(
+            _valid_approval(rule) for rule in approved
+        ):
+            raise RoutineError("{} contains invalid approvedPermissions".format(label))
         cron = task.get("cronExpression")
         fire_at = task.get("fireAt")
         if not (
@@ -226,6 +249,34 @@ def _select_change(label: str, candidates: Sequence[Tuple[int, TargetKey, Any]])
     return _clone(selected[2])
 
 
+def _merge_value(
+    label: str,
+    baseline: Any,
+    values: Sequence[Tuple[int, TargetKey, Any]],
+    known_targets: Set[TargetKey],
+) -> Any:
+    baseline_key = _value_key(baseline)
+    candidates = [
+        (mtime, target, value)
+        for mtime, target, value in values
+        if (value is not MISSING or target in known_targets)
+        and _value_key(value) != baseline_key
+    ]
+    if not candidates:
+        return _clone(baseline)
+    return _select_change(label, candidates)
+
+
+def _field(task: Any, field: str) -> Any:
+    return MISSING if task is MISSING else task.get(field, MISSING)
+
+
+def _without_permissions(task: Any) -> Any:
+    if task is MISSING:
+        return MISSING
+    return {key: value for key, value in task.items() if key not in PERMISSION_FIELDS}
+
+
 def _merge_task(
     key: str,
     baseline: Any,
@@ -233,20 +284,33 @@ def _merge_task(
     known_targets: Set[TargetKey],
     task_maps: Mapping[TargetKey, Mapping[str, Mapping[str, Any]]],
 ) -> Any:
-    candidates = []
-    baseline_key = _value_key(baseline)
-    for sample in samples:
-        if not sample.exists:
-            continue
-        current = task_maps[sample.target].get(key, MISSING)
-        if current is MISSING and sample.target not in known_targets:
-            continue
-        if _value_key(current) == baseline_key:
-            continue
-        candidates.append((sample.mtime_ns, sample.target, current))
-    if not candidates:
-        return _clone(baseline)
-    return _select_change("routine task", candidates)
+    tasks = [
+        (sample.mtime_ns, sample.target, task_maps[sample.target].get(key, MISSING))
+        for sample in samples
+        if sample.exists
+    ]
+    merged = _merge_value(
+        "routine task",
+        _without_permissions(baseline),
+        [(mtime, target, _without_permissions(task)) for mtime, target, task in tasks],
+        known_targets,
+    )
+    if merged is MISSING:
+        return MISSING
+    for field in PERMISSION_FIELDS:
+        value = _merge_value(
+            "routine {}".format(field),
+            _field(baseline, field),
+            [
+                (mtime, target, _field(task, field))
+                for mtime, target, task in tasks
+                if task is not MISSING
+            ],
+            known_targets,
+        )
+        if value is not MISSING:
+            merged[field] = value
+    return merged
 
 
 def transform_routine_manifests(

@@ -24,8 +24,8 @@ copies Claude's whole login database.
 Synchronization can move conversation-session metadata across Claude accounts
 and workspaces. That can expose work history to a personal account, or
 personal history to a work account. Review your employer's policy
-before enabling it. Routine definitions include local paths. Existing permission
-grants, execution history, and unknown fields stay local to each destination.
+before enabling it. Routine definitions include local paths and permission
+settings. Execution history and unknown fields stay local to each destination.
 
 The base config starts in safe mode. The recommended installer choice then
 enables automatic account discovery and sidebar sync inside the standard Claude
@@ -419,8 +419,13 @@ accounts receive the current snapshot instead of deleting it.
 
 Each multi-file update has exact preimages, post-write verification, automatic
 rollback, and crash recovery. Manifests and their comparison snapshot share one
-transaction. Definitions sync; permission grants, execution history, and unknown
-metadata remain local to each destination. Routine errors are reported separately
+transaction. Definitions sync, including each routine's permission mode and
+saved approvals, because a routine without a mode falls back to its folder's
+default, which is usually manual. Each permission field merges on its own, so a
+copy that never chose a mode cannot erase another account's choice. Bypass mode
+still needs bypass turned on in each account's Claude settings; elsewhere the
+run drops to accept-edits. Execution history and unknown metadata remain local
+to each destination. Routine errors are reported separately
 and never change a completed chat result, but the overall command returns a
 nonzero exit code with `progress=needs-attention`. This tool syncs Claude Code routines only;
 Cowork routines use different space-specific context and are left untouched.

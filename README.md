@@ -14,7 +14,8 @@ for example a work account and a personal one. Keep using the regular Claude app
 
 - Claude Code chat history.
 - Pins and custom groups, copied from one main account to the others.
-- Claude Code routine definitions, but not saved permissions or past runs.
+- Claude Code routines with their permission mode and saved approvals, but
+  not past runs. Bypass mode also needs bypass turned on in each account.
 
 Sync runs locally. It does not move data between Macs, transfer Claude web chats,
 copy logins, or sync Cowork routines.
