@@ -90,6 +90,8 @@ account stay as they are.
 Version 0.5.1 includes the new-account enrollment and completion-status fixes.
 Older installed builds can miss a new account during the account-switch restart
 and report completion while pins, groups, or routines still need another pass.
+Version 0.5.2 fixes pins and groups being skipped for every account when one
+chat was filed under a group that no longer exists.
 Updating the repository alone does not update the installed background helper;
 run the installer again to replace it. Check the installed version with:
 
@@ -126,6 +128,24 @@ If it needs attention, run:
 
 The tool keeps recovery backups. It stops affected changes when it finds damaged
 data, conflicting edits, or an unknown format. Never delete backups to clear an error.
+
+## Limits
+
+- Sync writes only while Claude is closed. Quitting Claude ends every open
+  chat, so quit when no chat is working.
+- Sync reads Claude's private files. A Claude update can change them. Sync
+  then stops that part and says so. The last live test used Claude Desktop
+  2.31226.1, on 10 October 2026.
+- Without [pull request 12](https://github.com/djahlor/claude-session-sync/pull/12),
+  open on 10 October 2026, a new account whose folder is still empty does not
+  join. Start one chat in it, then quit Claude.
+- Before 0.5.2, one chat filed under a deleted group stopped pins and groups
+  for every account. 0.5.2 reads that chat as ungrouped, as Claude shows it.
+- To check that Claude is closed, use `pgrep -x Claude`. `pgrep -f` also
+  matches this tool's background helper.
+
+The [technical reference](docs/technical-reference.md#limits) has the live
+test, the full list, and a double-click script that repeats the test.
 
 ## Details
 

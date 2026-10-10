@@ -108,7 +108,9 @@ at install or with `keep-sidebar`. Without a choice it adopts a scope only when
 one scope has groups or every scope with groups holds the same ones, and
 otherwise stops and asks. After that the signed-in scope is the source, except right after an
 account switch, when the scope just left is. The adapter copies the source's
-groups, assignments, and group order into every other scope. Pins are one
+groups, assignments, and group order into every other scope. An assignment or
+order entry for a group the scope no longer has is stale: it is read as no
+group, never copied, and left in place in the source. Pins are one
 shared list and stay as they are. When only the user can say which scope to
 keep, the adapter stops and asks. `doctor` runs the same plan on a disposable
 copy of the database.
