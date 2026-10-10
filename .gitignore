@@ -7,3 +7,5 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+# Logs from scripts/closed-sync-test.sh. They can name local paths.
+logs/

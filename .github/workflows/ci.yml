@@ -55,3 +55,5 @@ jobs:
       - run: zsh -n install.sh
       - run: zsh -n get.sh
       - run: zsh -n "Install Claude Session Sync.command"
+      - run: zsh -n scripts/closed-sync-test.sh
+      - run: zsh -n scripts/closed-sync-test.command
