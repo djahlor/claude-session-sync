@@ -41,8 +41,9 @@ account's pins and groups the next time Claude closes. Sync never overwrites
 different groups on its own. Until you choose a main account, it leaves them
 alone.
 
-A new account joins the sync after you chat in it and then switch accounts or
-quit Claude.
+A new account joins the sync the next time Claude closes after you sign in and
+open the Code tab once, so Claude creates the account's folder. You do not have
+to start a chat first. Your sessions then appear the next time Claude opens.
 
 ### Without Terminal
 
