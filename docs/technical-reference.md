@@ -45,7 +45,8 @@ data root:
 
 Automatic mode uses the `logins` target policy. Only sidebar folders of real
 logins take part: the approved targets, plus any folder whose account logged in
-on this Mac and that holds a chat Claude saved after that login. Leftover
+on this Mac and that holds a chat Claude saved after that login, or that Claude
+created after that login and that holds no older chat. Leftover
 folders from another Mac never had a login here and are ignored. It does not
 trust new filesystem roots. A malformed chat, or two copies that changed to different
 states with equal activity, is left alone and reported; every other chat still
@@ -109,12 +110,15 @@ happened yet.
 
 ### Limits found in that test
 
-- **An empty new-account folder never joins.** Without
-  [pull request 12](https://github.com/djahlor/claude-session-sync/pull/12),
-  which was still open on 10 October 2026, a folder joins only after Claude
-  saved a chat in it. A new account has no chat, so its folder stays empty and
-  never gets the other accounts' chats. The way around it is to start one chat
-  in the new account, then quit Claude.
+- **An empty new-account folder never joined.** In 0.5.1 a folder joined only
+  after Claude saved a chat in it. A new account has no chat, so its folder
+  stayed empty and never got the other accounts' chats. 0.5.2 also takes a
+  folder Claude created after the account's first login here, as long as it
+  holds no older chat
+  ([pull request 12](https://github.com/djahlor/claude-session-sync/pull/12)).
+  One limit stays: at the very first sign-in the folder does not exist yet, so
+  the restart after that switch cannot fill it. Open the Code tab once, then
+  quit Claude.
 - **One stale group pointer stopped pins and groups for every account.**
   Claude can save a chat under a group ID its account no longer has, and it
   shows that chat as ungrouped. 0.5.1 read this as an unknown format in any
@@ -145,7 +149,7 @@ Double-click `scripts/closed-sync-test.command` in Finder. It asks you to type
 `yes`, quits Claude, waits until `pgrep -a -x Claude` finds nothing, runs
 `sync`, reads `status`, opens Claude again, and reads `status` once more. It
 opens Claude again even when the sync fails. It tests the installed build, so
-run the installer first. The log is saved in `logs/` in the repository. Git
+update first. The log is saved in `logs/` in the repository. Git
 ignores that folder, because a log can name local paths. The script refuses to
 start from inside a Claude chat, where it would stop when Claude quits.
 
@@ -169,6 +173,14 @@ The same setup can run from Terminal:
 ```sh
 ./install.sh --automatic-targets --sync-layout --sync-routines
 ```
+
+An AI agent can run either command for you. Setup asks its one question, the
+main account, only when a person sits at a terminal. Without one it keeps the
+account already chosen. Setup replaces the helpers and restarts the watcher. It
+never quits Claude. The restarted watcher quits Claude only when the signed-in
+account differs from the one it last saw, which is the normal switch restart.
+The same command installs and updates, so when something needs attention,
+update first.
 
 From this directory:
 
@@ -234,8 +246,8 @@ Nothing syncs while Claude is open, and saving a chat never starts a sync.
 2. The helper quits Claude, syncs, and opens Claude again.
 3. Keep working. The next switch or quit syncs again.
 
-A new account joins after you chat in it and then switch accounts or quit
-Claude. `claude-session-sync restart-claude` asks the helper to quit Claude,
+A new account joins the next time Claude closes after you sign in and open the
+Code tab once. `claude-session-sync restart-claude` asks the helper to quit Claude,
 sync, and reopen it now. Status reports waiting, syncing, finished, or needs
 attention, and the last successful sync time. A missing or interrupted run is never reported as finished. A
 menu-bar status item and a non-activating status window show progress without
@@ -403,9 +415,11 @@ each account's first login on this Mac in the private chat state, so a rotated
 log does not lose it. A signed-in account the log does not name counts from the
 first time sync sees it. A folder outside sync joins once its account has a
 recorded login and the folder holds a chat Claude saved at least 5 seconds
-after that login. So a new account joins after you chat in it and then switch
-accounts or quit Claude. A folder copied from another Mac has no login here and
-stays out.
+after that login. It also joins when Claude created the folder at least 5
+seconds after that login and it holds no chat older than the login, which is
+how a new account's empty folder looks. So a new account joins the next time
+Claude closes after you sign in and open the Code tab once. A folder copied
+from another Mac has no login here and stays out.
 
 Every write goes through the journal. Each run keeps the files it replaced or
 removed. The newest runs always stay; older ones stay for 30 days while all

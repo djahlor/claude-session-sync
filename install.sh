@@ -78,7 +78,7 @@ echo "Open Claude normally. No separate profile app is needed."
 if [[ "$automatic_targets" == true ]]; then
   echo "Chats sync when you switch accounts and when you quit Claude."
   echo "After a switch, Claude closes, syncs, and opens again by itself."
-  echo "A new account joins after you chat in it and then switch accounts or quit Claude."
+  echo "A new account joins the next time Claude closes after you sign in and open the Code tab once."
 else
   echo "Safe mode is active. New account and workspace IDs need explicit approval."
   echo "Chats sync when you quit Claude."
