@@ -2,8 +2,9 @@
 
 Under the ``logins`` policy only real logins take part: the approved targets,
 plus any folder Claude itself wrote a chat to after its account logged in on
-this Mac. Leftover folders from other Macs never had a login here, so they
-stay out. Whether Claude runs, and which account is signed in now, do not
+this Mac, plus a folder Claude created after that login and that holds no chat
+older than it (a brand new account's own folder starts empty). Leftover
+folders from other Macs never had a login here, so they stay out. Whether Claude runs, and which account is signed in now, do not
 matter.
 """
 
@@ -65,7 +66,7 @@ def new_login_targets(
     selected_keys: Set[str],
     logins: Logins,
 ) -> List[str]:
-    """Folders outside sync holding a chat Claude saved after their account's first login here."""
+    """Folders outside sync that Claude wrote for their account after its first login here."""
 
     if config.target_policy != "logins":
         return []
@@ -79,7 +80,9 @@ def new_login_targets(
         first_login = logins.get(str(root), {}).get(target.account_id.lower())
         if first_login is None:
             continue
-        if _written_since(Path(target.path), first_login + LOGIN_SETTLE_MS):
+        since_ms = first_login + LOGIN_SETTLE_MS
+        folder = Path(target.path)
+        if _written_since(folder, since_ms) or _created_since(folder, since_ms, first_login):
             found.append(key)
     return sorted(found)
 
@@ -100,3 +103,29 @@ def _written_since(folder: Path, since_ms: int) -> bool:
         except OSError:
             continue
     return False
+
+
+def _created_since(folder: Path, since_ms: int, first_login_ms: int) -> bool:
+    """A folder Claude made after the login, with no chat that predates it.
+
+    A new account has no chat until its first one, so the first folder Claude
+    makes for it is empty. A folder with an older chat was copied in from
+    somewhere else.
+    """
+
+    try:
+        born_ms = int(folder.stat().st_birthtime * 1000)
+        entries = list(os.scandir(str(folder)))
+    except (AttributeError, OSError):
+        return False
+    if born_ms <= since_ms:
+        return False
+    for entry in entries:
+        if not (entry.name.startswith("local_") and entry.name.endswith(".json")):
+            continue
+        try:
+            if entry.stat(follow_symlinks=False).st_mtime_ns // 1_000_000 <= first_login_ms:
+                return False
+        except OSError:
+            return False
+    return True

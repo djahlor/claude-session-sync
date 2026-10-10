@@ -280,11 +280,54 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual(0, repeated.newly_enrolled)
         self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in synced_files})
 
+    def test_a_new_account_with_no_chats_yet_receives_the_others_history(self):
+        # A brand new account's own folder is empty, because Claude writes no
+        # chat there until the first one is started.
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_org = "dddddddd-0000-4000-8000-0000000000d4"
+        new_folder = self.folder(new_account, new_org)
+        (new_folder / "scheduled-tasks.json").write_text("{}", encoding="utf-8")
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 600))
+        self.write(self.a, X)
+        self.write(self.b, Y)
+
+        first = self.sync()
+
+        new_key = "Work/{}/{}".format(new_account, new_org)
+        self.assertEqual("committed", first.receipt.status)
+        self.assertEqual(1, first.newly_enrolled)
+        self.assertIn(new_key, load_state(state_path(self.config.state_dir)).enrolled)
+        self.assertIsNotNone(self.read(new_folder, X))
+        self.assertIsNotNone(self.read(new_folder, Y))
+        self.assertIsNotNone(self.read(self.a, Y))
+        self.assertEqual("noop", self.sync().receipt.status)
+
+    def test_a_folder_of_a_signed_in_account_with_older_chats_stays_out(self):
+        # Chats that predate the login were copied here from somewhere else.
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_org = "dddddddd-0000-4000-8000-0000000000d4"
+        old_folder = self.folder(new_account, new_org)
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 30))
+        self.write(old_folder, Y)
+        self.write(self.a, X)
+
+        run = self.sync()
+
+        self.assertEqual(0, run.newly_enrolled)
+        self.assertIsNone(self.read(old_folder, X))
+        self.assertIsNone(self.read(self.a, Y))
+
     def test_a_login_stays_recorded_after_claudes_log_rotates(self):
         new_account = "dddddddd-0000-4000-8000-000000000004"
         new_folder = self.folder(new_account, A_ORG)
         self.log_logins((A_ACCOUNT, new_account, 600), (new_account, A_ACCOUNT, 300))
         self.write(self.a, X)
+        older = self.write(new_folder, Y)
+        os.utime(str(older), (time.time() - 900, time.time() - 900))
         self.assertEqual(0, self.sync().newly_enrolled, "no chat was saved there after the login")
 
         self.app_log.write_text("", encoding="utf-8")
