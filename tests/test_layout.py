@@ -1567,5 +1567,131 @@ class UnconfirmedUploadTests(unittest.TestCase):
             self.assertEqual({"a/w": ["Focus"], "b/w": ["Focus"]}, group_names(values, self.targets))
 
 
+class StaleGroupPointerTests(unittest.TestCase):
+    """A chat filed under a group that is gone has no group, as Claude shows it.
+
+    The records have the shape Claude 2.31226.1 left on 10-10-2026, with names
+    and IDs replaced. An earlier sync had copied the main account's groups,
+    with their IDs, into its second workspace. Claude then saved one chat
+    there under that workspace's old group ID, with an order entry for it.
+    """
+
+    targets = {key: {"code:x", "code:y"} for key in ("main/w1", "main/w2", "new/w")}
+    main = scope("Focus", "Admin", assignments={"code:x": "id-focus"})
+
+    def stale_copy(self):
+        stale = copy.deepcopy(self.main)
+        stale["assignments"]["code:y"] = "id-old"
+        stale["order"]["id-old"] = ["code:y"]
+        return stale
+
+    def new_account_signed_in(self):
+        """main/w1 is the adopted source and a new, empty account is signed in."""
+        current = records(
+            {"main/w1": self.main, "main/w2": self.stale_copy(), "new/w": scope()},
+            active="new/w",
+            pins=["code:x"],
+        )
+        # Claude had saved the new account's empty sidebar in one record only.
+        persisted = decoded(current[GROUP_SCOPES_KEY])
+        del persisted["value"]["new/w"]
+        current[GROUP_SCOPES_KEY] = encoded(persisted)
+        return current
+
+    def test_a_stale_pointer_in_another_account_does_not_stop_the_sync(self):
+        result = transform_layout_records(
+            self.new_account_signed_in(),
+            self.targets,
+            snapshot=LayoutSnapshot("main/w1"),
+            timestamp_ms=20,
+            owner_account="new",
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        self.assertEqual(self.main, scopes["main/w1"])
+        for key in ("main/w2", "new/w"):
+            self.assertEqual(self.main["groups"], scopes[key]["groups"])
+            self.assertEqual({"code:x": "id-focus"}, scopes[key]["assignments"])
+            self.assertEqual({"id-focus": ["code:x"], "id-admin": []}, scopes[key]["order"])
+        self.assertEqual("new/w", result.canonical_upload_scope)
+        self.assertEqual((2, 1, 1), (result.group_count, result.assignment_count, result.pin_count))
+
+    def test_a_stale_pointer_in_the_source_account_is_not_copied(self):
+        targets = {key: self.targets[key] for key in ("main/w1", "main/w2")}
+        current = records({"main/w1": self.stale_copy(), "main/w2": scope()}, active="main/w1")
+
+        result = transform_layout_records(
+            current,
+            targets,
+            snapshot=LayoutSnapshot("main/w1"),
+            timestamp_ms=20,
+            owner_account="main",
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        self.assertEqual(self.stale_copy(), scopes["main/w1"], "the source stays as Claude saved it")
+        self.assertEqual({"code:x": "id-focus"}, scopes["main/w2"]["assignments"])
+        self.assertEqual({"id-focus": ["code:x"], "id-admin": []}, scopes["main/w2"]["order"])
+        self.assertEqual(1, result.assignment_count)
+
+    def test_an_account_with_no_groups_and_only_stale_pointers_counts_as_empty(self):
+        targets = {key: self.targets[key] for key in ("main/w1", "new/w")}
+        leftovers = scope(assignments={"code:y": "id-old"})
+        leftovers["order"] = {"id-old": ["code:y"]}
+        current = records({"main/w1": self.main, "new/w": leftovers}, active="new/w")
+
+        result = transform_layout_records(
+            current,
+            targets,
+            snapshot=LayoutSnapshot("main/w1"),
+            timestamp_ms=20,
+            owner_account="new",
+        )
+
+        scopes = decoded(result.records[DFRAME_STORE_KEY])["state"]["customGroupsByScope"]
+        self.assertEqual(self.main["groups"], scopes["new/w"]["groups"])
+        self.assertEqual({"code:x": "id-focus"}, scopes["new/w"]["assignments"])
+
+    def test_the_new_account_gets_the_groups_and_the_next_sync_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            synchronizer, fake, _database, values = LayoutRecoveryTests.transaction_fixture(
+                LayoutRecoveryTests(), root
+            )
+            values.clear()
+            values.update(self.new_account_signed_in())
+            values[layout_module.SYNC_OWNER_KEY] = b"\x01new"
+            values[layout_module.SYNC_ACTIVE_KEY] = b"\x011"
+            snapshot_path = synchronizer.config.state_dir / "sidebar-layout-0.json"
+            snapshot_path.write_text(json.dumps({"version": 1, "adopted_scope": "main/w1"}))
+            synchronizer.helper = root / "helper"
+            synchronizer.helper.write_bytes(b"fixture")
+            os.chmod(synchronizer.helper, 0o700)
+            with patch("claude_session_sync.layout.LevelDatabase", fake), patch.object(
+                synchronizer, "_target_sessions", return_value=self.targets
+            ):
+                receipt = synchronizer.sync()
+                repeated = synchronizer.sync()
+
+            self.assertEqual(("synced", 2, 1, 1), (
+                receipt.state, receipt.group_count, receipt.assignment_count, receipt.pin_count
+            ))
+            self.assertIsNone(receipt.reason)
+            self.assertEqual("noop", repeated.state)
+            self.assertEqual(
+                {key: ["Focus", "Admin"] for key in self.targets}, group_names(values, self.targets)
+            )
+            self.assertEqual(b"\x01new/w", values[layout_module.GROUP_UPLOAD_KEY])
+            self.assertEqual("new/w", json.loads(snapshot_path.read_text())["adopted_scope"])
+
+    def test_the_main_account_list_still_shows_an_account_with_a_stale_pointer(self):
+        rows = layout_module.sidebar_accounts(self.new_account_signed_in(), self.targets, "new")
+
+        self.assertEqual(
+            {"main/w1": ("Focus", "Admin"), "main/w2": ("Focus", "Admin"), "new/w": ()},
+            {row.scope: row.group_names for row in rows},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
