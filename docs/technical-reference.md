@@ -45,7 +45,8 @@ data root:
 
 Automatic mode uses the `logins` target policy. Only sidebar folders of real
 logins take part: the approved targets, plus any folder whose account logged in
-on this Mac and that holds a chat Claude saved after that login. Leftover
+on this Mac and that holds a chat Claude saved after that login, or that Claude
+created after that login and that holds no older chat. Leftover
 folders from another Mac never had a login here and are ignored. It does not
 trust new filesystem roots. A malformed chat, or two copies that changed to different
 states with equal activity, is left alone and reported; every other chat still
@@ -86,7 +87,71 @@ An unknown pins, groups, or routines record skips that update with
 `reason=unsafe-layout` or `reason=unsafe-routines`. The other parts still
 sync, `status` reports `needs-attention`, and `doctor` shows which part failed.
 The last full check on a copy of real data used Claude Desktop 1.46388.4, in
-September 2026.
+September 2026. The last live sync with Claude closed used Claude Desktop
+2.31226.1, on 10 October 2026.
+
+### Tested live
+
+On 10 October 2026 one sync ran on real Claude folders while Claude Desktop
+2.31226.1 was closed. Run `820d696c` copied 6834 files, 1.7 GB, into six
+account folders that were empty: 1134 chats and 5 delete markers each. One of
+the six belonged to a new account, which went from 0 to 1134 chats. Routines
+synced in the same run. Pins and groups did not. That run, and the next one
+nine minutes later, skipped them with `reason=unsafe-layout`. The run used the
+code of [pull request 12](https://github.com/djahlor/claude-session-sync/pull/12),
+not an installed release. Its log sat in a temporary folder and is gone, so
+these numbers come from the run record in the state folder.
+
+The pins and groups fix in 0.5.2 was then checked on a private copy of the same
+sidebar database, with no write to Claude. 0.5.1 stops there with the error
+below. 0.5.2 plans the copy: 16 groups, 217 chats in groups, and 25 pins, to
+all 13 synced account folders. A live run of 0.5.2 with Claude closed has not
+happened yet.
+
+### Limits found in that test
+
+- **An empty new-account folder never joined.** In 0.5.1 a folder joined only
+  after Claude saved a chat in it. A new account has no chat, so its folder
+  stayed empty and never got the other accounts' chats. 0.5.2 also takes a
+  folder Claude created after the account's first login here, as long as it
+  holds no older chat
+  ([pull request 12](https://github.com/djahlor/claude-session-sync/pull/12)).
+  One limit stays: at the very first sign-in the folder does not exist yet, so
+  the restart after that switch cannot fill it. Open the Code tab once, then
+  quit Claude.
+- **One stale group pointer stopped pins and groups for every account.**
+  Claude can save a chat under a group ID its account no longer has, and it
+  shows that chat as ungrouped. 0.5.1 read this as an unknown format in any
+  account's records and skipped pins and groups everywhere, with the detail
+  `custom group assignment references an unknown group`. 0.5.2 reads the chat
+  as ungrouped, the way Claude does. It never copies the stale pointer to
+  another account, and it leaves the account that holds it as Claude saved it.
+  Run the installer again to get 0.5.2.
+- **How to check that Claude is closed.** Use `pgrep -x Claude`. It matches
+  only the process named exactly `Claude`. `pgrep -f` on Claude's path also
+  matches the watcher, which carries that path as an argument and keeps
+  running, so it never comes back empty. One more catch: `pgrep` leaves out
+  its own parent processes. Run from inside a Claude chat, `pgrep -x Claude`
+  finds nothing while Claude is open. `pgrep -a -x Claude` is right in both
+  places.
+- **`status` says `finished` only while Claude is closed.** With Claude open
+  and nothing failed, it says `waiting-for-Claude`, because nothing syncs
+  while Claude runs. Read `status` before reopening Claude to prove a sync.
+- **The watcher syncs first.** When Claude quits, the watcher starts its own
+  sync. A manual `sync` in the same seconds can answer `reason=busy` or
+  `reason=claude-open`. Run it again after a moment.
+- **Quitting Claude ends every open chat**, including chats that are still
+  working. Quit when no chat is working.
+
+### Run the test yourself
+
+Double-click `scripts/closed-sync-test.command` in Finder. It asks you to type
+`yes`, quits Claude, waits until `pgrep -a -x Claude` finds nothing, runs
+`sync`, reads `status`, opens Claude again, and reads `status` once more. It
+opens Claude again even when the sync fails. It tests the installed build, so
+update first. The log is saved in `logs/` in the repository. Git
+ignores that folder, because a log can name local paths. The script refuses to
+start from inside a Claude chat, where it would stop when Claude quits.
 
 ## Install
 
@@ -108,6 +173,14 @@ The same setup can run from Terminal:
 ```sh
 ./install.sh --automatic-targets --sync-layout --sync-routines
 ```
+
+An AI agent can run either command for you. Setup asks its one question, the
+main account, only when a person sits at a terminal. Without one it keeps the
+account already chosen. Setup replaces the helpers and restarts the watcher. It
+never quits Claude. The restarted watcher quits Claude only when the signed-in
+account differs from the one it last saw, which is the normal switch restart.
+The same command installs and updates, so when something needs attention,
+update first.
 
 From this directory:
 
@@ -173,8 +246,8 @@ Nothing syncs while Claude is open, and saving a chat never starts a sync.
 2. The helper quits Claude, syncs, and opens Claude again.
 3. Keep working. The next switch or quit syncs again.
 
-A new account joins after you chat in it and then switch accounts or quit
-Claude. `claude-session-sync restart-claude` asks the helper to quit Claude,
+A new account joins the next time Claude closes after you sign in and open the
+Code tab once. `claude-session-sync restart-claude` asks the helper to quit Claude,
 sync, and reopen it now. Status reports waiting, syncing, finished, or needs
 attention, and the last successful sync time. A missing or interrupted run is never reported as finished. A
 menu-bar status item and a non-activating status window show progress without
@@ -266,7 +339,9 @@ Pins are one list shared by every account, keyed by chat ID, so they stay as
 they are. Custom groups belong to one account and workspace each, and sync
 copies one account's groups, chat assignments, and group order to the others.
 [Pins and groups across accounts](#pins-and-groups-across-accounts) says which
-account is the source.
+account is the source. A chat filed under a group that no longer exists counts
+as ungrouped, as Claude shows it. That stale pointer is never copied, and an
+account with no groups counts as empty whatever pointers it still holds.
 
 Claude also syncs the group list through its account settings. Copying only
 the local records is not enough. On startup, the server's older list replaces
@@ -340,9 +415,11 @@ each account's first login on this Mac in the private chat state, so a rotated
 log does not lose it. A signed-in account the log does not name counts from the
 first time sync sees it. A folder outside sync joins once its account has a
 recorded login and the folder holds a chat Claude saved at least 5 seconds
-after that login. So a new account joins after you chat in it and then switch
-accounts or quit Claude. A folder copied from another Mac has no login here and
-stays out.
+after that login. It also joins when Claude created the folder at least 5
+seconds after that login and it holds no chat older than the login, which is
+how a new account's empty folder looks. So a new account joins the next time
+Claude closes after you sign in and open the Code tab once. A folder copied
+from another Mac has no login here and stays out.
 
 Every write goes through the journal. Each run keeps the files it replaced or
 removed. The newest runs always stay; older ones stay for 30 days while all

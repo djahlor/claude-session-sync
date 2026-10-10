@@ -263,26 +263,32 @@ def _ordered_group_pairs(scope: Any) -> List[Tuple[str, str]]:
     names = [name for _group_id, name in pairs]
     if len(ids) != len(set(ids)) or len(names) != len(set(names)):
         raise LayoutError("custom groups contain duplicate ids or names")
-    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
-    if set(assignments.values()) - set(ids):
-        raise LayoutError("custom group assignment references an unknown group")
+    # Claude leaves assignments and order entries behind for groups that are
+    # gone, and shows those chats as ungrouped. They are stale, not unknown.
+    _string_map(scope.get("assignments", {}), "custom group assignments")
     order = scope.get("order", {})
     if not isinstance(order, dict) or any(
         not isinstance(group_id, str) for group_id in order
     ):
         raise LayoutError("custom group order has an unknown shape")
-    if set(order) - set(ids):
-        raise LayoutError("custom group order references an unknown group")
     for group_id, sessions in order.items():
         _string_list(sessions, "custom group session order")
     return pairs
+
+
+def _live_assignments(scope: Mapping[str, Any]) -> Dict[str, str]:
+    """The chats filed under a group the scope still has; the rest are stale."""
+
+    ids = {group_id for group_id, _name in _ordered_group_pairs(scope)}
+    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    return {session: group_id for session, group_id in assignments.items() if group_id in ids}
 
 
 def _scope_order_by_name(scope: Mapping[str, Any]) -> Dict[str, Tuple[str, ...]]:
     """Return the valid part of Chromium's stale-prone order index."""
 
     pairs = _ordered_group_pairs(scope)
-    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    assignments = _live_assignments(scope)
     raw_order = scope.get("order", {})
     return {
         name: tuple(
@@ -332,7 +338,7 @@ def _layout(scope: Mapping[str, Any]) -> Dict[str, Any]:
     """A scope's groups, chat assignments, and group order by name, for comparison."""
 
     names = dict(_ordered_group_pairs(scope))
-    assignments = _string_map(scope.get("assignments", {}), "custom group assignments")
+    assignments = _live_assignments(scope)
     return {
         "groups": list(names.values()),
         "assignments": {session: names[group] for session, group in sorted(assignments.items())},
@@ -410,7 +416,7 @@ def _copy_authoritative_scope(
         merged_group.update(copy.deepcopy(source_group))
         replacement_groups.append(merged_group)
     replacement["groups"] = replacement_groups
-    replacement["assignments"] = copy.deepcopy(source.get("assignments", {}))
+    replacement["assignments"] = _live_assignments(source)
     canonical_order = _scope_order_by_name(source)
     replacement["order"] = {
         group["id"]: list(canonical_order[group["name"]])
@@ -508,7 +514,7 @@ def _adopt_current_sidebar_records(
             _layout(source) if selected_scope != active_scope else unconfirmed_copy,
         ),
         group_count=len(_ordered_group_pairs(source)),
-        assignment_count=len(source.get("assignments", {})),
+        assignment_count=len(_live_assignments(source)),
         pin_count=len(current_pins),
         canonical_upload_scope=(
             active_scope if selected_scope != active_scope else None
@@ -752,13 +758,9 @@ def groups_differ(group_names: Iterable[Iterable[str]]) -> bool:
 
 
 def _scope_is_empty(scope: Optional[Mapping[str, Any]]) -> bool:
-    if scope is None:
-        return True
-    return (
-        not _ordered_group_pairs(scope)
-        and not scope.get("assignments", {})
-        and not any(scope.get("order", {}).values())
-    )
+    """Whether a scope has no groups. What is left without groups is stale."""
+
+    return scope is None or not _ordered_group_pairs(scope)
 
 
 # Why a main-account choice cannot apply, with the words to tell the user.

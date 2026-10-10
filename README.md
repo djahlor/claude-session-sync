@@ -52,6 +52,28 @@ to start a chat first. Your sessions then appear the next time Claude opens.
    System Settings, then Privacy & Security, and click **Open Anyway**.
 3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
 
+### With an AI agent
+
+Ask your agent: "Install or update Claude Session Sync from
+github.com/djahlor/claude-session-sync, then check it." The agent can do all of
+it. These are its steps:
+
+1. Run the install command above. Installing and updating are the same
+   command. It needs no keyboard: without a terminal it skips the main-account
+   question and keeps the account already chosen. It never quits Claude.
+2. Check the result:
+
+   ```sh
+   "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" --version
+   "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" status
+   ```
+
+   The version should match the newest one in [CHANGELOG.md](CHANGELOG.md).
+3. Nothing syncs while Claude is open. A fix for pins, groups, or routines
+   shows in `status` only after Claude has closed once. Until then `status`
+   keeps the last result. Quitting Claude ends every open chat, so ask the
+   person before you quit it.
+
 ## Switch accounts
 
 1. Sign out of Claude.
@@ -85,12 +107,10 @@ Routines sync at the same moments as chats.
 
 ## Update
 
-Run the same Terminal command again. Your sync history, backups, and main
-account stay as they are.
+Run the same Terminal command again. Installing and updating are one command.
+Your sync history, backups, and main account stay as they are, and Claude
+stays open. [CHANGELOG.md](CHANGELOG.md) lists what each version fixed.
 
-Version 0.5.1 includes the new-account enrollment and completion-status fixes.
-Older installed builds can miss a new account during the account-switch restart
-and report completion while pins, groups, or routines still need another pass.
 Updating the repository alone does not update the installed background helper;
 run the installer again to replace it. Check the installed version with:
 
@@ -105,6 +125,11 @@ To remove it, run:
 ```
 
 ## If something goes wrong
+
+Update first. Run the install command again, or ask your AI agent to. Most
+problems are fixed in a newer version, and an update keeps your sync history
+and backups. Then quit Claude once, at a moment when no chat is working, so
+sync runs again.
 
 If no notification appears, open Terminal and run:
 
@@ -128,10 +153,29 @@ If it needs attention, run:
 The tool keeps recovery backups. It stops affected changes when it finds damaged
 data, conflicting edits, or an unknown format. Never delete backups to clear an error.
 
+## Limits
+
+- Sync writes only while Claude is closed. Quitting Claude ends every open
+  chat, so quit when no chat is working.
+- Sync reads Claude's private files. A Claude update can change them. Sync
+  then stops that part and says so. The last live test used Claude Desktop
+  2.31226.1, on 10 October 2026.
+- A new account cannot join at its very first sign-in, because Claude has not
+  made its folder yet. Open the Code tab once, then quit Claude.
+- Before 0.5.2, a new account with no chat never joined, and one chat filed
+  under a deleted group stopped pins and groups for every account. Update to
+  fix both.
+- To check that Claude is closed, use `pgrep -x Claude`. `pgrep -f` also
+  matches this tool's background helper.
+
+The [technical reference](docs/technical-reference.md#limits) has the live
+test, the full list, and a double-click script that repeats the test.
+
 ## Details
 
 [Commands and recovery](docs/technical-reference.md) ·
 [Tested scope and limits](docs/technical-reference.md#limits) ·
+[Changelog](CHANGELOG.md) ·
 [MIT license](LICENSE)
 
 This project is not affiliated with or supported by Anthropic.
