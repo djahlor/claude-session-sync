@@ -54,7 +54,8 @@ window display progress without depending on Notification Center.
 1. Cross-profile copying is disabled unless the configuration explicitly
    acknowledges it. Target discovery uses the private exact-target allowlist,
    the `logins` policy (approved targets plus folders Claude wrote a chat to
-   after their account logged in on this Mac), or an explicit
+   after their account logged in on this Mac, and folders Claude created after
+   that login that hold no older chat), or an explicit
    `all-configured-profiles` policy, always restricted to
    the configured profile roots.
 2. A plan with invalid targets cannot be applied. A session the rules leave
