@@ -332,6 +332,19 @@ down faster.
 
 ## Pins and custom groups
 
+Newer Claude builds keep pins, groups, and the sidebar view per account on
+Anthropic's servers. They mark each account's section list as seeded from
+account settings (`prefsSeeded` under `codeSidebarByScope`), clear the local
+copy at every sign-in, and load the new account's list. A copy written to disk
+is then dropped or never read, and the account just left may no longer have its
+groups on disk at all. When the layout adapter finds a seeded section list, it
+reads nothing else, writes nothing, runs no recovery, and reports
+`layout={'state': 'per-account', 'reason': 'claude-keeps-sidebar-per-account'}`.
+That counts as finished. Older layout run journals stay on disk unchanged and no
+longer count as pending recovery. Seen on Desktop 2.42304.0, where seeded lists
+go back to at least 7 October 2026. The rest of this section describes builds
+without seeded lists.
+
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
 store record. It checks their shapes and stops on anything it does not know.
@@ -493,6 +506,14 @@ targets. On first sync it combines unique tasks and keeps the newest manifest
 when the same task differs. A private snapshot then tracks additions, edits, and
 deletions so a deleted routine does not return from a stale account. New empty
 accounts receive the current snapshot instead of deleting it.
+
+The snapshot also remembers each deleted task ID with the time of the sync that
+first saw it go. A folder that joins the sync later, such as an account or
+organization last used before the delete, can still hold an old copy. That copy
+is ignored and removed from the folder. A routine created again after the
+delete, with a later `createdAt`, or added again in a folder that already
+syncs, comes back as normal. A first-seen folder's copy also never outvotes a
+delete made in a known folder during the same sync.
 
 Each multi-file update has exact preimages, post-write verification, automatic
 rollback, and crash recovery. Manifests and their comparison snapshot share one

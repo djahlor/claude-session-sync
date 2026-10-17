@@ -173,6 +173,6 @@ def adapter_failure(config, name: str) -> int:
         if name == key and getattr(config, flag):
             return int(
                 read_status(config.state_dir, filename).get("state")
-                not in ("synced", "noop", "unknown")
+                not in ("synced", "noop", "unknown", "per-account")
             )
     return 0

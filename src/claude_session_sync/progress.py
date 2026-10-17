@@ -30,7 +30,7 @@ def finish_progress(config, payload: dict) -> str:
     adapters = [payload[key] for key in ("routines", "layout") if key in payload]
     outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
     attention = any(
-        value not in ("committed", "synced", "noop", "disabled", "deferred")
+        value not in ("committed", "synced", "noop", "disabled", "deferred", "per-account")
         for value in outcomes
     )
     attention = attention or any(adapter.get("reporting_error") for adapter in adapters)

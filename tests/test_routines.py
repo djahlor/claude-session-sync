@@ -286,6 +286,95 @@ class RoutineTransformTests(unittest.TestCase):
                 (sample("a", 10, manifest(task("daily"), task("daily"))),)
             )
 
+    def test_deletion_is_remembered_with_its_time(self):
+        baseline = manifest(task("daily"))
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), baseline)
+
+        result = transform_routine_manifests(
+            (sample("a", 20, manifest()),), snapshot=snapshot, now_ms=5000
+        )
+
+        self.assertEqual({"daily": 5000}, dict(result.snapshot.deleted))
+
+    def test_new_folder_cannot_bring_back_a_deleted_routine(self):
+        # A folder from before the delete joins the sync for the first time.
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"),), manifest(), {"daily": 5000}
+        )
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest()),
+                sample("old", 90, manifest(task("daily"))),
+            ),
+            snapshot=snapshot,
+        )
+
+        self.assertEqual([], result.manifest["scheduledTasks"])
+        self.assertEqual(manifest(), result.documents[("Work", "old", "org")])
+        self.assertEqual({"daily": 5000}, dict(result.snapshot.deleted))
+
+    def test_new_folder_cannot_beat_a_delete_in_the_same_sync(self):
+        baseline = manifest(task("daily"))
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), baseline)
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest()),
+                sample("old", 90, manifest(task("daily", cron="0 7 * * *"))),
+            ),
+            snapshot=snapshot,
+            now_ms=5000,
+        )
+
+        self.assertEqual([], result.manifest["scheduledTasks"])
+        self.assertEqual({"daily": 5000}, dict(result.snapshot.deleted))
+
+    def test_routine_made_again_after_the_delete_comes_back(self):
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"),), manifest(), {"daily": 5000}
+        )
+        again = dict(task("daily"), createdAt=6000)
+
+        result = transform_routine_manifests(
+            (sample("a", 10, manifest()), sample("new", 20, manifest(again))),
+            snapshot=snapshot,
+        )
+
+        self.assertEqual(
+            ["daily"], [item["id"] for item in result.manifest["scheduledTasks"]]
+        )
+        self.assertEqual({}, dict(result.snapshot.deleted))
+
+    def test_known_folder_can_add_a_deleted_routine_again(self):
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"),), manifest(), {"daily": 5000}
+        )
+
+        result = transform_routine_manifests(
+            (sample("a", 10, manifest(task("daily"))),), snapshot=snapshot
+        )
+
+        self.assertEqual(
+            ["daily"], [item["id"] for item in result.manifest["scheduledTasks"]]
+        )
+        self.assertEqual({}, dict(result.snapshot.deleted))
+
+    def test_snapshot_deletions_round_trip_and_are_validated(self):
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"),), manifest(), {"daily": 5000}
+        )
+        content = json.dumps(snapshot.as_dict()).encode("utf-8")
+
+        self.assertEqual(
+            {"daily": 5000}, dict(routines_module._decode_snapshot(content).deleted)
+        )
+        self.assertNotIn("deleted", RoutineSnapshot((), manifest()).as_dict())
+        for bad in ([], {"daily": "5000"}, {"daily": True}, {"bad id": 1}, {"daily": -1}):
+            document = dict(snapshot.as_dict(), deleted=bad)
+            with self.assertRaisesRegex(RoutineError, "invalid deletions"):
+                routines_module._decode_snapshot(json.dumps(document).encode("utf-8"))
+
 
 class RoutineSynchronizerTests(unittest.TestCase):
     def setUp(self):
@@ -371,6 +460,28 @@ class RoutineSynchronizerTests(unittest.TestCase):
                     "scheduledTasks"
                 ],
             )
+
+    def test_deleted_routine_stays_gone_when_an_old_folder_joins(self):
+        first = self.target("a")
+        self.write_manifest(first, manifest(self.daily()), 10)
+        self.synchronizer().sync()
+        self.write_manifest(first, manifest(), 30)
+        self.synchronizer().sync()
+        # An account folder last used before the delete joins the sync.
+        old = self.target("old")
+        self.write_manifest(old, manifest(self.daily()), 90)
+
+        receipt = self.synchronizer().sync()
+
+        self.assertEqual(0, receipt.task_count)
+        for target in (first, old):
+            self.assertEqual(
+                [],
+                json.loads((target / "scheduled-tasks.json").read_text())[
+                    "scheduledTasks"
+                ],
+            )
+        self.assertEqual("noop", self.synchronizer().sync().state)
 
     def test_missing_definition_stops_before_any_manifest_write(self):
         first = self.target("a")
