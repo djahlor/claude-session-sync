@@ -4,6 +4,18 @@ What each version changed. To get the newest one, run the install command in
 the [README](README.md#install) again. Check the installed version with
 `claude-session-sync --version`.
 
+## 0.5.3 (2026-10-17)
+
+- Fixed: a deleted routine came back when an account folder last used before
+  the delete joined the sync. Deletes are now remembered, so an old copy is
+  ignored and removed. A routine made again later still syncs.
+- Changed: on Claude versions that keep pins and groups per account on
+  Anthropic's servers, sync leaves the sidebar alone and reports
+  `per-account`. Those versions clear the copy on disk at every sign-in, so a
+  copied group list was dropped or never read, and a failed write could block
+  every later sidebar sync. Old sidebar journals no longer count as pending
+  recovery there.
+
 ## 0.5.2 (2026-10-10)
 
 - Fixed: pins and groups were skipped for every account when one chat was

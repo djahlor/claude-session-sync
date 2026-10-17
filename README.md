@@ -13,7 +13,11 @@ for example a work account and a personal one. Keep using the regular Claude app
 ## What it syncs
 
 - Claude Code chat history.
-- Pins and custom groups, copied from one main account to the others.
+- Pins and custom groups, copied from one main account to the others, on
+  Claude versions that keep them on your Mac. Newer Claude versions keep them
+  per account on Anthropic's servers and reload them at every sign-in. Sync
+  then leaves them alone and `status` shows `per-account`. Set groups once in
+  each account, in Claude itself.
 - Claude Code routines with their permission mode and saved approvals, but
   not past runs. Bypass mode also needs bypass turned on in each account.
 

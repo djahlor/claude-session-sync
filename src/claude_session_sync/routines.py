@@ -6,7 +6,8 @@ import copy
 import os
 import re
 import stat
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
@@ -30,6 +31,7 @@ from .store import SessionStore
 SNAPSHOT_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TASKS = 10_000
+MAX_DELETED = 10_000
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 MISSING = object()
 TargetKey = Tuple[str, str, str]
@@ -88,13 +90,19 @@ class RoutineSample:
 class RoutineSnapshot:
     targets: Tuple[TargetKey, ...]
     manifest: Mapping[str, Any]
+    # Task ID -> epoch milliseconds of the sync that first saw it deleted.
+    # A folder that joins later can hold an old copy; it must not bring it back.
+    deleted: Mapping[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        document = {
             "version": SNAPSHOT_VERSION,
             "targets": [list(target) for target in self.targets],
             "manifest": copy.deepcopy(dict(self.manifest)),
-        }
+        }  # type: Dict[str, Any]
+        if self.deleted:
+            document["deleted"] = dict(sorted(self.deleted.items()))
+        return document
 
 
 @dataclass(frozen=True)
@@ -271,6 +279,15 @@ def _field(task: Any, field: str) -> Any:
     return MISSING if task is MISSING else task.get(field, MISSING)
 
 
+def _created_after(task: Any, deleted_at: int) -> bool:
+    created = None if task is None else task.get("createdAt")
+    return (
+        isinstance(created, (int, float))
+        and not isinstance(created, bool)
+        and created > deleted_at
+    )
+
+
 def _without_permissions(task: Any) -> Any:
     if task is MISSING:
         return MISSING
@@ -317,6 +334,7 @@ def transform_routine_manifests(
     samples: Sequence[RoutineSample],
     *,
     snapshot: Optional[RoutineSnapshot] = None,
+    now_ms: Optional[int] = None,
 ) -> RoutineTransform:
     """Three-way merge task records so additions, edits, and deletions propagate."""
 
@@ -352,12 +370,35 @@ def transform_routine_manifests(
     for tasks in task_maps.values():
         task_ids.update(tasks)
 
+    deleted = dict(() if snapshot is None else snapshot.deleted)
     merged_tasks = []
     for task_id in sorted(task_ids):
+        task_samples = validated
+        deleted_at = None if task_id in baseline_tasks else deleted.get(task_id)
+        deleting_now = task_id in baseline_tasks and any(
+            sample.target in known_targets
+            and sample.document is not None
+            and task_id not in task_maps[sample.target]
+            for sample in validated
+        )
+        if deleted_at is not None or deleting_now:
+            # A folder that never synced may still hold a copy made before the
+            # delete. Only a known folder or a copy created later can restore it.
+            task_samples = tuple(
+                sample
+                for sample in validated
+                if sample.target in known_targets
+                or (
+                    deleted_at is not None
+                    and _created_after(
+                        task_maps.get(sample.target, {}).get(task_id), deleted_at
+                    )
+                )
+            )
         selected = _merge_task(
             task_id,
             baseline_tasks.get(task_id, MISSING),
-            validated,
+            task_samples,
             known_targets,
             task_maps,
         )
@@ -366,10 +407,19 @@ def transform_routine_manifests(
 
     merged: Dict[str, Any] = {"scheduledTasks": merged_tasks}
     merged = _validate_manifest(merged, "merged routine manifest")
+    merged_ids = {task["id"] for task in merged_tasks}
+    deleted = {task_id: at for task_id, at in deleted.items() if task_id not in merged_ids}
+    stamp = int(time.time() * 1000) if now_ms is None else now_ms
+    for task_id in baseline_tasks:
+        if task_id not in merged_ids:
+            deleted.setdefault(task_id, stamp)
+    if len(deleted) > MAX_DELETED:
+        newest = sorted(deleted.items(), key=lambda item: (-item[1], item[0]))
+        deleted = dict(newest[:MAX_DELETED])
     targets = tuple(sorted(sample.target for sample in validated))
     return RoutineTransform(
         merged,
-        RoutineSnapshot(targets, merged),
+        RoutineSnapshot(targets, merged, deleted),
         len(merged_tasks),
         {
             sample.target: _destination_manifest(merged, sample.document)
@@ -456,7 +506,21 @@ def _decode_snapshot(content: Optional[bytes]) -> Optional[RoutineSnapshot]:
     if len(targets) != len(set(targets)):
         raise RoutineError("routine snapshot has duplicate targets")
     manifest = _validate_manifest(value.get("manifest"), "routine snapshot")
-    return RoutineSnapshot(tuple(sorted(targets)), manifest)
+    raw_deleted = value.get("deleted", {})
+    if (
+        not isinstance(raw_deleted, dict)
+        or len(raw_deleted) > MAX_DELETED
+        or any(
+            not isinstance(task_id, str)
+            or not TASK_ID.fullmatch(task_id)
+            or not isinstance(at, int)
+            or isinstance(at, bool)
+            or at < 0
+            for task_id, at in raw_deleted.items()
+        )
+    ):
+        raise RoutineError("routine snapshot has invalid deletions")
+    return RoutineSnapshot(tuple(sorted(targets)), manifest, dict(raw_deleted))
 
 
 class RoutineSynchronizer:

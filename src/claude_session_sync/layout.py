@@ -60,6 +60,10 @@ NEEDS_MAIN_ACCOUNT = (
     "it is unclear which account's pins and groups to keep; list the accounts "
     "with keep-sidebar --dry-run, then keep one with keep-sidebar --account N --apply"
 )
+# Newer Claude builds keep pins and groups per account on Anthropic's servers
+# and reload them at every sign-in. Local records are only a cache then.
+PER_ACCOUNT = "per-account"
+PER_ACCOUNT_REASON = "claude-keeps-sidebar-per-account"
 
 
 class LayoutError(RuntimeError):
@@ -185,6 +189,25 @@ def _decode_record(value: bytes, label: str) -> Dict[str, Any]:
     if not isinstance(decoded, dict):
         raise LayoutError("{} is not a JSON object".format(label))
     return decoded
+
+
+def keeps_sidebar_on_server(record: Optional[bytes]) -> bool:
+    """Whether Claude seeded a sidebar section list from its account settings.
+
+    Such builds clear the local copy and reload the server's at every sign-in,
+    so a copy written here is either dropped or never read.
+    """
+    if record is None:
+        return False
+    try:
+        state = _decode_record(record, "dframe store").get("state")
+    except LayoutError:
+        return False
+    scopes = state.get("codeSidebarByScope") if isinstance(state, dict) else None
+    return isinstance(scopes, dict) and any(
+        isinstance(scope, dict) and scope.get("prefsSeeded") is True
+        for scope in scopes.values()
+    )
 
 
 def _encode_record(value: Mapping[str, Any]) -> bytes:
@@ -1030,6 +1053,14 @@ class LayoutSynchronizer:
             os.chmod(str(copied), 0o700)
             yield LevelDatabase(self.helper, copied)
 
+    def _keeps_sidebar_on_server(self) -> bool:
+        for profile in self.config.profiles:
+            self._assert_stopped()
+            with self._database_copy(profile.data_root) as database:
+                if keeps_sidebar_on_server(database.get_optional(DFRAME_STORE_KEY)):
+                    return True
+        return False
+
     def accounts(self, target_sessions: Mapping[str, Set[str]]) -> List[SidebarAccount]:
         """The default profile's accounts as rows. Works while Claude is open."""
 
@@ -1111,6 +1142,8 @@ class LayoutSynchronizer:
         if not self.config.sync_sidebar_layout:
             return {"state": "disabled"}
         self._assert_stopped()
+        if self._keeps_sidebar_on_server():
+            return {"state": PER_ACCOUNT, "reason": PER_ACCOUNT_REASON}
         adopt_source_scope, _pending = self._requested_source(False, None)
         profiles = groups = pins = assignments = 0
         reasons = []
@@ -1172,6 +1205,14 @@ class LayoutSynchronizer:
                 "another synchronization is still finishing"
             ) from error
         try:
+            if self._keeps_sidebar_on_server():
+                # Nothing on disk is the sidebar any more, so there is nothing to
+                # copy or recover. Older run journals stay on disk untouched.
+                if pending:
+                    clear_pending_adoption(self.config.state_dir)
+                return LayoutReceipt(
+                    PER_ACCOUNT, len(self.config.profiles), 0, 0, 0, 0, PER_ACCOUNT_REASON
+                )
             self._recover_pending()
             totals = [0, 0, 0, 0]
             changed_profiles = 0

@@ -24,9 +24,14 @@ def abandoned_preparation_count(state_dir: Path) -> int:
 
 def _adapter_recovery_pending(config) -> int:
     count = 0
+    # A per-account sidebar is never written or recovered, so old layout
+    # journals stay on disk as history instead of blocking anything.
+    layout_active = config.sync_sidebar_layout and read_status(
+        config.state_dir, "sidebar-layout-status.json"
+    ).get("state") != "per-account"
     for enabled, directory in (
         (config.sync_code_routines, "routine-runs"),
-        (config.sync_sidebar_layout, "layout-runs"),
+        (layout_active, "layout-runs"),
     ):
         root = config.state_dir / directory
         if not enabled or not os.path.lexists(root):
@@ -99,7 +104,7 @@ def doctor_summary(config: Config, dependencies, running) -> dict:
     probes = run_adapters(config, dependencies, running, probe_only=True)
     layout_failure = int(
         probes.get("layout", {}).get("state", "disabled")
-        not in ("compatible", "noop", "disabled")
+        not in ("compatible", "noop", "disabled", "per-account")
         and probes.get("layout", {}).get("reason") != "app-running"
     )
     routine_failure = int(

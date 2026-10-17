@@ -433,6 +433,120 @@ class LayoutRecoveryTests(unittest.TestCase):
                 "RECOVERY_REQUIRED", json.loads(journal_path.read_text())["state"]
             )
 
+    def server_owned_fixture(self, root):
+        """A closed Claude whose sidebar came from its account settings, plus
+        the stuck journal a failed write left behind on 17-10-2026."""
+        config = self.config(root)
+        database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+        database_path.mkdir(parents=True)
+        (config.profiles[0].data_root / "claude-code-sessions" / "a" / "w").mkdir(
+            parents=True
+        )
+        helper = root / "helper"
+        helper.write_bytes(b"placeholder")
+        os.chmod(helper, 0o700)
+        data = records({"a/w": scope("Focus")}, active="a/w")
+        store = decoded(data[DFRAME_STORE_KEY])
+        store["state"]["codeSidebarByScope"] = {
+            "a/w": {"sections": [], "migratedFrom": 1, "prefsSeeded": True}
+        }
+        data[DFRAME_STORE_KEY] = encoded(store)
+        journal_root = config.state_dir / "layout-runs"
+        journal_root.mkdir(parents=True)
+        synchronizer = LayoutSynchronizer(config, helper=helper, process_probe=lambda: ())
+        journal = journal_root / "stuck.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "state": "RECOVERY_REQUIRED",
+                    "records": [
+                        recovery_record(
+                            synchronizer._record_target(database_path, DFRAME_STORE_KEY),
+                            b"before",
+                            b"after",
+                        )
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        writes = []
+
+        class FakeDatabase:
+            def __init__(self, helper, database):
+                pass
+
+            def get(self, key):
+                return data[key]
+
+            def get_optional(self, key):
+                return data.get(key)
+
+            def write(self, records, state):
+                writes.append(records)
+
+        return config, synchronizer, journal, FakeDatabase, writes
+
+    def test_server_kept_sidebar_is_left_alone_without_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, journal, fake, writes = self.server_owned_fixture(
+                Path(directory)
+            )
+            before = journal.read_bytes()
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+                probe = synchronizer.probe()
+
+            self.assertEqual("per-account", receipt.state)
+            self.assertEqual("claude-keeps-sidebar-per-account", receipt.reason)
+            self.assertEqual(0, receipt.record_count)
+            self.assertEqual([], writes)
+            self.assertEqual(before, journal.read_bytes())
+            self.assertEqual(
+                {"state": "per-account", "reason": "claude-keeps-sidebar-per-account"},
+                probe,
+            )
+
+    def test_per_account_sidebar_does_not_count_old_journals_as_pending(self):
+        from claude_session_sync.adapters import adapter_failure, save_status
+        from claude_session_sync.health import _adapter_recovery_pending
+        from claude_session_sync.progress import finish_progress
+
+        with tempfile.TemporaryDirectory() as directory:
+            config, _synchronizer, _journal, _fake, _writes = self.server_owned_fixture(
+                Path(directory)
+            )
+            self.assertEqual(1, _adapter_recovery_pending(config))
+            save_status(
+                config.state_dir,
+                "sidebar-layout-status.json",
+                {"state": "per-account", "reason": "claude-keeps-sidebar-per-account"},
+            )
+
+            self.assertEqual(0, _adapter_recovery_pending(config))
+            self.assertEqual(0, adapter_failure(config, "layout"))
+            self.assertEqual(
+                "finished",
+                finish_progress(
+                    config, {"state": "committed", "layout": {"state": "per-account"}}
+                ),
+            )
+
+    def test_only_a_server_seeded_section_list_counts_as_per_account(self):
+        seeded = {"state": {"codeSidebarByScope": {"a/w": {"prefsSeeded": True}}}}
+        for record, expected in (
+            (encoded(seeded), True),
+            (encoded({"state": {"codeSidebarByScope": {"a/w": {"sections": []}}}}), False),
+            (encoded({"state": {"codeSidebarByScope": {"a/w": {"prefsSeeded": 1}}}}), False),
+            (encoded({"state": {"customGroupsByScope": {}}}), False),
+            (encoded({"state": []}), False),
+            (b"\x01{broken", False),
+            (None, False),
+        ):
+            with self.subTest(record=record):
+                self.assertIs(expected, layout_module.keeps_sidebar_on_server(record))
+
     def test_probe_opens_only_copied_database_and_leaves_live_files_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
