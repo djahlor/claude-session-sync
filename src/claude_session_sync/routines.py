@@ -6,8 +6,9 @@ import copy
 import os
 import re
 import stat
+import dataclasses
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
@@ -92,7 +93,7 @@ class RoutineSnapshot:
     manifest: Mapping[str, Any]
     # Task ID -> epoch milliseconds of the sync that first saw it deleted.
     # A folder that joins later can hold an old copy; it must not bring it back.
-    deleted: Mapping[str, int] = field(default_factory=dict)
+    deleted: Mapping[str, int] = dataclasses.field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         document = {
