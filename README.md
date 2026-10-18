@@ -1,6 +1,6 @@
 # Claude Session Sync
 
-Keep your Claude Code chats, pins, and groups when you switch accounts in the
+Keep your Claude Code chats and routines when you switch accounts in the
 Claude Desktop app on macOS. Runs locally, nothing leaves your Mac.
 
 For people who use more than one Claude account in Claude Desktop on one Mac,
@@ -13,11 +13,12 @@ for example a work account and a personal one. Keep using the regular Claude app
 ## What it syncs
 
 - Claude Code chat history.
-- Pins and custom groups, copied from one main account to the others, on
-  Claude versions that keep them on your Mac. Newer Claude versions keep them
-  per account on Anthropic's servers and reload them at every sign-in. Sync
-  then leaves them alone and `status` shows `per-account`. Set groups once in
-  each account, in Claude itself.
+- Pins and custom groups, only on older Claude versions that keep them on your
+  Mac. There they are copied from one main account to the others. Newer Claude
+  versions keep them per account on Anthropic's servers and reload them at
+  every sign-in, so sync leaves them alone and `status` shows `per-account`.
+  To give another account the same groups, see
+  [Groups on newer Claude versions](#groups-on-newer-claude-versions).
 - Claude Code routines with their permission mode and saved approvals, but
   not past runs. Bypass mode also needs bypass turned on in each account.
 
@@ -38,12 +39,12 @@ are missing. Then it downloads the latest version, builds its helpers, and adds 
 background helper and a small **Sync** menu-bar item. It does not replace the
 Claude app.
 
-If your accounts have different custom groups, it lists them, with up to three
-group names each, and asks which one is the main one. Type its number, or press
-Enter to keep the account you are signed into. The other accounts copy the main
-account's pins and groups the next time Claude closes. Sync never overwrites
-different groups on its own. Until you choose a main account, it leaves them
-alone.
+On older Claude versions, if your accounts have different custom groups, it
+lists them, with up to three group names each, and asks which one is the main
+one. Type its number, or press Enter to keep the account you are signed into.
+The other accounts copy the main account's pins and groups the next time Claude
+closes. Sync never overwrites different groups on its own. Until you choose a
+main account, it leaves them alone.
 
 A new account joins the sync the next time Claude closes after you sign in and
 open the Code tab once, so Claude creates the account's folder. You do not have
@@ -87,8 +88,8 @@ it. These are its steps:
 Chats sync when you switch accounts and when you quit Claude. Nothing syncs
 while Claude is open. Claude keeps your chats in memory and keeps pins and
 groups in a database it locks while it runs, so sync waits until Claude is
-closed. The restart after a switch also copies pins and groups from the account
-you just left.
+closed. On older Claude versions, the restart after a switch also copies pins
+and groups from the account you just left.
 
 A small status window shows what is happening, even if macOS hides notifications.
 The **Sync** menu keeps the latest status.
@@ -102,12 +103,42 @@ The **Sync** menu keeps the latest status.
 - Only folders of accounts you really use take part. Leftover folders from an
   old Mac are ignored.
 
-Pins and groups follow the account you use. When you switch, the account you
-just left is the source. Otherwise the account you are signed into wins. A
-group you delete stays deleted in every account. The one exception: if you
+On older Claude versions, pins and groups follow the account you use. When you
+switch, the account you just left is the source. Otherwise the account you are
+signed into wins. A group you delete stays deleted in every account. The one exception: if you
 delete the main account's last group, the other accounts keep theirs, and the
 status says so. To pick another main account later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
 Routines sync at the same moments as chats.
+
+## Groups on newer Claude versions
+
+Newer Claude versions keep pins, custom groups, and the sidebar view per
+account on Anthropic's servers. Claude loads them again at every sign-in and
+replaces any copy on your Mac, so sync cannot change them. After a switch, each
+account shows the groups it had the last time you used it.
+
+A group made in Claude's own sidebar is saved for that account and stays. So
+set up your groups once in each account. You can do it by hand, or let Claude
+do it with the [sidebar-groups skill](skills/sidebar-groups/SKILL.md). The
+skill uses the sidebar tools of the Claude Desktop Code tab, so it rebuilds
+every group and files every chat in one go.
+
+1. Install the skill once:
+
+   ```sh
+   mkdir -p ~/.claude/skills/sidebar-groups && curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/skills/sidebar-groups/SKILL.md -o ~/.claude/skills/sidebar-groups/SKILL.md
+   ```
+
+2. In the account whose groups you want to keep, open a chat in the Code tab
+   and ask Claude to save your sidebar groups.
+3. Sign in to another account, open a chat in the Code tab, and ask Claude to
+   sync your groups. It makes the same groups and files the same chats there.
+   Groups that are not in the saved list are removed. Their chats move to the
+   plain list. No chat is archived or deleted.
+4. Repeat step 3 once in each account. When you change your groups later, save
+   them again from that account first.
+
+The skill copies groups only, not pins.
 
 ## Update
 
@@ -144,9 +175,10 @@ If no notification appears, open Terminal and run:
 Status tells you whether sync is waiting, running, finished, or needs attention.
 The menu-bar item and status window do not depend on macOS notification banners.
 
-If sync has finished but custom groups are not visible, open the sidebar
-**Filter** menu and choose **Group by → Custom groups**. Each account can have
-its own display setting; **None** hides groups even when their data has synced.
+On older Claude versions, if sync has finished but custom groups are not
+visible, open the sidebar **Filter** menu and choose **Group by → Custom
+groups**. Each account can have its own display setting; **None** hides groups
+even when their data has synced.
 
 If it needs attention, run:
 

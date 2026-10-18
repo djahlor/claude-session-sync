@@ -342,8 +342,13 @@ reads nothing else, writes nothing, runs no recovery, and reports
 `layout={'state': 'per-account', 'reason': 'claude-keeps-sidebar-per-account'}`.
 That counts as finished. Older layout run journals stay on disk unchanged and no
 longer count as pending recovery. Seen on Desktop 2.42304.0, where seeded lists
-go back to at least 7 October 2026. The rest of this section describes builds
-without seeded lists.
+go back to at least 7 October 2026. On those builds, a group made through
+Claude's own sidebar is saved to the account and stays. The
+[sidebar-groups skill](../skills/sidebar-groups/SKILL.md) saves one account's
+groups to `~/.claude/sidebar-groups/layout.json` and rebuilds them in the
+signed-in account through the Code tab's sidebar tools. The README's
+[Groups on newer Claude versions](../README.md#groups-on-newer-claude-versions)
+has the steps. The rest of this section describes builds without seeded lists.
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
@@ -442,6 +447,9 @@ The watcher owns a persistent menu-bar status item and a non-activating status
 window. It does not rely on AppleScript or Notification Center delivery.
 
 ## Pins and groups across accounts
+
+This section describes builds without seeded section lists. On newer builds,
+see [Pins and custom groups](#pins-and-custom-groups).
 
 Claude keeps pins and custom groups in its Local Storage database, which it
 locks while open, and each account's group list also lives in that account's
