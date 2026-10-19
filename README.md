@@ -1,85 +1,52 @@
 # Claude Session Sync
 
-Keep your Claude Code chats and routines when you switch accounts in the
-Claude Desktop app on macOS. Runs locally, nothing leaves your Mac.
+Keep your Claude Code chats, groups, routines and browser logins when you switch accounts in the Claude Desktop app on a Mac.
 
-For people who use more than one Claude account in Claude Desktop on one Mac,
-for example a work account and a personal one. Keep using the regular Claude app.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+  <img alt="You switch accounts, Claude closes, sync copies chats, groups, routines and logins, Claude opens again" src="docs/images/how-it-works-light.svg">
+</picture>
+
+For people with more than one Claude account on one Mac, for example a work account and a personal one. You keep using the normal Claude app. Everything runs on your Mac and nothing leaves it.
 
 > [!WARNING]
-> Experimental and unofficial. Claude updates can break sync.
-> Only use this with accounts whose histories you are allowed to combine.
+> Experimental and unofficial. Claude updates can break parts of it. Only use it with accounts whose histories you are allowed to combine.
 
 ## What it syncs
 
-- Claude Code chat history.
-- Custom groups, which Claude now calls sections. On newer Claude versions the
-  restart after a switch copies the groups of the account you just left into
-  the account you signed in to, and Claude saves them to that account itself.
-  See [Groups on newer Claude versions](#groups-on-newer-claude-versions).
-  Older Claude versions keep pins and groups on your Mac, and both are copied
-  from one main account.
-- Claude Code routines with their permission mode and saved approvals, but
-  not past runs. Bypass mode also needs bypass turned on in each account.
-- If you turn it on, the site logins of Claude's built-in browser. See
-  [Browser logins](#browser-logins).
+| What | When | Standard install |
+|---|---|---|
+| Claude Code chats | Each switch and each quit | On |
+| Custom groups, which Claude now calls sections | Each switch | On |
+| Claude Code routines, with their permission mode and saved approvals | Each switch and each quit | On |
+| Site logins in Claude's built-in browser | Each switch | Off, [turn it on](#browser-logins) |
 
-Sync runs locally. It does not move data between Macs, transfer Claude web chats,
-copy your Claude logins, or sync Cowork routines.
+It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account.
+
+## Requirements
+
+- macOS with [Claude Desktop](https://claude.ai/download).
+- Apple's Command Line Tools. The installer asks macOS to install them if they are missing.
 
 ## Install
 
-You need macOS and [Claude Desktop](https://claude.ai/download). Paste this into
-Terminal:
+Paste this into Terminal:
 
 ```sh
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
 ```
 
-It checks for Apple's Command Line Tools and asks macOS to install them if they
-are missing. Then it downloads the latest version, builds its helpers, and adds a
-background helper and a small **Sync** menu-bar item. It does not replace the
-Claude app.
-
-On older Claude versions, if your accounts have different custom groups, it
-lists them, with up to three group names each, and asks which one is the main
-one. Type its number, or press Enter to keep the account you are signed into.
-The other accounts copy the main account's pins and groups the next time Claude
-closes. Sync never overwrites different groups on its own. Until you choose a
-main account, it leaves them alone.
-
-A new account joins the sync the next time Claude closes after you sign in and
-open the Code tab once, so Claude creates the account's folder. You do not have
-to start a chat first. Your sessions then appear the next time Claude opens.
+It downloads the latest version, builds its helpers, and adds a background helper with a small **Sync** item in the menu bar. It never replaces or quits the Claude app. The same command updates it.
 
 ### Without Terminal
 
 1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
-2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open
-   System Settings, then Privacy & Security, and click **Open Anyway**.
+2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open System Settings, then Privacy & Security, and click **Open Anyway**.
 3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
 
 ### With an AI agent
 
-Ask your agent: "Install or update Claude Session Sync from
-github.com/djahlor/claude-session-sync, then check it." The agent can do all of
-it. These are its steps:
-
-1. Run the install command above. Installing and updating are the same
-   command. It needs no keyboard: without a terminal it skips the main-account
-   question and keeps the account already chosen. It never quits Claude.
-2. Check the result:
-
-   ```sh
-   "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" --version
-   "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" status
-   ```
-
-   The version should match the newest one in [CHANGELOG.md](CHANGELOG.md).
-3. Nothing syncs while Claude is open. A fix for pins, groups, or routines
-   shows in `status` only after Claude has closed once. Until then `status`
-   keeps the last result. Quitting Claude ends every open chat, so ask the
-   person before you quit it.
+Ask your agent: "Install or update Claude Session Sync from github.com/djahlor/claude-session-sync, then check it." The install command needs no keyboard. Without a terminal it skips the main-account question and keeps the account already chosen. The agent can check the result with `--version` and `status` from [Commands](#commands). A fix shows in `status` only after Claude has closed once, and quitting Claude ends every open chat, so the agent should ask you before it quits Claude.
 
 ## Switch accounts
 
@@ -87,177 +54,86 @@ it. These are its steps:
 2. Sign in to the other account.
 3. Claude closes, syncs, and opens again by itself.
 
-Chats sync when you switch accounts and when you quit Claude. Nothing syncs
-while Claude is open. Claude keeps your chats in memory and keeps pins and
-groups in a database it locks while it runs, so sync waits until Claude is
-closed. On older Claude versions, the restart after a switch also copies pins
-and groups from the account you just left.
+Nothing syncs while Claude is open, because Claude keeps chats in memory and locks its database while it runs. Chats and routines also sync when you quit Claude. A small status window and the **Sync** menu show what is happening, even if macOS hides notifications.
 
-A small status window shows what is happening, even if macOS hides notifications.
-The **Sync** menu keeps the latest status.
+A new account joins the next time Claude closes after you sign in and open the Code tab once. You do not have to start a chat first.
 
 ## How it picks the right copy
 
 - The copy that changed since the last sync wins. A click never counts.
 - If both changed, the one with the latest real activity wins.
 - If that is a tie, the chat is left alone and the status says so.
-- Deleted chats stay deleted.
-- Only folders of accounts you really use take part. Leftover folders from an
-  old Mac are ignored.
+- Deleted chats and routines stay deleted.
+- Only folders of accounts you really use take part. Leftover folders from an old Mac are ignored.
 
-On older Claude versions, pins and groups follow the account you use. When you
-switch, the account you just left is the source. Otherwise the account you are
-signed into wins. A group you delete stays deleted in every account. The one exception: if you
-delete the main account's last group, the other accounts keep theirs, and the
-status says so. To pick another main account later, see [pins and groups across accounts](docs/technical-reference.md#pins-and-groups-across-accounts).
-Routines sync at the same moments as chats.
+## Groups
 
-## Groups on newer Claude versions
+Newer Claude versions keep groups per account on Anthropic's servers. When you switch, the restart copies the groups of the account you just left into the account you signed in to, and Claude saves them to that account itself. Sync never reads or sends your login. If something is not as sync expects, it changes nothing and `status` says why. Pins are not copied on these versions.
 
-Newer Claude versions keep pins, custom groups, and the sidebar view per
-account on Anthropic's servers. At startup Claude loads the account's saved
-copy. The one exception is Claude's own pending-upload flag: when it names the
-signed-in account, Claude uploads the copy on your Mac instead.
+Older Claude versions keep pins and groups on your Mac. One main account is the source. When your accounts have different groups, the installer asks which one is the main account, and until you choose, sync leaves the groups alone.
 
-Sync uses that flag. When you switch accounts, the restart copies the groups of
-the account you just left into the account you signed in to and sets the flag
-for that account. Claude opens and saves those groups to the account itself.
-Sync never reads or sends your login. If the signed-in account, a waiting
-upload, or Claude's settings sync is not what sync expects, it changes nothing
-and `status` says why.
-
-- The account you used last is the main one. Its groups go to the next account
-  you switch to.
-- An account with an edit still waiting to upload keeps it and becomes the main
-  one.
-- If you signed in to another account without the switch restart, sync waits
-  for the next switch.
-- Pins are not copied on these versions.
-- It needs sidebar sync turned on:
-
-  ```sh
-  "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" configure --sync-layout --apply
-  ```
-
-To copy groups by hand instead, use the
-[sidebar-groups skill](skills/sidebar-groups/SKILL.md). It rebuilds the groups
-in the signed-in account through the Code tab's own sidebar tools.
-
-1. Install the skill once:
-
-   ```sh
-   mkdir -p ~/.claude/skills/sidebar-groups && curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/skills/sidebar-groups/SKILL.md -o ~/.claude/skills/sidebar-groups/SKILL.md
-   ```
-
-2. In the account whose groups you want to keep, open a chat in the Code tab
-   and ask Claude to save your sidebar groups.
-3. Sign in to another account, open a chat in the Code tab, and ask Claude to
-   sync your groups. It makes the same groups and files the same chats there.
-   Groups that are not in the saved list are removed. Their chats move to the
-   plain list. No chat is archived or deleted.
-4. Repeat step 3 once in each account. When you change your groups later, save
-   them again from that account first.
-
-The skill copies groups only, not pins.
+You can also copy groups by hand with the [sidebar-groups skill](skills/sidebar-groups/SKILL.md). The [technical reference](docs/technical-reference.md#pins-and-custom-groups) has the steps and the rules for each version.
 
 ## Browser logins
 
-Claude clears its built-in browser every time the signed-in Claude account
-changes: the sites you signed in to, the cookies you imported, and their saved
-data. A restart with the same account keeps them, if **Keep cookies** is on.
+Claude clears its built-in browser every time the signed-in Claude account changes: the sites you signed in to, the cookies you imported, and their saved data. A restart with the same account keeps them, if **Keep cookies** is on.
 
-Turn this on and sync puts them back after a switch:
+With browser logins on, the background helper saves a copy of the built-in browser every 15 minutes and a few seconds after you import cookies. When you switch, the restart puts that copy back before Claude opens. Turn it on with `configure --sync-browser-logins --apply` from [Commands](#commands).
 
-```sh
-claude-session-sync configure --sync-browser-logins --apply
-```
+- It is off by default. Turned on, every Claude account on this Mac shares the same site logins in the built-in browser, which is what Claude's clearing prevents. Turn it on only when every account is yours.
+- If you clear the built-in browser yourself without switching, sync keeps it cleared.
+- The copy stays in sync's private folder, still encrypted with Claude's own key. Sync reads counts and times, never a cookie.
 
-While Claude runs, the background helper saves a copy of the built-in browser
-every five minutes and a few seconds after you import cookies. When you switch
-accounts, the restart puts that copy back before Claude opens. Claude then
-starts with the new account already known and keeps it.
+## Commands
 
-- Off by default. Every Claude account on this Mac then shares the same site
-  logins in the built-in browser, which is what Claude's clearing prevents.
-  Turn it on only when every account is yours.
-- If you clear the built-in browser yourself without switching accounts, sync
-  respects that and never brings the old copy back.
-- The copy stays in sync's private state folder, still encrypted with Claude's
-  own key. Sync reads only counts and times, never a cookie.
-- Check it with `claude-session-sync browser-logins status --json`.
-
-## Update
-
-Run the same Terminal command again. Installing and updating are one command.
-Your sync history, backups, and main account stay as they are, and Claude
-stays open. [CHANGELOG.md](CHANGELOG.md) lists what each version fixed.
-
-Updating the repository alone does not update the installed background helper;
-run the installer again to replace it. Check the installed version with:
+The installed tool lives in your Library folder. Set it once per Terminal window:
 
 ```sh
-"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" --version
+css="$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync"
 ```
 
-To remove it, run:
+| Command | What it does |
+|---|---|
+| `"$css" status` | Says whether sync is waiting, running, finished, or needs attention |
+| `"$css" doctor` | Checks the setup and names the part that failed |
+| `"$css" --version` | Shows the installed version |
+| `"$css" configure --sync-layout --apply` | Turns on groups |
+| `"$css" configure --sync-browser-logins --apply` | Turns on browser logins |
+| `"$css" browser-logins status --json` | Shows the saved browser copy, counts only |
+| `"$css" uninstall --apply` | Removes the background helper and menu-bar item |
 
-```sh
-"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" uninstall --apply
-```
+All commands and recovery steps are in the [technical reference](docs/technical-reference.md).
+
+## Update and uninstall
+
+Run the install command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
+
+To remove it, run `"$css" uninstall --apply`.
 
 ## If something goes wrong
 
-Update first. Run the install command again, or ask your AI agent to. Most
-problems are fixed in a newer version, and an update keeps your sync history
-and backups. Then quit Claude once, at a moment when no chat is working, so
-sync runs again.
+1. Update first, with the install command. Most problems are fixed in a newer version, and an update keeps your history and backups.
+2. Quit Claude once, at a moment when no chat is working, so sync runs again.
+3. Run `"$css" status`. If it needs attention, run `"$css" doctor`.
 
-If no notification appears, open Terminal and run:
+On older Claude versions, if groups synced but do not show, open the sidebar **Filter** menu and choose **Group by**, then **Custom groups**. Each account has its own setting, and **None** hides groups even when they synced.
 
-```sh
-"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" status
-```
-
-Status tells you whether sync is waiting, running, finished, or needs attention.
-The menu-bar item and status window do not depend on macOS notification banners.
-
-On older Claude versions, if sync has finished but custom groups are not
-visible, open the sidebar **Filter** menu and choose **Group by → Custom
-groups**. Each account can have its own display setting; **None** hides groups
-even when their data has synced.
-
-If it needs attention, run:
-
-```sh
-"$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" doctor
-```
-
-The tool keeps recovery backups. It stops affected changes when it finds damaged
-data, conflicting edits, or an unknown format. Never delete backups to clear an error.
+Sync keeps recovery backups and stops a change when it finds damaged data, conflicting edits, or a format it does not know. Never delete backups to clear an error.
 
 ## Limits
 
-- Sync writes only while Claude is closed. Quitting Claude ends every open
-  chat, so quit when no chat is working.
-- Sync reads Claude's private files. A Claude update can change them. Sync
-  then stops that part and says so. The last live test used Claude Desktop
-  2.31226.1, on 10 October 2026.
-- A new account cannot join at its very first sign-in, because Claude has not
-  made its folder yet. Open the Code tab once, then quit Claude.
-- Before 0.5.2, a new account with no chat never joined, and one chat filed
-  under a deleted group stopped pins and groups for every account. Update to
-  fix both.
-- To check that Claude is closed, use `pgrep -x Claude`. `pgrep -f` also
-  matches this tool's background helper.
+- Sync writes only while Claude is closed, and quitting Claude ends every open chat.
+- Sync reads Claude's private files, which an update can change. Sync then stops that part, leaves the rest running, and says so.
+- The last full live test used Claude Desktop 2.31226.1 on 10 October 2026. Groups were checked on 2.42304.0 on 19 October 2026. Browser login saving was checked on 2.42304.2 on 20 October 2026, and its restore is tested on copies.
+- To check that Claude is closed, use `pgrep -x Claude`. `pgrep -f` also matches the background helper.
 
-The [technical reference](docs/technical-reference.md#limits) has the live
-test, the full list, and a double-click script that repeats the test.
+The [technical reference](docs/technical-reference.md#limits) has the full list and a double-click script that repeats the live test.
 
-## Details
+## More
 
-[Commands and recovery](docs/technical-reference.md) ·
-[Tested scope and limits](docs/technical-reference.md#limits) ·
-[Changelog](CHANGELOG.md) ·
-[MIT license](LICENSE)
+- [Technical reference](docs/technical-reference.md)
+- [Changelog](CHANGELOG.md)
+- [Security](SECURITY.md)
+- [MIT license](LICENSE)
 
 This project is not affiliated with or supported by Anthropic.

@@ -261,7 +261,7 @@ private final class SessionSyncWatcher: NSObject {
     checkAccount()
   }
 
-  // Every five minutes, and a few seconds after Claude records an import.
+  // Every 15 minutes, and a few seconds after Claude records an import.
   // The sync tool decides whether the copy is worth keeping.
   private func scheduleBrowserLoginSnapshot() {
     guard let url = importsURL, profile != nil else { return }
@@ -275,7 +275,7 @@ private final class SessionSyncWatcher: NSObject {
     if now >= nextPeriodicSnapshot && snapshotDue == nil { snapshotDue = now }
     guard let due = snapshotDue, now >= due, !snapshotRunning, !running, !restartRequested else { return }
     snapshotDue = nil
-    nextPeriodicSnapshot = now.addingTimeInterval(300)
+    nextPeriodicSnapshot = now.addingTimeInterval(900)
     guard let executable = command.first else { return }
     let task = Process()
     task.executableURL = URL(fileURLWithPath: executable)

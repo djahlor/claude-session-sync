@@ -370,8 +370,28 @@ Verified on Desktop 2.42304.0 on 19 October 2026: after a copy, Claude cleared
 the flag within 10 seconds of opening and showed the copied sections. Seeded
 lists go back to at least 7 October 2026. The
 [sidebar-groups skill](../skills/sidebar-groups/SKILL.md) is a manual
-alternative that rebuilds groups through the Code tab's sidebar tools. The rest
-of this section describes builds without seeded lists.
+alternative that rebuilds groups through the Code tab's sidebar tools.
+
+To copy groups by hand with the skill:
+
+1. Install it once:
+
+   ```sh
+   mkdir -p ~/.claude/skills/sidebar-groups && curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/skills/sidebar-groups/SKILL.md -o ~/.claude/skills/sidebar-groups/SKILL.md
+   ```
+
+2. In the account whose groups you want to keep, open a chat in the Code tab
+   and ask Claude to save your sidebar groups.
+3. Sign in to another account, open a chat in the Code tab, and ask Claude to
+   sync your groups. It makes the same groups and files the same chats there.
+   Groups that are not in the saved list are removed, and their chats move to
+   the plain list. No chat is archived or deleted.
+4. Repeat step 3 once in each account. When you change your groups later, save
+   them again from that account first.
+
+The skill copies groups only, not pins.
+
+The rest of this section describes builds without seeded lists.
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
@@ -571,7 +591,7 @@ partition, its local storage, and that jar's entries in
   it is safe while Claude runs. It skips an empty jar (`jar-empty`), an
   unchanged one (`unchanged`), and waits one run before it accepts a drop to
   less than half the saved cookies (`large-drop`). The watcher runs it every
-  five minutes and five seconds after the import record changes.
+  15 minutes and five seconds after the import record changes.
 - `switch`, before it reopens Claude, and `auto`, at a quit, restore the copy
   when the jar is empty and the account hash differs from the copy's. The live
   jar is copied to `backups/` first (last three kept).

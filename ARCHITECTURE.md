@@ -146,7 +146,7 @@ its local storage and its imported-site records on every account change, and
 keeps them across same-account restarts. The optional adapter
 (`sync_browser_logins`) keeps one copy per profile in the state folder:
 SQLite's backup API copies the cookie database while Claude runs, the watcher
-starts a snapshot every five minutes and after the import record changes, and
+starts a snapshot every 15 minutes and after the import record changes, and
 an empty jar never replaces a saved copy. With Claude closed, `switch` and
 `auto` restore the copy only when the jar is empty and the account hash differs
 from the copy's; an empty jar under the same account is a deliberate clear and
