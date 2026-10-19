@@ -231,6 +231,12 @@ def _parser() -> argparse.ArgumentParser:
     rollback = commands.add_parser("rollback", help="restore an earlier run")
     rollback.add_argument("run_id")
     rollback.add_argument("--json", action="store_true", dest="as_json")
+    browser_logins = commands.add_parser(
+        "browser-logins",
+        help="save or restore the built-in browser's site logins",
+    )
+    browser_logins.add_argument("action", choices=("snapshot", "restore", "status"))
+    browser_logins.add_argument("--json", action="store_true", dest="as_json")
     status = commands.add_parser("status", help="show current adapter state")
     status.add_argument("--json", action="store_true", dest="as_json")
     doctor = commands.add_parser("doctor", help="validate configuration safety")
@@ -261,6 +267,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="sync Claude Code routines after Claude quits",
     )
+    configure.add_argument(
+        "--sync-browser-logins",
+        action="store_true",
+        help="keep the built-in browser's site logins across account switches",
+    )
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
     configure_mode.add_argument("--apply", action="store_true")
@@ -270,6 +281,7 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--automatic-targets", action="store_true")
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
+    setup.add_argument("--sync-browser-logins", action="store_true")
     setup.add_argument(
         "--ask-main-account",
         action="store_true",
@@ -353,6 +365,22 @@ def _running_processes(
         executable=config.claude_executable,
         timeout=timeout,
     )
+
+
+def _settle_browser_logins(config: Config, dependencies: CliDependencies, profiles) -> dict:
+    """Claude is closed: put back logins a switch cleared, or save them. Never raises."""
+
+    from .browser_logins import run_browser_logins
+
+    try:
+        return run_browser_logins(
+            config,
+            lambda: bool(_running_processes(config, dependencies)),
+            "settle",
+            profiles=profiles,
+        )
+    except Exception as error:
+        return {"state": "failed", "reason": type(error).__name__}
 
 
 def _wait_for_managed_processes_to_exit(
@@ -440,6 +468,7 @@ def _run_switch(
             )
             return 1
         record_progress(config, "syncing")
+        browser_logins = None
         try:
             payload = _switch_chat_result(config, dependencies)
             payload.update(
@@ -454,7 +483,10 @@ def _run_switch(
             payload["progress"] = finish_progress(config, payload)
         finally:
             # Claude was closed for this switch. It reopens even when the sync
-            # failed, so a failed sync never leaves Claude closed.
+            # failed, so a failed sync never leaves Claude closed. The account
+            # change just cleared the built-in browser, so its logins go back
+            # first: Claude then starts with the new account already known.
+            browser_logins = _settle_browser_logins(config, dependencies, (profile,))
             launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
         if launch_failed:
             _write(
@@ -465,6 +497,8 @@ def _run_switch(
             return 1
         if not arguments.no_launch:
             payload["launch"] = "started"
+        if browser_logins is not None and browser_logins["state"] != "disabled":
+            payload["browser_logins"] = browser_logins
         _write(payload, as_json=as_json, stream=output)
         return 0 if payload["progress"] == "finished" else 1
     finally:
@@ -875,6 +909,9 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
                 adopt_source_scope=getattr(arguments, "adopt_source_scope", None),
             )
         )
+        browser_logins = _settle_browser_logins(config, deps, config.profiles)
+        if browser_logins["state"] != "disabled":
+            payload["browser_logins"] = browser_logins
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
         return _exit_code(arguments, payload["progress"])
@@ -963,6 +1000,7 @@ def run(
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
+                sync_browser_logins=arguments.sync_browser_logins,
             )
             ask = None
             if arguments.ask_main_account and arguments.apply:
@@ -997,6 +1035,7 @@ def run(
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
+                sync_browser_logins=arguments.sync_browser_logins,
                 apply=arguments.apply,
             )
             _write(payload, as_json=False, stream=output)
@@ -1089,6 +1128,16 @@ def run(
                 stream=output,
             )
             return 0
+        if arguments.command == "browser-logins":
+            from .browser_logins import run_browser_logins
+
+            payload = run_browser_logins(
+                config,
+                lambda: bool(_running_processes(config, deps)),
+                arguments.action,
+            )
+            _write(payload, as_json=arguments.as_json, stream=output)
+            return 0 if payload["state"] in ("done", "disabled") else 1
         if arguments.command == "status":
             running = _running_processes(config, deps)
             watcher_error = watcher_failure(config.state_dir)

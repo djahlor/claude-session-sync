@@ -21,9 +21,11 @@ for example a work account and a personal one. Keep using the regular Claude app
   from one main account.
 - Claude Code routines with their permission mode and saved approvals, but
   not past runs. Bypass mode also needs bypass turned on in each account.
+- If you turn it on, the site logins of Claude's built-in browser. See
+  [Browser logins](#browser-logins).
 
 Sync runs locally. It does not move data between Macs, transfer Claude web chats,
-copy logins, or sync Cowork routines.
+copy your Claude logins, or sync Cowork routines.
 
 ## Install
 
@@ -157,6 +159,32 @@ in the signed-in account through the Code tab's own sidebar tools.
    them again from that account first.
 
 The skill copies groups only, not pins.
+
+## Browser logins
+
+Claude clears its built-in browser every time the signed-in Claude account
+changes: the sites you signed in to, the cookies you imported, and their saved
+data. A restart with the same account keeps them, if **Keep cookies** is on.
+
+Turn this on and sync puts them back after a switch:
+
+```sh
+claude-session-sync configure --sync-browser-logins --apply
+```
+
+While Claude runs, the background helper saves a copy of the built-in browser
+every five minutes and a few seconds after you import cookies. When you switch
+accounts, the restart puts that copy back before Claude opens. Claude then
+starts with the new account already known and keeps it.
+
+- Off by default. Every Claude account on this Mac then shares the same site
+  logins in the built-in browser, which is what Claude's clearing prevents.
+  Turn it on only when every account is yours.
+- If you clear the built-in browser yourself without switching accounts, sync
+  respects that and never brings the old copy back.
+- The copy stays in sync's private state folder, still encrypted with Claude's
+  own key. Sync reads only counts and times, never a cookie.
+- Check it with `claude-session-sync browser-logins status --json`.
 
 ## Update
 

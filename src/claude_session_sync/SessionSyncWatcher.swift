@@ -96,6 +96,13 @@ private final class SessionSyncWatcher: NSObject {
   private var noticePanel: NSPanel?
   private var noticeGeneration = 0
   private var lastMessage = ""
+  // The built-in browser loses its site logins on every account change. A
+  // copy saved while it is healthy is what the switch puts back.
+  private let importsURL: URL?
+  private var importsStamp: Date?
+  private var snapshotDue: Date?
+  private var nextPeriodicSnapshot = Date().addingTimeInterval(60)
+  private var snapshotRunning = false
 
   init(command: [String], claudeExecutable: String, statusURL: URL,
        accountURL: URL?, profile: String?) {
@@ -107,6 +114,7 @@ private final class SessionSyncWatcher: NSObject {
     let directory = statusURL.deletingLastPathComponent()
     self.restartURL = directory.appendingPathComponent("account-restart.json")
     self.restartRequestURL = directory.appendingPathComponent("restart-request")
+    self.importsURL = accountURL?.deletingLastPathComponent().appendingPathComponent("chrome-import-sites.json")
     super.init()
     if accountURL != nil {
       do {
@@ -249,7 +257,39 @@ private final class SessionSyncWatcher: NSObject {
       requestRestart(mode: request.contains("adopt-current-sidebar") ? "adopt-current-sidebar" : nil)
       return
     }
+    scheduleBrowserLoginSnapshot()
     checkAccount()
+  }
+
+  // Every five minutes, and a few seconds after Claude records an import.
+  // The sync tool decides whether the copy is worth keeping.
+  private func scheduleBrowserLoginSnapshot() {
+    guard let url = importsURL, profile != nil else { return }
+    let now = Date()
+    // URL resource values are cached per URL object, so ask the file system each time.
+    let stamp = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    if stamp != importsStamp {
+      if importsStamp != nil || stamp != nil { snapshotDue = now.addingTimeInterval(5) }
+      importsStamp = stamp
+    }
+    if now >= nextPeriodicSnapshot && snapshotDue == nil { snapshotDue = now }
+    guard let due = snapshotDue, now >= due, !snapshotRunning, !running, !restartRequested else { return }
+    snapshotDue = nil
+    nextPeriodicSnapshot = now.addingTimeInterval(300)
+    guard let executable = command.first else { return }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: executable)
+    task.arguments = Array(command.dropFirst()) + ["browser-logins", "snapshot", "--json"]
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    task.terminationHandler = { [weak self] _ in self?.queue.async { self?.snapshotRunning = false } }
+    do {
+      try task.run()
+      snapshotRunning = true
+    } catch {
+      NSLog("claude-session-sync watcher could not start a browser login snapshot")
+    }
   }
 
   private func checkAccount() {

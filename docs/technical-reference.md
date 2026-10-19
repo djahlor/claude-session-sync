@@ -559,6 +559,30 @@ and never change a completed chat result, but the overall command returns a
 nonzero exit code with `progress=needs-attention`. This tool syncs Claude Code routines only;
 Cowork routines use different space-specific context and are left untouched.
 
+## Built-in browser logins
+
+Optional, off by default (`sync_browser_logins`). Claude Desktop clears its
+built-in browser on every account change: the `launch-preview-cowork-shared`
+partition, its local storage, and that jar's entries in
+`chrome-import-sites.json`. A same-account restart keeps them.
+
+- `browser-logins snapshot` copies the jar into
+  `<state_dir>/browser-logins/<profile>/snapshot` with SQLite's backup API, so
+  it is safe while Claude runs. It skips an empty jar (`jar-empty`), an
+  unchanged one (`unchanged`), and waits one run before it accepts a drop to
+  less than half the saved cookies (`large-drop`). The watcher runs it every
+  five minutes and five seconds after the import record changes.
+- `switch`, before it reopens Claude, and `auto`, at a quit, restore the copy
+  when the jar is empty and the account hash differs from the copy's. The live
+  jar is copied to `backups/` first (last three kept).
+- An empty jar under the same account is a clear the person made in Claude.
+  The copy is then marked and never restored (`cleared-in-claude`), until a new
+  healthy snapshot replaces it.
+- `browser-logins status --json` reports counts, times, and whether the copy
+  belongs to the signed-in account. Cookie values and the account id are never
+  read into output; the account is stored as a SHA-256 hash.
+- A failure here never blocks chat sync or the relaunch.
+
 ## Failure handling
 
 `auto` and `sync` report chats left alone in `counts` (`tied`, `lost`,

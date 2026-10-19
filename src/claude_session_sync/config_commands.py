@@ -81,6 +81,7 @@ def _prepare_config_data(
     automatic_targets: bool,
     sync_layout: bool,
     sync_routines: bool,
+    sync_browser_logins: bool = False,
 ) -> tuple[bytes, dict]:
     """Return validated desired config bytes and a safe change summary."""
 
@@ -92,6 +93,7 @@ def _prepare_config_data(
         automatic_targets=automatic_targets,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
+        sync_browser_logins=sync_browser_logins,
     )
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     _validate_config_data(encoded)
@@ -105,6 +107,7 @@ def _configure(
     sync_layout: bool,
     sync_routines: bool,
     apply: bool,
+    sync_browser_logins: bool = False,
 ) -> dict:
     from .filesystem import atomic_write_bytes, ensure_private_directory
 
@@ -114,6 +117,7 @@ def _configure(
         automatic_targets=automatic_targets,
         sync_layout=sync_layout,
         sync_routines=sync_routines,
+        sync_browser_logins=sync_browser_logins,
     )
 
     changes = payload["counts"]["changes"]
@@ -134,6 +138,7 @@ def _apply_config_options(
     automatic_targets: bool,
     sync_layout: bool,
     sync_routines: bool,
+    sync_browser_logins: bool = False,
 ) -> int:
     changes = _drop_personal_profile(document)
 
@@ -155,6 +160,10 @@ def _apply_config_options(
 
     if sync_routines and document.get("sync_code_routines") is not True:
         document["sync_code_routines"] = True
+        changes += 1
+
+    if sync_browser_logins and document.get("sync_browser_logins") is not True:
+        document["sync_browser_logins"] = True
         changes += 1
 
     return changes
@@ -192,5 +201,6 @@ def _config_summary(document: dict, changes: int) -> dict:
             ),
             "layout_sync": int(document.get("sync_sidebar_layout") is True),
             "routine_sync": int(document.get("sync_code_routines") is True),
+            "browser_login_sync": int(document.get("sync_browser_logins") is True),
         },
     }

@@ -4,6 +4,14 @@ What each version changed. To get the newest one, run the install command in
 the [README](README.md#install) again. Check the installed version with
 `claude-session-sync --version`.
 
+## 0.6.0 (2026-10-20)
+
+- Added: optional browser logins. Claude clears its built-in browser on every
+  account change. With `configure --sync-browser-logins --apply`, the
+  background helper saves a copy while it is healthy, and the restart after a
+  switch puts it back before Claude opens. A browser you cleared yourself
+  stays cleared. New command: `browser-logins snapshot|restore|status`.
+
 ## 0.5.4 (2026-10-19)
 
 - Fixed: on Claude versions that keep groups per account on Anthropic's
