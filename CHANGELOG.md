@@ -4,6 +4,21 @@ What each version changed. To get the newest one, run the install command in
 the [README](README.md#install) again. Check the installed version with
 `claude-session-sync --version`.
 
+## 0.5.4 (2026-10-19)
+
+- Fixed: on Claude versions that keep groups per account on Anthropic's
+  servers, an account switch showed that account's old groups. The restart
+  after a switch now copies the groups of the account you just left into the
+  new account and sets Claude's own pending-upload flag, so Claude saves them
+  to that account itself. It changes nothing when the signed-in account, a
+  waiting upload or Claude's settings sync does not match. Pins stay per
+  account on these versions.
+- Fixed: 0.5.3 said Claude clears the local copy at every sign-in. It keeps
+  every account's slot. It loads the server copy unless the upload flag names
+  the signed-in account.
+- Added: the sidebar-groups skill, to rebuild groups by hand through the Code
+  tab's sidebar tools.
+
 ## 0.5.3 (2026-10-17)
 
 - Fixed: a deleted routine came back when an account folder last used before

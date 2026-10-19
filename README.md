@@ -13,12 +13,12 @@ for example a work account and a personal one. Keep using the regular Claude app
 ## What it syncs
 
 - Claude Code chat history.
-- Pins and custom groups, only on older Claude versions that keep them on your
-  Mac. There they are copied from one main account to the others. Newer Claude
-  versions keep them per account on Anthropic's servers and reload them at
-  every sign-in, so sync leaves them alone and `status` shows `per-account`.
-  To give another account the same groups, see
-  [Groups on newer Claude versions](#groups-on-newer-claude-versions).
+- Custom groups, which Claude now calls sections. On newer Claude versions the
+  restart after a switch copies the groups of the account you just left into
+  the account you signed in to, and Claude saves them to that account itself.
+  See [Groups on newer Claude versions](#groups-on-newer-claude-versions).
+  Older Claude versions keep pins and groups on your Mac, and both are copied
+  from one main account.
 - Claude Code routines with their permission mode and saved approvals, but
   not past runs. Bypass mode also needs bypass turned on in each account.
 
@@ -113,15 +113,33 @@ Routines sync at the same moments as chats.
 ## Groups on newer Claude versions
 
 Newer Claude versions keep pins, custom groups, and the sidebar view per
-account on Anthropic's servers. Claude loads them again at every sign-in and
-replaces any copy on your Mac, so sync cannot change them. After a switch, each
-account shows the groups it had the last time you used it.
+account on Anthropic's servers. At startup Claude loads the account's saved
+copy. The one exception is Claude's own pending-upload flag: when it names the
+signed-in account, Claude uploads the copy on your Mac instead.
 
-A group made in Claude's own sidebar is saved for that account and stays. So
-set up your groups once in each account. You can do it by hand, or let Claude
-do it with the [sidebar-groups skill](skills/sidebar-groups/SKILL.md). The
-skill uses the sidebar tools of the Claude Desktop Code tab, so it rebuilds
-every group and files every chat in one go.
+Sync uses that flag. When you switch accounts, the restart copies the groups of
+the account you just left into the account you signed in to and sets the flag
+for that account. Claude opens and saves those groups to the account itself.
+Sync never reads or sends your login. If the signed-in account, a waiting
+upload, or Claude's settings sync is not what sync expects, it changes nothing
+and `status` says why.
+
+- The account you used last is the main one. Its groups go to the next account
+  you switch to.
+- An account with an edit still waiting to upload keeps it and becomes the main
+  one.
+- If you signed in to another account without the switch restart, sync waits
+  for the next switch.
+- Pins are not copied on these versions.
+- It needs sidebar sync turned on:
+
+  ```sh
+  "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" configure --sync-layout --apply
+  ```
+
+To copy groups by hand instead, use the
+[sidebar-groups skill](skills/sidebar-groups/SKILL.md). It rebuilds the groups
+in the signed-in account through the Code tab's own sidebar tools.
 
 1. Install the skill once:
 

@@ -333,22 +333,45 @@ down faster.
 ## Pins and custom groups
 
 Newer Claude builds keep pins, groups, and the sidebar view per account on
-Anthropic's servers. They mark each account's section list as seeded from
-account settings (`prefsSeeded` under `codeSidebarByScope`), clear the local
-copy at every sign-in, and load the new account's list. A copy written to disk
-is then dropped or never read, and the account just left may no longer have its
-groups on disk at all. When the layout adapter finds a seeded section list, it
-reads nothing else, writes nothing, runs no recovery, and reports
-`layout={'state': 'per-account', 'reason': 'claude-keeps-sidebar-per-account'}`.
-That counts as finished. Older layout run journals stay on disk unchanged and no
-longer count as pending recovery. Seen on Desktop 2.42304.0, where seeded lists
-go back to at least 7 October 2026. On those builds, a group made through
-Claude's own sidebar is saved to the account and stays. The
-[sidebar-groups skill](../skills/sidebar-groups/SKILL.md) saves one account's
-groups to `~/.claude/sidebar-groups/layout.json` and rebuilds them in the
-signed-in account through the Code tab's sidebar tools. The README's
-[Groups on newer Claude versions](../README.md#groups-on-newer-claude-versions)
-has the steps. The rest of this section describes builds without seeded lists.
+Anthropic's servers, in the `ccd/dframe-store` entry of
+`/api/claude_code/organizations/{org}/user_settings`. They mark each account's
+section list as seeded from account settings (`prefsSeeded` under
+`codeSidebarByScope`). Local Storage keeps one slot per `ACCOUNT/WORKSPACE` in
+`codeSidebarByScope` and `customGroupsByScope`, and signing out keeps them. At
+startup Claude loads the account's server copy, except when
+`ccd-sync-pending:ccd/dframe-store` equals the signed-in `ACCOUNT/WORKSPACE`
+and `ccd-sync-owner` names that account: then the local slot wins and Claude
+uploads it. A `|migrate` suffix merges the server copy in first, so sync never
+writes it. Which local chat sits in which section is never uploaded.
+
+When the layout adapter finds a seeded section list, it works this way and
+reports `state: per-account`:
+
+- `sidebar-main-0.json` in the state folder names the main account: the one
+  signed in at the last closed sync.
+- After a switch, it copies the main account's slot into the signed-in
+  account's slot, rebuilds that account's `customGroupsByScope` entry from the
+  sections, sets the pending-upload flag for that account, and makes it the
+  main one. The reason is `claude-uploads-copy-on-next-start`.
+- `keep-sidebar --account N --apply` copies that account's slot into the
+  signed-in one the same way at the next closed sync.
+- It writes nothing when the owner is another account
+  (`signed-in-account-not-confirmed`), Claude's settings sync is quarantined
+  (`claude-settings-sync-quarantined`), another account's upload waits
+  (`another-upload-pending`), the signed-in slot is not loaded yet
+  (`signed-in-sidebar-not-loaded`), the main slot has no sections
+  (`main-account-has-no-groups`), or the account changed without the switch
+  restart (`account-changed-without-switch-restart`). A signed-in account with
+  its own upload waiting (`signed-in-edit-pending`) becomes the main one.
+- Writes use their own journal, `layout-account-runs`. Older `layout-runs`
+  journals stay on disk unchanged and no longer count as pending recovery.
+
+Verified on Desktop 2.42304.0 on 19 October 2026: after a copy, Claude cleared
+the flag within 10 seconds of opening and showed the copied sections. Seeded
+lists go back to at least 7 October 2026. The
+[sidebar-groups skill](../skills/sidebar-groups/SKILL.md) is a manual
+alternative that rebuilds groups through the Code tab's sidebar tools. The rest
+of this section describes builds without seeded lists.
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe

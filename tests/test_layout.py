@@ -498,13 +498,14 @@ class LayoutRecoveryTests(unittest.TestCase):
                 receipt = synchronizer.sync(after_account_switch=True)
                 probe = synchronizer.probe()
 
+            # No owner key: Claude would ignore an upload flag, so nothing is written.
             self.assertEqual("per-account", receipt.state)
-            self.assertEqual("claude-keeps-sidebar-per-account", receipt.reason)
+            self.assertEqual("signed-in-account-not-confirmed", receipt.reason)
             self.assertEqual(0, receipt.record_count)
             self.assertEqual([], writes)
             self.assertEqual(before, journal.read_bytes())
             self.assertEqual(
-                {"state": "per-account", "reason": "claude-keeps-sidebar-per-account"},
+                {"state": "per-account", "reason": "signed-in-account-not-confirmed"},
                 probe,
             )
 
@@ -1809,3 +1810,252 @@ class StaleGroupPointerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def section(name, members=(), kind="manual"):
+    return {
+        "id": "cg-{}".format(name.lower()),
+        "kind": kind,
+        "v": 2,
+        "name": name,
+        "order": 0,
+        "members": ["code:local_{}".format(member) for member in members],
+    }
+
+
+def seeded_slot(*sections):
+    built = [section("", kind="pinned")] + list(sections) + [section("", kind="sessions")]
+    for index, entry in enumerate(built):
+        entry["order"] = index
+        if entry["kind"] != "manual":
+            entry["id"] = entry["kind"]
+            del entry["members"]
+    return {"sections": built, "migratedFrom": 1, "prefsSeeded": True}
+
+
+class PerAccountCopyTests(unittest.TestCase):
+    """Builds that keep the sidebar per account: copy, then let Claude upload."""
+
+    MAIN = seeded_slot(section("Popcorn", ["p1", "p2"]), section("Life", ["l1"]))
+    OLD = seeded_slot(section("Customers", ["p1"]), section("Old", ["l1"]))
+
+    def fixture(self, root, *, active="b/w", owner="b", flag=None, quarantine=False, slots=None):
+        config = LayoutRecoveryTests().config(root)
+        database_path = config.profiles[0].data_root / "Local Storage" / "leveldb"
+        database_path.mkdir(parents=True)
+        helper = root / "helper"
+        helper.write_bytes(b"placeholder")
+        os.chmod(helper, 0o700)
+        slots = slots if slots is not None else {"a/w": self.MAIN, "b/w": self.OLD}
+        state = {
+            "codeSidebarByScope": copy.deepcopy(slots),
+            "customGroupsByScope": {"b/w": scope("Customers", "Old")},
+            "lastSidebarScopeKey": active,
+            "pinnedOrder": [],
+        }
+        data = {DFRAME_STORE_KEY: encoded({"state": state, "version": 1, "shared": {}})}
+        if owner is not None:
+            data[layout_module.SYNC_OWNER_KEY] = b"\x01" + owner.encode()
+        if flag is not None:
+            data[layout_module.GROUP_UPLOAD_KEY] = flag
+        if quarantine:
+            data[layout_module.SYNC_QUARANTINE_KEY] = b"\x011"
+        writes = []
+
+        class FakeDatabase:
+            def __init__(self, helper, database):
+                self.database = Path(database)
+
+            def get(self, key):
+                return data[key]
+
+            def get_optional(self, key):
+                return data.get(key)
+
+            def write(self, records, state_dir):
+                writes.append(records)
+                for key, value in records.items():
+                    if value is None:
+                        data.pop(key, None)
+                    else:
+                        data[key] = value
+
+        synchronizer = LayoutSynchronizer(config, helper=helper, process_probe=lambda: ())
+        return config, synchronizer, data, writes, FakeDatabase
+
+    def main_file(self, config, scope_key):
+        path = config.state_dir / "sidebar-main-0.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "main_scope": scope_key}))
+        return path
+
+    def test_switch_copies_main_sidebar_and_sets_claudes_upload_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            main = self.main_file(config, "a/w")
+            old_journals = config.state_dir / "layout-runs"
+            old_journals.mkdir(parents=True)
+            stuck = old_journals / "stuck.json"
+            stuck.write_text('{"version": 2, "state": "RECOVERY_REQUIRED", "records": []}')
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+
+            state = decoded(data[DFRAME_STORE_KEY])["state"]
+            self.assertEqual(self.MAIN, state["codeSidebarByScope"]["b/w"])
+            self.assertEqual(self.MAIN, state["codeSidebarByScope"]["a/w"])
+            self.assertEqual(
+                {
+                    "groups": [
+                        {"id": "cg-popcorn", "name": "Popcorn"},
+                        {"id": "cg-life", "name": "Life"},
+                    ],
+                    "assignments": {
+                        "code:local_p1": "cg-popcorn",
+                        "code:local_p2": "cg-popcorn",
+                        "code:local_l1": "cg-life",
+                    },
+                    "order": {
+                        "cg-popcorn": ["code:local_p1", "code:local_p2"],
+                        "cg-life": ["code:local_l1"],
+                    },
+                },
+                state["customGroupsByScope"]["b/w"],
+            )
+            self.assertEqual(b"\x01b/w", data[layout_module.GROUP_UPLOAD_KEY])
+            self.assertEqual("b/w", json.loads(main.read_text())["main_scope"])
+            self.assertEqual("per-account", receipt.state)
+            self.assertEqual("claude-uploads-copy-on-next-start", receipt.reason)
+            self.assertEqual((2, 2, 3), (receipt.record_count, receipt.group_count,
+                                         receipt.assignment_count))
+            runs = list((config.state_dir / "layout-account-runs").glob("*.json"))
+            self.assertEqual(["COMMITTED"], [json.loads(run.read_text())["state"] for run in runs])
+            self.assertIn("RECOVERY_REQUIRED", stuck.read_text())
+
+    def test_plain_quit_on_main_account_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            self.main_file(config, "b/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync()
+            self.assertEqual([], writes)
+            self.assertEqual(0, receipt.record_count)
+            self.assertNotIn(layout_module.GROUP_UPLOAD_KEY, data)
+
+    def test_first_run_makes_the_signed_in_account_the_main_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                synchronizer.sync(after_account_switch=True)
+            self.assertEqual([], writes)
+            main = json.loads((config.state_dir / "sidebar-main-0.json").read_text())
+            self.assertEqual("b/w", main["main_scope"])
+
+    def test_account_change_without_switch_restart_waits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            main = self.main_file(config, "a/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync()
+            self.assertEqual([], writes)
+            self.assertEqual("account-changed-without-switch-restart", receipt.reason)
+            self.assertEqual("a/w", json.loads(main.read_text())["main_scope"])
+
+    def test_requested_account_is_copied_without_a_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            self.main_file(config, "b/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(adopt_source_scope="a/w")
+            state = decoded(data[DFRAME_STORE_KEY])["state"]
+            self.assertEqual(self.MAIN, state["codeSidebarByScope"]["b/w"])
+            self.assertEqual("claude-uploads-copy-on-next-start", receipt.reason)
+
+    def test_refuses_when_claude_would_ignore_or_mistake_the_flag(self):
+        cases = (
+            ({"owner": "a"}, "signed-in-account-not-confirmed"),
+            ({"owner": None}, "signed-in-account-not-confirmed"),
+            ({"quarantine": True}, "claude-settings-sync-quarantined"),
+            ({"flag": b"\x01a/w"}, "another-upload-pending"),
+            ({"active": "c/w"}, "signed-in-sidebar-not-loaded"),
+        )
+        for options, reason in cases:
+            with self.subTest(reason=reason, options=options):
+                with tempfile.TemporaryDirectory() as directory:
+                    config, synchronizer, data, writes, fake = self.fixture(
+                        Path(directory), **options
+                    )
+                    self.main_file(config, "a/w")
+                    before = dict(data)
+                    with patch("claude_session_sync.layout.LevelDatabase", fake):
+                        receipt = synchronizer.sync(after_account_switch=True)
+                    self.assertEqual([], writes)
+                    self.assertEqual(before, data)
+                    self.assertEqual(reason, receipt.reason)
+
+    def test_pending_edit_in_signed_in_account_wins(self):
+        for flag in (b"\x01b/w", b"\x01b/w|migrate"):
+            with self.subTest(flag=flag):
+                with tempfile.TemporaryDirectory() as directory:
+                    config, synchronizer, data, writes, fake = self.fixture(
+                        Path(directory), flag=flag
+                    )
+                    main = self.main_file(config, "a/w")
+                    with patch("claude_session_sync.layout.LevelDatabase", fake):
+                        receipt = synchronizer.sync(after_account_switch=True)
+                    self.assertEqual([], writes)
+                    self.assertEqual("signed-in-edit-pending", receipt.reason)
+                    self.assertEqual("b/w", json.loads(main.read_text())["main_scope"])
+
+    def test_empty_main_sidebar_is_never_copied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), slots={"a/w": seeded_slot(), "b/w": self.OLD}
+            )
+            self.main_file(config, "a/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+            self.assertEqual([], writes)
+            self.assertEqual("main-account-has-no-groups", receipt.reason)
+
+    def test_unknown_section_shape_stops_the_copy(self):
+        broken = copy.deepcopy(self.MAIN)
+        broken["sections"][1]["members"] = "p1"
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), slots={"a/w": broken, "b/w": self.OLD}
+            )
+            self.main_file(config, "a/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                with self.assertRaises(LayoutError):
+                    synchronizer.sync(after_account_switch=True)
+            self.assertEqual([], writes)
+
+    def test_probe_plans_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            self.main_file(config, "b/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                probe = synchronizer.probe()
+            self.assertEqual([], writes)
+            self.assertEqual(
+                {"state": "per-account", "reason": "claude-keeps-sidebar-per-account"}, probe
+            )
+
+    def test_consumed_upload_flag_counts_as_settled_in_recovery(self):
+        key = layout_module.GROUP_UPLOAD_KEY
+        for flag in (b"\x01b/w", b"\x01b/w|migrate"):
+            self.assertTrue(same_recovery_payload(key, flag, None, plain_flag_consumed=True))
+        for flag in (b"\x01b", b"b/w", b"\x01b/w/x", b"\x01b w/w"):
+            self.assertFalse(same_recovery_payload(key, flag, None, plain_flag_consumed=True))
+        # The old group copy's journal keeps its stricter rule.
+        self.assertFalse(same_recovery_payload(key, b"\x01b/w", None))
+
+    def test_stuck_per_account_journal_counts_as_pending(self):
+        from claude_session_sync.health import _adapter_recovery_pending
+
+        with tempfile.TemporaryDirectory() as directory:
+            config, *_rest = self.fixture(Path(directory))
+            runs = config.state_dir / "layout-account-runs"
+            runs.mkdir(parents=True)
+            (runs / "run.json").write_text('{"state": "RECOVERY_REQUIRED"}')
+            self.assertEqual(1, _adapter_recovery_pending(config))
