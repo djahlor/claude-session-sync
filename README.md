@@ -1,5 +1,7 @@
 # Claude Session Sync
 
+[![Test](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Keep your Claude Code chats, groups, routines and browser logins when you switch accounts in the Claude Desktop app on a Mac.
 
 <picture>
