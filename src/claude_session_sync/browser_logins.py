@@ -22,11 +22,13 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import strict_json as json
-from .filesystem import atomic_write_bytes, ensure_private_directory
+from .config import Config
+from .filesystem import atomic_write_bytes, ensure_private_directory, read_bounded
 from .locking import ExclusiveFileLock, LockUnavailableError
+from .model import Profile
 
 
 JAR_NAME = "launch-preview-cowork-shared"
@@ -38,10 +40,9 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 
 
 def _read_json(path: Path, limit: int = MAX_JSON_BYTES):
+    """The parsed document, or None when it is missing, unsafe, too large or not JSON."""
     try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
-            return None
-        return json.loads(path.read_bytes())
+        return json.loads(read_bounded(path, limit))
     except (OSError, ValueError):
         return None
 
@@ -92,15 +93,13 @@ def _copy_tree(source: Path, destination: Path) -> None:
 class BrowserLogins:
     """One profile's built-in browser jar and its saved copy."""
 
-    def __init__(self, profile, state_dir: Path, running: Callable[[], bool]) -> None:
+    def __init__(self, profile: Profile, state_dir: Path, running: Callable[[], bool]) -> None:
         self.claude = Path(profile.data_root)
         self.partition = self.claude / "Partitions" / JAR_NAME
         self.records_path = self.claude / RECORDS_NAME
         self.home = Path(state_dir) / "browser-logins" / profile.name
         self.saved = self.home / "snapshot"
         self.running = running
-
-    # Reading state -----------------------------------------------------
 
     def account(self) -> Optional[str]:
         document = _read_json(self.claude / ACCOUNT_FILE)
@@ -125,8 +124,6 @@ class BrowserLogins:
 
     def _save_meta(self, meta: Dict) -> None:
         _write_json(self.saved / "meta.json", meta)
-
-    # Commands ------------------------------------------------------------
 
     def snapshot(self) -> Dict:
         with self._lock():
@@ -182,11 +179,9 @@ class BrowserLogins:
             saved["same_account"] = meta.get("account") == self.account()
         return {"state": "ok", "sites": sites, "cookies": cookies, "snapshot": saved}
 
-    # Internals -----------------------------------------------------------
-
-    def _lock(self):
+    def _lock(self) -> ExclusiveFileLock:
         ensure_private_directory(self.home)
-        return _Held(ExclusiveFileLock(self.home / "browser-logins.lock", mode="auto", timeout=10))
+        return ExclusiveFileLock(self.home / "browser-logins.lock", mode="auto", timeout=10)
 
     def _snapshot(self) -> Dict:
         sites, cookies = self.health()
@@ -238,11 +233,12 @@ class BrowserLogins:
             "account": account,
         }
         _write_json(staging / "meta.json", meta)
-        previous = self.home / "snapshot.prev"
-        shutil.rmtree(str(previous), ignore_errors=True)
+        replaced = self.home / "snapshot.old"
+        shutil.rmtree(str(replaced), ignore_errors=True)
         if self.saved.exists():
-            self.saved.rename(previous)
+            self.saved.rename(replaced)
         staging.rename(self.saved)
+        shutil.rmtree(str(replaced), ignore_errors=True)
         return {"state": "saved", "sites": len(records), "cookies": copied}
 
     def _backup_live(self) -> Path:
@@ -281,41 +277,38 @@ class BrowserLogins:
             incoming.rename(self.partition / "Local Storage")
             shutil.rmtree(str(outgoing), ignore_errors=True)
         current = _read_json(self.records_path)
-        others = [e for e in current if not (isinstance(e, dict) and e.get("jar") == JAR_ID)] \
-            if isinstance(current, list) else []
+        if not isinstance(current, list):
+            current = []
+        others = [e for e in current if not (isinstance(e, dict) and e.get("jar") == JAR_ID)]
         saved_records = _read_json(self.saved / "records.json")
-        _write_json(self.records_path, others + (saved_records if isinstance(saved_records, list) else []))
+        if not isinstance(saved_records, list):
+            saved_records = []
+        _write_json(self.records_path, others + saved_records)
 
 
-class _Held:
-    def __init__(self, lock: ExclusiveFileLock) -> None:
-        self.lock = lock
-
-    def __enter__(self):
-        try:
-            self.lock.acquire()
-        except LockUnavailableError as error:
-            raise BrowserLoginsBusy("another browser-logins run holds the lock") from error
-        return self
-
-    def __exit__(self, *_details) -> None:
-        self.lock.release()
+ACTIONS: Dict[str, Callable[[BrowserLogins], Dict]] = {
+    "snapshot": BrowserLogins.snapshot,
+    "restore": BrowserLogins.restore,
+    "settle": BrowserLogins.settle,
+    "status": BrowserLogins.status,
+}
 
 
-class BrowserLoginsBusy(RuntimeError):
-    """Another snapshot or restore is running for this profile."""
-
-
-def run_browser_logins(config, running: Callable[[], bool], action: str, profiles=None) -> Dict:
+def run_browser_logins(
+    config: Config,
+    running: Callable[[], bool],
+    action: str,
+    profiles: Optional[Iterable[Profile]] = None,
+) -> Dict:
     """Run one action for each profile. A failure never stops a sync or a relaunch."""
-    if not getattr(config, "sync_browser_logins", False):
+    if not config.sync_browser_logins:
         return {"state": "disabled"}
     results = {}
     for profile in config.profiles if profiles is None else profiles:
         logins = BrowserLogins(profile, config.state_dir, running)
         try:
-            results[profile.name] = getattr(logins, action)()
-        except BrowserLoginsBusy:
+            results[profile.name] = ACTIONS[action](logins)
+        except LockUnavailableError:
             results[profile.name] = {"state": "skipped", "reason": "busy"}
         except Exception as error:  # a jar problem must never block chats or the relaunch
             results[profile.name] = {"state": "failed", "reason": type(error).__name__}

@@ -66,6 +66,15 @@ def _open_regular_read(path: PathLike) -> BinaryIO:
         raise
 
 
+def read_bounded(path: PathLike, limit: int) -> bytes:
+    """Read a regular file that is not a symlink, refusing anything over limit bytes."""
+    with _open_regular_read(path) as source:
+        content = source.read(limit + 1)
+    if len(content) > limit:
+        raise UnsafePathError("file is larger than {} bytes: {}".format(limit, path))
+    return content
+
+
 def digest_file(path: PathLike) -> str:
     digest = hashlib.sha256()
     with _open_regular_read(path) as source:
