@@ -37,6 +37,42 @@ RECORDS_NAME = "chrome-import-sites.json"
 ACCOUNT_FILE = "config.json"
 KEEP_BACKUPS = 3
 MAX_JSON_BYTES = 16 * 1024 * 1024
+# Beside clearing the jar, an account change sets this preference back to
+# "pending", and Claude then offers to import cookies again (20-10-2026).
+DESKTOP_CONFIG = "claude_desktop_config.json"
+IMPORT_PROMPT = "launchChromeImportPrompt"
+LAST_RESTORE = "last-restore.json"
+
+
+def settle_import_prompt(path: Path) -> str:
+    """Mark Claude's cookie-import prompt done. Only that value changes.
+
+    The file also holds MCP servers and other settings, so every other byte
+    stays as Claude wrote it, and the edit is checked by parsing both versions.
+    """
+    pending = '"{}": "pending"'.format(IMPORT_PROMPT).encode("utf-8")
+    done = '"{}": "done"'.format(IMPORT_PROMPT).encode("utf-8")
+    try:
+        raw = read_bounded(path, MAX_JSON_BYTES)
+        document = json.loads(raw)
+    except (OSError, ValueError):
+        return "unreadable"
+    preferences = document.get("preferences") if isinstance(document, dict) else None
+    if not isinstance(preferences, dict) or preferences.get(IMPORT_PROMPT) != "pending":
+        return "unchanged"
+    if raw.count(pending) != 1:
+        return "unrecognised"
+    updated = raw.replace(pending, done)
+    expected = dict(document, preferences=dict(preferences, **{IMPORT_PROMPT: "done"}))
+    try:
+        if json.loads(updated) != expected:
+            return "unrecognised"
+    except ValueError:
+        return "unrecognised"
+    mode = path.stat().st_mode & 0o777
+    atomic_write_bytes(path, updated)
+    os.chmod(path, mode)
+    return "done"
 
 
 def _read_json(path: Path, limit: int = MAX_JSON_BYTES):
@@ -163,7 +199,12 @@ class BrowserLogins:
             meta["restored"] = datetime.now().astimezone().isoformat(timespec="seconds")
             meta.pop("restore_pending", None)
             self._save_meta(meta)
-            return {"state": "restored", "sites": sites, "cookies": cookies}
+            prompt = settle_import_prompt(self.claude / DESKTOP_CONFIG)
+            # A later snapshot replaces the copy and its meta; this outlives it.
+            _write_json(self.home / LAST_RESTORE, {
+                "at": meta["restored"], "sites": sites, "cookies": cookies, "import_prompt": prompt,
+            })
+            return {"state": "restored", "sites": sites, "cookies": cookies, "import_prompt": prompt}
 
     def _note_pending_restore(self) -> None:
         """Remember a switch that emptied the jar while Claude was open.
@@ -197,6 +238,11 @@ class BrowserLogins:
             saved["cleared"] = bool(meta.get("cleared"))
             saved["restore_pending"] = bool(meta.get("restore_pending"))
             saved["same_account"] = meta.get("account") == self.account()
+            last = _read_json(self.home / LAST_RESTORE, limit=64 * 1024)
+            if isinstance(last, dict):
+                saved["last_restore"] = {
+                    key: last.get(key) for key in ("at", "sites", "cookies", "import_prompt")
+                }
         return {"state": "ok", "sites": sites, "cookies": cookies, "snapshot": saved}
 
     def _lock(self) -> ExclusiveFileLock:

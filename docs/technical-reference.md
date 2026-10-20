@@ -619,10 +619,32 @@ partition, its local storage, and that jar's entries in
 - Otherwise an empty jar under the same account is a clear the person made in
   Claude. The copy is then marked and never restored (`cleared-in-claude`),
   until a new healthy snapshot replaces it.
+- An account change also sets `preferences.launchChromeImportPrompt` in
+  `claude_desktop_config.json` back to `pending`, and Claude then offers to
+  import cookies again. After a restore that value becomes `done`. Only that
+  value changes: the edit replaces its one occurrence, checks that both versions
+  parse to the same settings apart from it, and keeps the file's mode. Any other
+  layout is left alone (`unrecognised`).
 - `browser-logins status --json` reports counts, times, and whether the copy
-  belongs to the signed-in account. Cookie values and the account id are never
-  read into output; the account is stored as a SHA-256 hash.
+  belongs to the signed-in account. `last_restore` keeps the time, counts and
+  prompt result of the last restore after newer copies are saved. Cookie values
+  and the account id are never read into output; the account is stored as a
+  SHA-256 hash.
 - A failure here never blocks chat sync or the relaunch.
+
+## Ties
+
+Copies of a chat that differ at the same `lastActivityAt` are a tie. Claude
+changes some fields without touching that time: archiving, pull requests,
+titles, trusted git folders, published pages. The planner reads the leading
+copies of each tied chat again and lets one win when it holds everything the
+others hold (`tie_break.py`): archived if any copy is, every pull request at the
+same or a later state (`OPEN` < `CLOSED` < `MERGED`, dismissals kept), the title
+named at a later turn or a person's rename over an automatic name, every git
+folder and every published page at its latest update. Account and runtime
+fields (Remote Control ids, interruption and error marks, pending reminders)
+are ignored for this. Any other difference keeps the tie. `--prefer` still
+comes first.
 
 ## Failure handling
 

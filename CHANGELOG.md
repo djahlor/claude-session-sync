@@ -6,6 +6,14 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-20
+
+### Fixed
+
+- After a switch, Claude asked to import cookies again although the logins were back. On every account change Claude also sets its `launchChromeImportPrompt` preference back to `pending`. A restore now sets it to `done`, changing only that value in `claude_desktop_config.json`.
+- `browser-logins status` lost the restore time once a newer copy was saved, so a switch that did restore looked like one that did not. Status now shows `last_restore`.
+- 329 chats were left alone as ties: their copies differed at the same last-activity time, mostly in being archived (224), their pull requests (49) or their titles. A tied chat now takes the copy that already holds everything the others hold: archived if any copy is, each pull request at the same or a later state, the later title or a person's rename, every trusted git folder and published page. Account-specific fields, such as Remote Control and interruption marks, no longer block that. Chats whose copies each hold something the others lack stay as they are (23 on 20-10-2026), so nothing is lost.
+
 ## [0.6.3] - 2026-10-20
 
 ### Fixed

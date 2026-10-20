@@ -24,7 +24,8 @@ from .chat_model import (
 from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
-from .filesystem import normalized_path
+from . import strict_json
+from .filesystem import normalized_path, read_bounded
 from .hash_cache import HashCache
 from .logins import default_app_log, record_logins
 from .model import (
@@ -37,7 +38,11 @@ from .model import (
 )
 from .rules import plan as plan_rules
 from .store import SessionStore
+from .tie_break import tie_break
 
+
+# A chat record is metadata, not the conversation; this bounds a bad file.
+TIE_BREAK_MAX_BYTES = 64 * 1024 * 1024
 
 @dataclass
 class PlanContext:
@@ -152,6 +157,11 @@ class Planner:
 
         prefer_key = _resolve_prefer(prefer, targets)
         decided = plan_rules(snapshots, state.sync, prefer_key, prefer_session)
+        breaks = _tie_breaks(decided.problems, snapshots, index)
+        if breaks:
+            decided = plan_rules(
+                snapshots, state.sync, prefer_key, prefer_session, tie_breaks=breaks
+            )
         operations = tuple(_operation(action, targets, index) for action in decided.actions)
 
         total_bytes = sum(
@@ -250,6 +260,35 @@ def _operation(action, targets: Mapping[str, Target], index) -> Operation:
         "retire", session_id, held.path, held.path, held.digest, held.digest,
         held.size, artifact,
     )
+
+
+def _tie_breaks(problems, snapshots, index) -> Dict[str, str]:
+    """Read the leading copies of each tied chat and name the one that covers the rest.
+
+    Only tied chats are read again, so a warm plan stays cheap. A copy that no
+    longer matches what the scan hashed keeps its chat tied for this run.
+    """
+    breaks = {}  # type: Dict[str, str]
+    for session_id in sorted({problem.session_id for problem in problems if problem.kind == "tied"}):
+        holders = [s for s in snapshots if session_id in s.records]
+        latest = max(s.records[session_id].last_activity_at for s in holders)
+        copies = {}
+        for snapshot in holders:
+            if snapshot.records[session_id].last_activity_at != latest:
+                continue
+            replica = index[snapshot.key]["records"][session_id]
+            try:
+                raw = read_bounded(replica.path, TIE_BREAK_MAX_BYTES)
+                if not replica.digest or hashlib.sha256(raw).hexdigest() != replica.digest:
+                    break
+                copies[snapshot.key] = strict_json.loads(raw)
+            except (OSError, ValueError):
+                break
+        else:
+            winner = tie_break(copies) if len(copies) > 1 else None
+            if winner is not None:
+                breaks[session_id] = winner
+    return breaks
 
 
 def _resolve_prefer(prefer: Optional[str], targets: Mapping[str, Target]) -> Optional[str]:

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -24,6 +25,20 @@ class FakeClaude:
         self.partition.mkdir(parents=True)
         self.sign_in("account-a")
         self.fill(cookies=120, sites=3)
+        self.set_prompt("done")
+
+    def set_prompt(self, value: str) -> None:
+        """Claude's own settings file: indent 2, no trailing newline, other keys kept."""
+        document = {
+            "globalShortcut": "Alt+C",
+            "mcpServers": {"tool": {"command": "run", "env": {"TOKEN": "secret-value"}}},
+            "preferences": {"launchChromeImportPrompt": value, "ratio": 0.1, "launchPreviewStorage": "shared"},
+        }
+        (self.root / "claude_desktop_config.json").write_text(json.dumps(document, indent=2))
+
+    def prompt(self) -> str:
+        document = json.loads((self.root / "claude_desktop_config.json").read_text())
+        return document["preferences"]["launchChromeImportPrompt"]
 
     def sign_in(self, account: str) -> None:
         (self.root / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account}))
@@ -47,7 +62,9 @@ class FakeClaude:
         (self.root / "chrome-import-sites.json").write_text(json.dumps(records))
 
     def clear_like_claude(self) -> None:
-        """What Claude does on an account change: empty jar, empty storage, no records."""
+        """What Claude does on an account change: empty jar, empty storage, no records,
+        and its cookie-import prompt back to pending."""
+        self.set_prompt("pending")
         with contextlib.closing(sqlite3.connect(str(self.partition / "Cookies"))) as db, db:
             db.execute("delete from cookies")
         (self.partition / "Cookies-journal").write_bytes(b"")
@@ -103,7 +120,7 @@ class BrowserLoginsTests(unittest.TestCase):
 
         result = self.logins().restore()
 
-        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120}, result)
+        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120, "import_prompt": "done"}, result)
         self.assertEqual(["site0.test", "site1.test", "site2.test"], self.claude.jar_sites())
         self.assertEqual(["other.test"], self.claude.other_sites())
         self.assertFalse((self.claude.partition / "Cookies-journal").exists())
@@ -139,7 +156,7 @@ class BrowserLoginsTests(unittest.TestCase):
         self.assertEqual("saved", self.logins().snapshot()["state"])
         self.claude.sign_in("account-b")
         self.claude.clear_like_claude()
-        self.assertEqual({"state": "restored", "sites": 2, "cookies": 80}, self.logins().restore())
+        self.assertEqual({"state": "restored", "sites": 2, "cookies": 80, "import_prompt": "done"}, self.logins().restore())
 
     def test_nothing_is_restored_while_claude_runs(self):
         self.logins().snapshot()
@@ -159,7 +176,7 @@ class BrowserLoginsTests(unittest.TestCase):
         self.assertEqual("claude-open", self.logins().restore()["reason"])
         self.assertTrue(self.logins().status()["snapshot"]["restore_pending"])
         self.open = False
-        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120}, self.logins().restore())
+        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120, "import_prompt": "done"}, self.logins().restore())
         self.assertFalse(self.logins().status()["snapshot"]["restore_pending"])
 
     def test_a_missed_restore_survives_switching_back_to_the_copys_account(self):
@@ -175,7 +192,7 @@ class BrowserLoginsTests(unittest.TestCase):
 
         self.assertEqual("jar-empty", self.logins().settle()["reason"])
         self.open = False
-        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120}, self.logins().restore())
+        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120, "import_prompt": "done"}, self.logins().restore())
         self.claude.clear_like_claude()
         self.assertEqual("cleared-in-claude", self.logins().restore()["reason"])
 
@@ -190,6 +207,55 @@ class BrowserLoginsTests(unittest.TestCase):
         self.assertEqual("saved", self.logins().settle()["state"])
         self.assertFalse(self.logins().status()["snapshot"]["restore_pending"])
         self.assertTrue(self.logins().status()["snapshot"]["same_account"])
+
+    def test_a_restore_marks_claudes_import_prompt_done_and_changes_nothing_else(self):
+        # 20-10-2026 14:35: logins came back, but the prompt Claude had set to
+        # pending asked to import them again.
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        config = self.claude.root / "claude_desktop_config.json"
+        os.chmod(config, 0o600)
+        before = config.read_bytes()
+
+        self.assertEqual("done", self.logins().restore()["import_prompt"])
+        after = config.read_bytes()
+        self.assertEqual("done", self.claude.prompt())
+        self.assertEqual(before.replace(b'"pending"', b'"done"'), after)
+        self.assertEqual(0o600, config.stat().st_mode & 0o777)
+
+    def test_the_import_prompt_stays_pending_when_nothing_was_restored(self):
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        self.open = True
+        self.logins().restore()
+
+        self.assertEqual("pending", self.claude.prompt())
+
+    def test_an_unexpected_settings_file_is_left_alone(self):
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        config = self.claude.root / "claude_desktop_config.json"
+        odd = config.read_text().replace('"launchChromeImportPrompt": "pending"',
+                                          '"launchChromeImportPrompt":"pending"')
+        config.write_text(odd)
+
+        self.assertEqual("unrecognised", self.logins().restore()["import_prompt"])
+        self.assertEqual(odd, config.read_text())
+
+    def test_status_keeps_the_last_restore_after_a_new_copy_is_saved(self):
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        self.logins().restore()
+        self.claude.fill(cookies=150, sites=4)
+        self.assertEqual("saved", self.logins().snapshot()["state"])
+
+        status = self.logins().status()["snapshot"]
+        self.assertIsNone(status["restored"])
+        self.assertEqual((3, 120, "done"), tuple(status["last_restore"][key] for key in ("sites", "cookies", "import_prompt")))
 
     def test_a_large_drop_waits_one_run_before_it_is_saved(self):
         self.logins().snapshot()
