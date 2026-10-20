@@ -6,6 +6,17 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+### Changed
+
+- The one-line installer installs the newest release, or `main` while the repository has none. The release lookup gives up after 10 seconds.
+- An unexpected error now prints a traceback to report. Errors the tool raises on purpose, and damaged database files, still print one line.
+- Code cleanup with no change in behavior: one formatter and import order, one command table in the CLI, one bounded file read for private files, a shared process helper in the watcher, and `layout.py` split into three modules. CI also checks formatting and types.
+- The wall-clock benchmark runs only with `RUN_PERFORMANCE_TESTS=1`.
+
+### Added
+
+- CONTRIBUTING, issue forms, and a private security reporting link.
+
 ## [0.6.5] - 2026-10-20
 
 ### Fixed
