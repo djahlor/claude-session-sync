@@ -150,6 +150,47 @@ class BrowserLoginsTests(unittest.TestCase):
         self.assertEqual("claude-open", self.logins().restore()["reason"])
         self.assertEqual([], self.claude.jar_sites())
 
+    def test_a_restore_missed_while_claude_runs_comes_back_at_the_next_close(self):
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        self.open = True
+
+        self.assertEqual("claude-open", self.logins().restore()["reason"])
+        self.assertTrue(self.logins().status()["snapshot"]["restore_pending"])
+        self.open = False
+        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120}, self.logins().restore())
+        self.assertFalse(self.logins().status()["snapshot"]["restore_pending"])
+
+    def test_a_missed_restore_survives_switching_back_to_the_copys_account(self):
+        # 20-10-2026: Claude came back mid-switch, so A's copy was never put
+        # back in B. Back in A, the empty jar is the switch, not a clear.
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        self.open = True
+        self.assertEqual("jar-empty", self.logins().settle()["reason"])
+        self.claude.sign_in("account-a")
+        self.claude.clear_like_claude()
+
+        self.assertEqual("jar-empty", self.logins().settle()["reason"])
+        self.open = False
+        self.assertEqual({"state": "restored", "sites": 3, "cookies": 120}, self.logins().restore())
+        self.claude.clear_like_claude()
+        self.assertEqual("cleared-in-claude", self.logins().restore()["reason"])
+
+    def test_a_new_import_replaces_a_copy_still_owed(self):
+        self.logins().snapshot()
+        self.claude.sign_in("account-b")
+        self.claude.clear_like_claude()
+        self.open = True
+        self.logins().settle()
+        self.claude.fill(cookies=60, sites=2)
+
+        self.assertEqual("saved", self.logins().settle()["state"])
+        self.assertFalse(self.logins().status()["snapshot"]["restore_pending"])
+        self.assertTrue(self.logins().status()["snapshot"]["same_account"])
+
     def test_a_large_drop_waits_one_run_before_it_is_saved(self):
         self.logins().snapshot()
         self.claude.fill(cookies=20, sites=3)
@@ -208,6 +249,78 @@ class SwitchRestoresBeforeLaunchTests(unittest.TestCase):
             self.assertEqual([["site0.test", "site1.test", "site2.test"]], seen_at_launch)
             payload = json.loads(out.getvalue())
             self.assertEqual("restored", payload["browser_logins"]["profiles"]["Work"]["state"])
+
+    def test_claude_opened_during_the_chat_sync_still_gets_its_logins(self):
+        # 20-10-2026 11:47: the sign-in page reopened Claude 20 seconds into
+        # the switch's chat sync, before the old restore step at the end.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            claude = FakeClaude(root / "Claude")
+            profile = Profile("Work", root / "Claude", ("/usr/bin/true",), True)
+            config = replace(make_config(profile, root / "state"), sync_browser_logins=True)
+            BrowserLogins(profile, config.state_dir, lambda: False).snapshot()
+            claude.sign_in("account-b")
+            claude.clear_like_claude()
+            claude_open = []
+
+            class AppRunningError(Exception):
+                pass
+
+            def reopen_during_chat_sync(_config):
+                claude_open.append(claude.jar_sites())
+                raise AppRunningError()
+
+            class Probe:
+                def running(self, **_kwargs):
+                    return ("claude",) if claude_open else ()
+
+            out = io.StringIO()
+            run(
+                ["--config", str(root / "config.json"), "switch", "Work", "--json"],
+                dependencies=CliDependencies(
+                    config_loader=lambda _path: config,
+                    planner_factory=reopen_during_chat_sync,
+                    process_probe=Probe(),
+                    launcher=type("Launcher", (), {"launch": lambda self, command: None})(),
+                ),
+                stdout=out,
+                stderr=io.StringIO(),
+            )
+
+            self.assertEqual([["site0.test", "site1.test", "site2.test"]], claude_open)
+            payload = json.loads(out.getvalue())
+            self.assertEqual("claude-open", payload["reason"])
+            self.assertEqual("restored", payload["browser_logins"]["profiles"]["Work"]["state"])
+            self.assertEqual(["site0.test", "site1.test", "site2.test"], claude.jar_sites())
+
+
+class QuitRestoresAMissedSwitchTests(unittest.TestCase):
+    def test_a_quit_puts_back_logins_a_switch_missed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            claude = FakeClaude(root / "Claude")
+            profile = Profile("Work", root / "Claude", ("/usr/bin/true",), True)
+            config = replace(make_config(profile, root / "state"), sync_browser_logins=True)
+            BrowserLogins(profile, config.state_dir, lambda: False).snapshot()
+            claude.sign_in("account-b")
+            claude.clear_like_claude()
+            BrowserLogins(profile, config.state_dir, lambda: True).settle()
+
+            class Probe:
+                def running(self, **_kwargs):
+                    return ()
+
+            out = io.StringIO()
+            run(
+                ["--config", str(root / "config.json"), "auto", "--json"],
+                dependencies=CliDependencies(config_loader=lambda _path: config, process_probe=Probe()),
+                stdout=out,
+                stderr=io.StringIO(),
+            )
+
+            payload = json.loads(out.getvalue())
+            self.assertEqual("restored", payload["browser_logins"]["profiles"]["Work"]["state"])
+            self.assertEqual(["site0.test", "site1.test", "site2.test"], claude.jar_sites())
 
 
 def make_config(profile: Profile, state: Path) -> Config:

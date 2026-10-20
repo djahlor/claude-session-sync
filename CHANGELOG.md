@@ -6,6 +6,13 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-20
+
+### Fixed
+
+- Browser logins could stay gone after a switch. The switch put them back only at its end, after the chat sync, and only while Claude was closed. When Claude was opened again during that sync, for example by the sign-in page handing back to Claude, the restore was skipped and the built-in browser asked to import again. The switch now puts the logins back first, right after Claude quits.
+- A restore that is missed anyway is remembered. The next quit puts the logins back, also after switching back to the account the copy came from, where an empty browser used to count as one you cleared yourself. `browser-logins status` shows it as `restore_pending`.
+
 ## [0.6.1] - 2026-10-20
 
 ### Fixed

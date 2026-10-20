@@ -133,6 +133,7 @@ class BrowserLogins:
         """Put the saved jar back. Only with Claude closed, only after a switch."""
         with self._lock():
             if self.running():
+                self._note_pending_restore()
                 return {"state": "skipped", "reason": "claude-open"}
             sites, cookies = self.health()
             if sites and cookies:
@@ -147,7 +148,7 @@ class BrowserLogins:
             account = self.account()
             if account is None:
                 return {"state": "skipped", "reason": "no-account"}
-            if meta.get("account") == account:
+            if meta.get("account") == account and not meta.get("restore_pending"):
                 # Emptied without an account change: the person cleared it in
                 # Claude. Respect that and never bring this copy back.
                 meta["cleared"] = True
@@ -160,8 +161,26 @@ class BrowserLogins:
                 return {"state": "failed", "reason": "restore-not-visible"}
             meta["account"] = account
             meta["restored"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            meta.pop("restore_pending", None)
             self._save_meta(meta)
             return {"state": "restored", "sites": sites, "cookies": cookies}
+
+    def _note_pending_restore(self) -> None:
+        """Remember a switch that emptied the jar while Claude was open.
+
+        Claude can be opened again before a switch puts the jar back. The copy
+        is then still owed: the next restore with Claude closed brings it back,
+        also after switching back to the copy's own account, where an empty jar
+        would otherwise read as a clear made in Claude.
+        """
+        sites, cookies = self.health()
+        meta = self._meta()
+        account = self.account()
+        if (sites and cookies) or not meta or meta.get("cleared") or meta.get("restore_pending") \
+                or account is None or meta.get("account") == account:
+            return
+        meta["restore_pending"] = True
+        self._save_meta(meta)
 
     def settle(self) -> Dict:
         """After Claude quits: restore when a switch emptied the jar, else save it."""
@@ -176,6 +195,7 @@ class BrowserLogins:
         if meta:
             saved = {key: meta.get(key) for key in ("taken", "sites", "cookies", "restored")}
             saved["cleared"] = bool(meta.get("cleared"))
+            saved["restore_pending"] = bool(meta.get("restore_pending"))
             saved["same_account"] = meta.get("account") == self.account()
         return {"state": "ok", "sites": sites, "cookies": cookies, "snapshot": saved}
 
@@ -189,10 +209,11 @@ class BrowserLogins:
         account = self.account()
         same_account = bool(meta) and meta.get("account") == account and account is not None
         if not (sites and cookies):
-            if same_account and not meta.get("cleared"):
+            if same_account and not meta.get("cleared") and not meta.get("restore_pending"):
                 meta["cleared"] = True
                 self._save_meta(meta)
                 return {"state": "cleared", "reason": "emptied-without-switch"}
+            self._note_pending_restore()
             return {"state": "skipped", "reason": "jar-empty"}
         if same_account and not meta.get("cleared") and cookies * 2 < int(meta.get("cookies", 0)):
             # A half-finished clear can look like a smaller jar. Accept a big

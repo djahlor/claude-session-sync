@@ -598,12 +598,18 @@ partition, its local storage, and that jar's entries in
   unchanged one (`unchanged`), and waits one run before it accepts a drop to
   less than half the saved cookies (`large-drop`). The watcher runs it every
   15 minutes and five seconds after the import record changes.
-- `switch`, before it reopens Claude, and `auto`, at a quit, restore the copy
-  when the jar is empty and the account hash differs from the copy's. The live
+- `switch`, right after Claude quits and before the chat sync, and `auto`, at
+  a quit and before the chat sync, restore the copy when the jar is empty and
+  the account hash differs from the copy's. Claude can be opened again during
+  a long chat sync, and a jar is only put back while Claude is closed. The live
   jar is copied to `backups/` first (last three kept).
-- An empty jar under the same account is a clear the person made in Claude.
-  The copy is then marked and never restored (`cleared-in-claude`), until a new
-  healthy snapshot replaces it.
+- An empty jar seen while Claude runs under another account marks the copy
+  `restore_pending`: a switch emptied it and nothing put it back yet. The next
+  restore with Claude closed brings it back, also under the copy's own account.
+  A new healthy snapshot drops the mark.
+- Otherwise an empty jar under the same account is a clear the person made in
+  Claude. The copy is then marked and never restored (`cleared-in-claude`),
+  until a new healthy snapshot replaces it.
 - `browser-logins status --json` reports counts, times, and whether the copy
   belongs to the signed-in account. Cookie values and the account id are never
   read into output; the account is stored as a SHA-256 hash.

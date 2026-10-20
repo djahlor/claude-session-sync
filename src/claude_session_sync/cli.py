@@ -383,6 +383,15 @@ def _settle_browser_logins(config: Config, dependencies: CliDependencies, profil
         return {"state": "failed", "reason": type(error).__name__}
 
 
+def _browser_logins_busy(result: dict) -> bool:
+    """True when a settle met another writer and gets one more try."""
+
+    if result.get("state") == "failed":
+        return True
+    profiles = result.get("profiles", {})
+    return any(entry.get("reason") == "busy" for entry in profiles.values())
+
+
 def _wait_for_managed_processes_to_exit(
     config: Config,
     dependencies: CliDependencies,
@@ -468,7 +477,12 @@ def _run_switch(
             )
             return 1
         record_progress(config, "syncing")
-        browser_logins = None
+        # The account change just cleared the built-in browser. Its logins go
+        # back first, in the second after Claude quits, because a jar is only
+        # put back while Claude is closed and Claude can be opened again during
+        # the long chat sync. Claude then starts with the new account already
+        # known and does not clear it again.
+        browser_logins = _settle_browser_logins(config, dependencies, (profile,))
         try:
             def running() -> bool:
                 return bool(_running_processes(config, dependencies))
@@ -494,10 +508,9 @@ def _run_switch(
             payload["progress"] = finish_progress(config, payload)
         finally:
             # Claude was closed for this switch. It reopens even when the sync
-            # failed, so a failed sync never leaves Claude closed. The account
-            # change just cleared the built-in browser, so its logins go back
-            # first: Claude then starts with the new account already known.
-            browser_logins = _settle_browser_logins(config, dependencies, (profile,))
+            # failed, so a failed sync never leaves Claude closed.
+            if _browser_logins_busy(browser_logins):
+                browser_logins = _settle_browser_logins(config, dependencies, (profile,))
             launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
         if launch_failed:
             _write(
@@ -906,6 +919,9 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         if running:
             return _report_waiting(arguments, config, output, "claude-open")
         record_progress(config, "syncing")
+        # Before the chat sync, while Claude is surely closed: a restore a
+        # switch missed comes back now, else the jar is saved.
+        browser_logins = _settle_browser_logins(config, deps, config.profiles)
         try:
             payload = _chat_payload(arguments, config, deps)
         except Exception as error:
@@ -920,7 +936,8 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
                 adopt_source_scope=getattr(arguments, "adopt_source_scope", None),
             )
         )
-        browser_logins = _settle_browser_logins(config, deps, config.profiles)
+        if _browser_logins_busy(browser_logins):
+            browser_logins = _settle_browser_logins(config, deps, config.profiles)
         if browser_logins["state"] != "disabled":
             payload["browser_logins"] = browser_logins
         payload["progress"] = finish_progress(config, payload)
