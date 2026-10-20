@@ -6,6 +6,12 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-10-20
+
+### Fixed
+
+- A picture sent in a chat with SendUserFile showed as broken after an account switch. Claude loads it from the account that sent it, and that account is no longer signed in. The restart after a switch now points such a picture at its file on your Mac, so it shows in every account. The chat record keeps the original upload id, under another name, and its size does not change. On by default; `fix_chat_pictures: false` in the config turns it off. (From #17, merged into this line.)
+
 ## [0.6.4] - 2026-10-20
 
 ### Fixed

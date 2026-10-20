@@ -88,6 +88,42 @@ def _default_routine_factory(config: Config) -> Any:
     return RoutineSynchronizer(config)
 
 
+def _default_picture_factory(config: Config) -> Any:
+    from .pictures import PictureFixer
+
+    return PictureFixer(config)
+
+
+def _fix_chat_pictures(config: Config, deps: "CliDependencies", payload: dict) -> None:
+    """Point sent pictures at their copy on this Mac. Reported only when it acts or fails.
+
+    It runs only on the restart after an account switch, so it reaches the
+    pictures sent before the switch: those were uploaded to another account.
+    Pictures sent later keep their upload, which Claude's phone and web views
+    need, until the next switch. It never blocks the chat sync: a failure is
+    reported and the sync goes on.
+    """
+    if not config.fix_chat_pictures:
+        return
+    from .adapters import save_status
+
+    try:
+        receipt = deps.picture_factory(config).sync()
+        result = {
+            "state": receipt.state,
+            "files": receipt.file_count,
+            "pictures": receipt.picture_count,
+        }
+    except Exception as error:
+        result = {"state": "skipped", "reason": "pictures-error", "detail": str(error)}
+    try:
+        save_status(config.state_dir, "chat-pictures-status.json", result)
+    except OSError:
+        result["reporting_error"] = "status-write-failed"
+    if result["state"] != "noop":
+        payload["pictures"] = result
+
+
 @dataclass(frozen=True)
 class CliDependencies:
     """Injected system boundaries used by command tests and platform adapters."""
@@ -100,6 +136,7 @@ class CliDependencies:
     installer_factory: InstallerFactory = _default_installer_factory
     layout_factory: LayoutFactory = _default_layout_factory
     routine_factory: RoutineFactory = _default_routine_factory
+    picture_factory: Callable[[Config], Any] = _default_picture_factory
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
@@ -525,6 +562,8 @@ def _run_switch(
             # sidebar copy goes first when it can, so that never skips it.
             layout_first = run_layout_first(config, dependencies, running, **sidebar_options)
             payload = _switch_chat_result(config, dependencies)
+            if getattr(arguments, "after_account_switch", False):
+                _fix_chat_pictures(config, dependencies, payload)
             payload.update(
                 run_adapters(
                     config,

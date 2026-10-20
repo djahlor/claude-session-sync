@@ -22,6 +22,7 @@ For people with more than one Claude account on one Mac, for example a work acco
 | Custom groups, which Claude now calls sections | Each switch | On |
 | Claude Code routines, with their permission mode and saved approvals | Each switch and each quit | On |
 | Site logins in Claude's built-in browser | Each switch | Off, [turn it on](#browser-logins) |
+| Pictures sent in a chat, shown from your Mac in every account ([how](docs/technical-reference.md#pictures-sent-in-a-chat)) | Each switch | On |
 
 It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account.
 

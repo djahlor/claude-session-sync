@@ -32,6 +32,8 @@ class Config:
     sync_sidebar_layout: bool = False
     sync_code_routines: bool = False
     sync_browser_logins: bool = False
+    # Show sent pictures from the copy on this Mac, so an account switch keeps them.
+    fix_chat_pictures: bool = True
     version: int = 1
 
 
@@ -48,12 +50,14 @@ _CONFIG_KEYS = {
     "sync_sidebar_layout",
     "sync_code_routines",
     "sync_browser_logins",
+    "fix_chat_pictures",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "target_policy",
     "sync_sidebar_layout",
     "sync_code_routines",
     "sync_browser_logins",
+    "fix_chat_pictures",
 }
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
 _TARGET_KEYS = {"profile", "account", "workspace"}
@@ -218,6 +222,9 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_browser_logins = document.get("sync_browser_logins", False)
     if not isinstance(sync_browser_logins, bool):
         raise ConfigError("sync_browser_logins must be a boolean")
+    fix_chat_pictures = document.get("fix_chat_pictures", True)
+    if not isinstance(fix_chat_pictures, bool):
+        raise ConfigError("fix_chat_pictures must be a boolean")
 
     claude_executable = Path(
         _nonempty_string(document["claude_executable"], "claude_executable")
@@ -235,5 +242,6 @@ def load_config(path: Union[str, Path]) -> Config:
         sync_sidebar_layout=sync_sidebar_layout,
         sync_code_routines=sync_code_routines,
         sync_browser_logins=sync_browser_logins,
+        fix_chat_pictures=fix_chat_pictures,
         version=version,
     )

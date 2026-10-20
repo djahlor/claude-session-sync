@@ -1,3 +1,3 @@
 """Safe synchronization for Claude Desktop Code-session registries."""
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"

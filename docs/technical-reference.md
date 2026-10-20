@@ -561,6 +561,44 @@ works while Claude is open. `--apply` makes that row the source the next time
 Claude closes, and without `--account` it keeps the signed-in account.
 `restart-claude` quits Claude, syncs, and reopens it now.
 
+## Pictures sent in a chat
+
+A picture sent with SendUserFile is stored twice: as a file on your Mac and as
+an upload to the account that sent it. The chat transcript in
+`~/.claude/projects/<folder>/<session>.jsonl` (or under `CLAUDE_CONFIG_DIR`)
+records both, as an attachment with `path` and `file_uuid`. The Code tab draws
+the card from the upload, always through the organization signed in now, and
+has no fallback. After an account switch that organization does not have the
+upload, so the card shows a broken image. An attachment without `file_uuid`
+is drawn from its `path` through the desktop app instead. Seen in Claude
+Desktop 2.42304.2 on 20 October 2026.
+
+On the restart after an account switch, sync reads the transcripts of the Code
+chats it syncs (found by `cliSessionId` in each chat record) and renames
+`file_uuid` to `orig_uuid` for each picture that:
+
+- is an image (`isImage`, or a .png, .jpg, .jpeg, .gif or .webp path),
+- has an absolute path to a regular file that still exists, is not a symbolic
+  link and is not inside Claude's own data folder,
+- still has the size the chat recorded.
+
+The new key has the same length, so each line is rewritten in place at the
+same offset. The file never changes size, and a line Claude appends at the
+same moment is not lost. The original id stays in the line; renaming the key
+back undoes it. A line still being written waits for the next switch. Each
+transcript is read once: `chat-pictures-offsets.json` in the state folder keeps
+how far it was read, and a replaced transcript is read again from the start.
+The last result is in `chat-pictures-status.json`, and a sync report shows a
+`pictures` field only when it changed a picture or failed.
+
+It runs only after a switch, so it reaches the pictures sent before it, which
+went to another account. Pictures sent after the switch keep their upload until
+the next switch. Claude's web and phone views cannot read files on the Mac: they
+show a file tile instead of a picture whose upload id was renamed, the same as
+they show a picture uploaded to another account. A picture whose file was moved
+or deleted keeps its upload id. Set `"fix_chat_pictures": false` in the config
+to turn it off.
+
 ## Claude Code routines
 
 Claude Code stores routines in `scheduled-tasks.json`, separate from chat files.
