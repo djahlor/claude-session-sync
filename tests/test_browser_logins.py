@@ -17,6 +17,7 @@ from claude_session_sync.browser_logins import (
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import Config
 from claude_session_sync.model import Profile
+from claude_session_sync.transaction import AppRunningError
 
 OTHER_JAR = "persist:launch-preview-some-project"
 
@@ -398,9 +399,6 @@ class SwitchRestoresBeforeLaunchTests(unittest.TestCase):
             claude.sign_in("account-b")
             claude.clear_like_claude()
             claude_open = []
-
-            class AppRunningError(Exception):
-                pass
 
             def reopen_during_chat_sync(_config):
                 claude_open.append(claude.jar_sites())
