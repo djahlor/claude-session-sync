@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1399,7 +1400,13 @@ _COMMANDS: dict[str, Callable[..., int]] = {
 
 # Errors the tool raises on purpose carry a message written for the person.
 # Anything else is a bug, so its traceback is shown.
-_EXPECTED_ERRORS = (ValueError, OSError, RuntimeError, subprocess.SubprocessError)
+_EXPECTED_ERRORS = (
+    ValueError,
+    OSError,
+    RuntimeError,
+    subprocess.SubprocessError,
+    sqlite3.Error,
+)
 
 
 def run(
