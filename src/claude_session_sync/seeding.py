@@ -10,7 +10,6 @@ starting point. Nothing outside the private state file is written.
 import hashlib
 import os
 from pathlib import Path
-from typing import Dict, Set
 
 from .chat_state import load_state, save_state, state_path
 from .enrollment import select_targets, target_key
@@ -28,24 +27,26 @@ def seed_from_unenrolled(config, *, apply: bool) -> dict:
 def _seed(config, *, apply: bool) -> dict:
     state = load_state(state_path(config.state_dir))
     if state.sync.synced:
-        raise ValueError("chat state already has synced versions; seeding only starts a new state")
+        raise ValueError(
+            "chat state already has synced versions; seeding only starts a new state"
+        )
     found = SessionStore().discover_targets(config)
     selected, ignored = select_targets(config, found.targets, state.enrolled)
     if config.target_policy != "logins" or not ignored:
         raise ValueError("seeding needs the logins policy and folders outside sync")
 
-    present: Dict[str, Set[str]] = {}
+    present: dict[str, set[str]] = {}
     for target in selected:
         present[target_key(target)] = _record_ids(Path(target.path))
     wanted = set().union(*present.values()) if present else set()
 
-    versions: Dict[str, Set[str]] = {}
-    unreadable: Set[str] = set()
-    cache: Dict[str, str] = {}
+    versions: dict[str, set[str]] = {}
+    unreadable: set[str] = set()
+    cache: dict[str, str] = {}
     for target in ignored:
         folder = Path(target.path)
         for session_id in sorted(wanted & _record_ids(folder)):
-            path = folder / "local_{}.json".format(session_id)
+            path = folder / f"local_{session_id}.json"
             try:
                 raw = path.read_bytes()
             except OSError:
@@ -92,7 +93,7 @@ def _seed(config, *, apply: bool) -> dict:
     }
 
 
-def _record_ids(folder: Path) -> Set[str]:
+def _record_ids(folder: Path) -> set[str]:
     ids = set()
     try:
         entries = list(os.scandir(str(folder)))

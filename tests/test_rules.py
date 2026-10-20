@@ -70,7 +70,9 @@ class NewRecordTests(unittest.TestCase):
         self.assertEqual(result.problems, [])
 
     def test_identical_copies_need_nothing(self):
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})])
+        result = planned(
+            [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})]
+        )
 
         self.assertEqual((result.actions, result.problems), ([], []))
 
@@ -87,7 +89,10 @@ class OneSideChangedTests(unittest.TestCase):
     def test_a_change_without_new_activity_still_wins(self):
         # A rename or an archive moves no activity.
         result = planned(
-            [snapshot("A", {X: copy("v1", 50)}), snapshot("B", {X: copy("renamed", 50)})],
+            [
+                snapshot("A", {X: copy("v1", 50)}),
+                snapshot("B", {X: copy("renamed", 50)}),
+            ],
             state(agreed={X: "v1"}),
         )
 
@@ -138,7 +143,9 @@ class BothSidesChangedTests(unittest.TestCase):
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A")])
 
     def test_first_contact_with_differing_copies_is_decided_the_same_way(self):
-        result = planned([snapshot("A", {X: copy("v1", 90)}), snapshot("B", {X: copy("v2", 50)})])
+        result = planned(
+            [snapshot("A", {X: copy("v1", 90)}), snapshot("B", {X: copy("v2", 50)})]
+        )
 
         self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B")])
 
@@ -149,7 +156,9 @@ class BothSidesChangedTests(unittest.TestCase):
         )
 
         self.assertEqual(result.actions, [])
-        self.assertEqual(result.problems, [Problem("tied", X, "A"), Problem("tied", X, "B")])
+        self.assertEqual(
+            result.problems, [Problem("tied", X, "A"), Problem("tied", X, "B")]
+        )
 
     def test_a_tie_blocks_creation_too_because_no_version_is_chosen(self):
         result = planned(
@@ -273,7 +282,11 @@ class PlacementTests(unittest.TestCase):
 class UnusableCopyTests(unittest.TestCase):
     def test_an_unreadable_copy_freezes_the_session_everywhere(self):
         result = planned(
-            [snapshot("A", {X: unreadable()}), snapshot("B", {X: copy("v1")}), snapshot("C")]
+            [
+                snapshot("A", {X: unreadable()}),
+                snapshot("B", {X: copy("v1")}),
+                snapshot("C"),
+            ]
         )
 
         self.assertEqual(result.actions, [])
@@ -292,7 +305,9 @@ class UnusableCopyTests(unittest.TestCase):
 
 
 class LostRecordTests(unittest.TestCase):
-    def test_a_record_seen_before_and_now_gone_without_a_tombstone_is_not_recreated(self):
+    def test_a_record_seen_before_and_now_gone_without_a_tombstone_is_not_recreated(
+        self,
+    ):
         result = planned(
             [snapshot("A", {X: copy("v1")}), snapshot("B")],
             state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}),
@@ -365,7 +380,10 @@ class DeleteWinsTests(unittest.TestCase):
 
     def test_an_unreadable_copy_freezes_a_delete_as_well(self):
         result = planned(
-            [snapshot("A", {X: unreadable()}), snapshot("B", tombstones={X: DELETED_AT})]
+            [
+                snapshot("A", {X: unreadable()}),
+                snapshot("B", tombstones={X: DELETED_AT}),
+            ]
         )
 
         self.assertEqual(result.actions, [])
@@ -418,7 +436,9 @@ class RecordWinsTests(unittest.TestCase):
     def test_differing_copies_still_converge_when_the_record_wins(self):
         result = planned(
             [
-                snapshot("A", {X: copy("v2", DELETED_AT + 5)}, tombstones={X: DELETED_AT}),
+                snapshot(
+                    "A", {X: copy("v2", DELETED_AT + 5)}, tombstones={X: DELETED_AT}
+                ),
                 snapshot("B", {X: copy("v1", DELETED_AT - 5)}),
             ],
             state(agreed={X: "v1"}),
@@ -438,7 +458,10 @@ class UnknownVersionTests(unittest.TestCase):
 
     def test_a_folder_that_joins_later_cannot_undo_a_rename(self):
         result = planned(
-            [snapshot("A", {X: copy("renamed", 50)}), snapshot("B", {X: copy("t", 50)})],
+            [
+                snapshot("A", {X: copy("renamed", 50)}),
+                snapshot("B", {X: copy("t", 50)}),
+            ],
             state(synced={"A": {X: "renamed"}}, folders=""),
         )
 
@@ -447,7 +470,10 @@ class UnknownVersionTests(unittest.TestCase):
 
     def test_with_an_unknown_copy_later_activity_still_wins(self):
         result = planned(
-            [snapshot("A", {X: copy("renamed", 50)}), snapshot("B", {X: copy("t", 90)})],
+            [
+                snapshot("A", {X: copy("renamed", 50)}),
+                snapshot("B", {X: copy("t", 90)}),
+            ],
             state(synced={"A": {X: "renamed"}}, folders=""),
         )
 
@@ -470,7 +496,9 @@ class UnknownVersionTests(unittest.TestCase):
 
 class SettleTests(unittest.TestCase):
     def test_identical_copies_everywhere_become_each_folders_version(self):
-        after = settle(state(), [snapshot("A", {X: copy("v2")}), snapshot("B", {X: copy("v2")})])
+        after = settle(
+            state(), [snapshot("A", {X: copy("v2")}), snapshot("B", {X: copy("v2")})]
+        )
 
         self.assertEqual(after.synced, {"A": {X: "v2"}, "B": {X: "v2"}})
 
@@ -494,9 +522,13 @@ class SettleTests(unittest.TestCase):
         self.assertEqual(after.seen, {"A": {X}})
 
     def test_folders_outside_the_run_keep_what_they_had(self):
-        before = state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}, "C": {X}}, folders="ABC")
+        before = state(
+            agreed={X: "v1"}, seen={"A": {X}, "B": {X}, "C": {X}}, folders="ABC"
+        )
 
-        after = settle(before, [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})])
+        after = settle(
+            before, [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})]
+        )
 
         self.assertEqual(after.synced["C"], {X: "v1"})
         self.assertEqual(after.seen["C"], {X})
@@ -509,7 +541,10 @@ class SettleTests(unittest.TestCase):
         self.assertEqual((after.synced, after.seen), (before.synced, before.seen))
 
     def test_an_unreadable_copy_means_no_agreement(self):
-        after = settle(state(), [snapshot("A", {X: unreadable()}), snapshot("B", {X: unreadable()})])
+        after = settle(
+            state(),
+            [snapshot("A", {X: unreadable()}), snapshot("B", {X: unreadable()})],
+        )
 
         self.assertEqual(after.synced, {})
 
@@ -567,7 +602,10 @@ class SettleTests(unittest.TestCase):
         self.assertEqual(after.seen, {"A": {X, Y}, "B": set()})
 
     def test_a_record_missing_from_one_folder_stays_remembered_there(self):
-        after = settle(state(seen={"A": {X}, "B": {X}}), [snapshot("A", {X: copy("v1")}), snapshot("B")])
+        after = settle(
+            state(seen={"A": {X}, "B": {X}}),
+            [snapshot("A", {X: copy("v1")}), snapshot("B")],
+        )
 
         self.assertEqual(after.seen["B"], {X})
 

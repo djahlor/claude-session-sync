@@ -4,8 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 
-from .config import Config, load_config
 from . import strict_json as json
+from .config import Config, load_config
 
 
 def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) -> dict:
@@ -182,7 +182,9 @@ def _drop_personal_profile(document: dict) -> int:
     profiles = document.get("profiles")
     if not isinstance(profiles, list) or not any(personal(p, "name") for p in profiles):
         return 0
-    document["profiles"] = [profile for profile in profiles if not personal(profile, "name")]
+    document["profiles"] = [
+        profile for profile in profiles if not personal(profile, "name")
+    ]
     targets = document.get("approved_targets")
     if isinstance(targets, list):
         document["approved_targets"] = [

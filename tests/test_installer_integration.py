@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import platform
 import subprocess
 import tempfile
@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from claude_session_sync.installer import InstallLayout, Installer, _plist, _string
+from claude_session_sync.installer import Installer, InstallLayout, _plist, _string
 
 
 @unittest.skipUnless(platform.system() == "Darwin", "macOS installer integration")
@@ -51,18 +51,21 @@ class InstallerIntegrationTests(unittest.TestCase):
             home = Path(directory) / "synthetic-home"
             agents = home / "Library" / "LaunchAgents"
             agents.mkdir(parents=True)
-            label = "com.claude-session-sync.test.{}".format(uuid.uuid4().hex)
+            label = f"com.claude-session-sync.test.{uuid.uuid4().hex}"
             plist = agents / (label + ".plist")
             plist.write_bytes(
                 _plist(
                     (
                         ("Label", _string(label)),
-                        ("ProgramArguments", "<array>\n    <string>/usr/bin/true</string>\n  </array>"),
+                        (
+                            "ProgramArguments",
+                            "<array>\n    <string>/usr/bin/true</string>\n  </array>",
+                        ),
                         ("RunAtLoad", "<true/>"),
                     )
                 )
             )
-            domain = "gui/{}".format(os.getuid())
+            domain = f"gui/{os.getuid()}"
             subprocess.run(["/usr/bin/plutil", "-lint", str(plist)], check=True)
             try:
                 subprocess.run(
@@ -70,7 +73,9 @@ class InstallerIntegrationTests(unittest.TestCase):
                 )
                 result = subprocess.run(
                     ["/bin/launchctl", "print", domain + "/" + label],
-                    check=False, text=True, capture_output=True,
+                    check=False,
+                    text=True,
+                    capture_output=True,
                 )
                 self.assertEqual(result.returncode, 0)
             finally:
@@ -95,7 +100,9 @@ class InstallerIntegrationTests(unittest.TestCase):
 
             document = json.loads(layout.config_path.read_text(encoding="utf-8"))
             document["sync_sidebar_layout"] = True
-            configured = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+            configured = (
+                json.dumps(document, indent=2, sort_keys=True) + "\n"
+            ).encode()
             upgraded = installer.setup(dry_run=False, config_data=configured)
             self.assertEqual(upgraded.state, "installed")
             self.assertEqual(layout.config_path.read_bytes(), configured)

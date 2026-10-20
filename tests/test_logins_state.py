@@ -37,8 +37,8 @@ def local_ms(stamp: str) -> int:
 
 def login_line(stamp: str, before: str, after: str) -> str:
     return (
-        "{} [info] [account] Login-state transition (loggedOut: true → false, "
-        "uuid: {} → {}), clearing oauth cache\n".format(stamp, before, after)
+        f"{stamp} [info] [account] Login-state transition (loggedOut: true → false, "
+        f"uuid: {before} → {after}), clearing oauth cache\n"
     )
 
 
@@ -67,7 +67,12 @@ class ChatStateTests(unittest.TestCase):
     def test_a_corrupt_file_stops_sync_instead_of_forgetting(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chat-state.json"
-            for content in ("{", "[]", '{"version": 9}', '{"version": 1, "seen": {"k": "x"}}'):
+            for content in (
+                "{",
+                "[]",
+                '{"version": 9}',
+                '{"version": 1, "seen": {"k": "x"}}',
+            ):
                 with self.subTest(content=content):
                     path.write_text(content, encoding="utf-8")
                     with self.assertRaises(StateUnusable):
@@ -77,7 +82,11 @@ class ChatStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chat-state.json"
             for document in (
-                {"version": 2, "normalisation": "older rules", "synced": {"k": {"x": "h"}}},
+                {
+                    "version": 2,
+                    "normalisation": "older rules",
+                    "synced": {"k": {"x": "h"}},
+                },
                 {"version": 1, "normalisation": normalisation(), "agreed": {"x": "h"}},
             ):
                 with self.subTest(version=document["version"]):
@@ -88,7 +97,6 @@ class ChatStateTests(unittest.TestCase):
 
                     self.assertEqual({}, state.sync.synced)
                     self.assertEqual({"k": {"x"}}, state.sync.seen)
-
 
     def test_a_state_saved_while_claude_synced_open_loads_and_drops_live_creates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,7 +110,12 @@ class ChatStateTests(unittest.TestCase):
                         "seen": {"k": ["x"]},
                         "enrolled": ["Work/a/b"],
                         "live_creates": {
-                            "k": {"account": ACCOUNT, "login_ms": 5, "pids": [3], "ids": ["x"]}
+                            "k": {
+                                "account": ACCOUNT,
+                                "login_ms": 5,
+                                "pids": [3],
+                                "ids": ["x"],
+                            }
                         },
                     }
                 ),
@@ -117,12 +130,12 @@ class ChatStateTests(unittest.TestCase):
             self.assertEqual(["Work/a/b"], saved["enrolled"])
             self.assertNotIn("live_creates", saved)
 
-
     def test_a_login_an_older_version_saved_is_kept_as_a_recorded_login(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chat-state.json"
             path.write_text(
-                json.dumps({"version": 2, "logins": {"/root": [ACCOUNT, 5]}}), encoding="utf-8"
+                json.dumps({"version": 2, "logins": {"/root": [ACCOUNT, 5]}}),
+                encoding="utf-8",
             )
 
             self.assertEqual({"/root": {ACCOUNT: 5}}, load_state(path).logins)
@@ -152,7 +165,7 @@ class LoginTests(unittest.TestCase):
         log.write_text(
             login_line("2026-09-22 14:39:21", OTHER, ACCOUNT)
             + "2026-09-22 14:50:00 [info] [account] Login-state transition (loggedOut: false → true, "
-            "uuid: {} → <none>), clearing oauth cache\n".format(ACCOUNT)
+            f"uuid: {ACCOUNT} → <none>), clearing oauth cache\n"
             + login_line("2026-09-22 14:56:48", ACCOUNT, OTHER)
             + login_line("2026-09-22 15:00:00", OTHER, ACCOUNT.upper()),
             encoding="utf-8",
@@ -169,7 +182,9 @@ class LoginTests(unittest.TestCase):
 
     def test_each_account_keeps_its_first_login_after_the_log_rotates(self):
         log = self.root / "main.log"
-        log.write_text(login_line("2026-09-22 14:39:21", OTHER, ACCOUNT), encoding="utf-8")
+        log.write_text(
+            login_line("2026-09-22 14:39:21", OTHER, ACCOUNT), encoding="utf-8"
+        )
         logins = {}
         record_logins([self.root], logins, NOW_MS, lambda _root: log)
 
@@ -200,7 +215,9 @@ class LoginTests(unittest.TestCase):
 
     def test_a_login_time_in_the_future_is_read_as_now(self):
         log = self.root / "main.log"
-        log.write_text(login_line("2099-01-01 00:00:00", OTHER, ACCOUNT), encoding="utf-8")
+        log.write_text(
+            login_line("2099-01-01 00:00:00", OTHER, ACCOUNT), encoding="utf-8"
+        )
 
         self.assertEqual([(ACCOUNT, NOW_MS)], logins_in_app_log(log, NOW_MS))
 
@@ -231,7 +248,9 @@ class EnrollmentTests(unittest.TestCase):
             old = self.target(root, "old-account", "w3")
             config = self.config(root, approved=[(ACCOUNT, "w1")])
 
-            selected, ignored = select_targets(config, [one, two, old], ["Work/{}/w2".format(OTHER)])
+            selected, ignored = select_targets(
+                config, [one, two, old], [f"Work/{OTHER}/w2"]
+            )
 
             self.assertEqual([one, two], list(selected))
             self.assertEqual([old], list(ignored))
@@ -241,7 +260,9 @@ class EnrollmentTests(unittest.TestCase):
             root = Path(directory)
             targets = [self.target(root, ACCOUNT, "w1"), self.target(root, OTHER, "w2")]
 
-            selected, ignored = select_targets(self.config(root, "all-configured-profiles"), targets, [])
+            selected, ignored = select_targets(
+                self.config(root, "all-configured-profiles"), targets, []
+            )
 
             self.assertEqual((targets, []), (list(selected), list(ignored)))
 
@@ -263,7 +284,7 @@ class EnrollmentTests(unittest.TestCase):
                 {str(Path(os.path.abspath(root))): {ACCOUNT: login_ms}},
             )
 
-            self.assertEqual(["Work/{}/fresh".format(ACCOUNT)], joined)
+            self.assertEqual([f"Work/{ACCOUNT}/fresh"], joined)
 
     def test_an_account_that_logged_in_earlier_joins_while_another_is_signed_in(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -283,7 +304,7 @@ class EnrollmentTests(unittest.TestCase):
                 {str(root): {OTHER: now_ms - 600_000, ACCOUNT: now_ms - 60_000}},
             )
 
-            self.assertEqual(["Work/{}/b".format(OTHER)], joined)
+            self.assertEqual([f"Work/{OTHER}/b"], joined)
 
     def test_a_folder_of_an_account_with_no_login_here_stays_out(self):
         with tempfile.TemporaryDirectory() as directory:

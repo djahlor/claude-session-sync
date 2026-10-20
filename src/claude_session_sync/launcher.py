@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Sequence
-
+from collections.abc import Sequence
 
 LAUNCH_TIMEOUT_SECONDS = 10.0
 
@@ -38,7 +37,7 @@ class Launcher:
             raise LaunchError("launch command could not start") from error
         except subprocess.CalledProcessError as error:
             raise LaunchError(
-                "launch command exited with status {}".format(error.returncode)
+                f"launch command exited with status {error.returncode}"
             ) from error
         except subprocess.TimeoutExpired as error:
             raise LaunchError("launch command did not finish in time") from error

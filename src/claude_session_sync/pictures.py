@@ -22,9 +22,10 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 from . import strict_json as json
 from .config import Config
@@ -64,7 +65,7 @@ def projects_root() -> Path:
     return base / "projects"
 
 
-def _attachment_lists(value: Any) -> Iterator[List[Any]]:
+def _attachment_lists(value: Any) -> Iterator[list[Any]]:
     if isinstance(value, dict):
         for key, item in value.items():
             if key == "attachments" and isinstance(item, list):
@@ -77,7 +78,7 @@ def _attachment_lists(value: Any) -> Iterator[List[Any]]:
 
 
 class PictureFixer:
-    def __init__(self, config: Config, *, root: Optional[Path] = None) -> None:
+    def __init__(self, config: Config, *, root: Path | None = None) -> None:
         self.config = config
         self.root = Path(root) if root is not None else projects_root()
         # Claude's own data folder: the Code tab never draws a card from there.
@@ -85,13 +86,17 @@ class PictureFixer:
             str(profile.data_root).rstrip("/") + "/" for profile in config.profiles
         )
 
-    def _local_picture(self, attachment: Any) -> Optional[str]:
+    def _local_picture(self, attachment: Any) -> str | None:
         """The upload id of a picture whose copy on this Mac is the file sent, or None."""
 
         if not isinstance(attachment, dict):
             return None
         path, uuid = attachment.get("path"), attachment.get("file_uuid")
-        if not isinstance(path, str) or not isinstance(uuid, str) or not UUID.match(uuid):
+        if (
+            not isinstance(path, str)
+            or not isinstance(uuid, str)
+            or not UUID.match(uuid)
+        ):
             return None
         if (
             attachment.get("isImage") is not True
@@ -107,11 +112,15 @@ class PictureFixer:
         if not stat.S_ISREG(metadata.st_mode):
             return None
         size = attachment.get("size")
-        if isinstance(size, int) and not isinstance(size, bool) and size != metadata.st_size:
+        if (
+            isinstance(size, int)
+            and not isinstance(size, bool)
+            and size != metadata.st_size
+        ):
             return None
         return uuid
 
-    def plan_line(self, line: bytes) -> Optional[bytes]:
+    def plan_line(self, line: bytes) -> bytes | None:
         """The same line with its local pictures freed from their upload, or None."""
 
         if OLD_KEY not in line or b'"attachments":[' not in line:
@@ -138,7 +147,7 @@ class PictureFixer:
             return None
         return changed
 
-    def _load_offsets(self) -> Dict[str, Dict[str, int]]:
+    def _load_offsets(self) -> dict[str, dict[str, int]]:
         path = self.config.state_dir / OFFSETS_FILENAME
         try:
             document = json.loads(path.read_bytes().decode("utf-8"))
@@ -147,7 +156,11 @@ class PictureFixer:
         except (OSError, UnicodeDecodeError, ValueError) as error:
             raise PictureError("chat picture offsets are unreadable") from error
         files = document.get("files") if isinstance(document, dict) else None
-        if not isinstance(document, dict) or document.get("version") != OFFSETS_VERSION or not isinstance(files, dict):
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != OFFSETS_VERSION
+            or not isinstance(files, dict)
+        ):
             raise PictureError("chat picture offsets have an unknown shape")
         return {
             key: value
@@ -155,16 +168,19 @@ class PictureFixer:
             if isinstance(key, str)
             and isinstance(value, dict)
             and all(
-                isinstance(value.get(field), int) and not isinstance(value.get(field), bool)
+                isinstance(value.get(field), int)
+                and not isinstance(value.get(field), bool)
                 for field in ("dev", "ino", "scanned")
             )
         }
 
-    def _save_offsets(self, files: Dict[str, Dict[str, int]]) -> None:
+    def _save_offsets(self, files: dict[str, dict[str, int]]) -> None:
         ensure_private_directory(self.config.state_dir)
         document = {"version": OFFSETS_VERSION, "files": files}
         path = self.config.state_dir / OFFSETS_FILENAME
-        atomic_write_bytes(path, (json.dumps(document, sort_keys=True) + "\n").encode("utf-8"))
+        atomic_write_bytes(
+            path, (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+        )
         os.chmod(path, 0o600)
 
     def _synced_chat_ids(self) -> set:
@@ -196,10 +212,14 @@ class PictureFixer:
             if project.is_symlink() or not project.is_dir():
                 continue
             for path in sorted(project.glob("*.jsonl")):
-                if path.stem.lower() in ids and not path.is_symlink() and path.is_file():
+                if (
+                    path.stem.lower() in ids
+                    and not path.is_symlink()
+                    and path.is_file()
+                ):
                     yield path
 
-    def _fix_file(self, path: Path, start: int) -> Tuple[int, int]:
+    def _fix_file(self, path: Path, start: int) -> tuple[int, int]:
         """Rewrite qualifying lines from START. Returns (scanned length, pictures)."""
 
         pictures = 0
@@ -218,7 +238,10 @@ class PictureFixer:
                         break
                     changed = self.plan_line(line)
                     # Write only over the exact bytes just read, at the same length.
-                    if changed is not None and os.pread(descriptor, len(line), offset) == line:
+                    if (
+                        changed is not None
+                        and os.pread(descriptor, len(line), offset) == line
+                    ):
                         os.pwrite(descriptor, changed, offset)
                         pictures += changed.count(NEW_KEY) - line.count(NEW_KEY)
                     offset += len(line)
@@ -232,7 +255,7 @@ class PictureFixer:
 
     def sync(self) -> PictureReceipt:
         offsets = self._load_offsets()
-        kept: Dict[str, Dict[str, int]] = {}
+        kept: dict[str, dict[str, int]] = {}
         files = pictures = 0
         for path in self._transcripts():
             metadata = path.stat()
@@ -248,13 +271,17 @@ class PictureFixer:
             scanned, fixed = start, 0
             if start < metadata.st_size:
                 scanned, fixed = self._fix_file(path, start)
-            kept[str(path)] = {"dev": metadata.st_dev, "ino": metadata.st_ino, "scanned": scanned}
+            kept[str(path)] = {
+                "dev": metadata.st_dev,
+                "ino": metadata.st_ino,
+                "scanned": scanned,
+            }
             if fixed:
                 files += 1
                 pictures += fixed
         self._save_offsets(kept)
         return PictureReceipt("synced" if pictures else "noop", files, pictures)
 
-    def probe(self) -> Dict[str, Any]:
+    def probe(self) -> dict[str, Any]:
         self._load_offsets()
         return {"state": "compatible"}

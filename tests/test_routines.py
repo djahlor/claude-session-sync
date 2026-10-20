@@ -1,15 +1,16 @@
+import base64
+import hashlib
 import json
 import os
 import stat
-import tempfile
-import unittest
-import base64
-import hashlib
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import claude_session_sync.routines as routines_module
 from claude_session_sync.config import Config
 from claude_session_sync.model import Profile
 from claude_session_sync.routines import (
@@ -19,7 +20,6 @@ from claude_session_sync.routines import (
     RoutineSynchronizer,
     transform_routine_manifests,
 )
-import claude_session_sync.routines as routines_module
 
 
 def task(task_id, file_path="/tmp/task/SKILL.md", cron="0 9 * * *"):
@@ -175,14 +175,15 @@ class RoutineTransformTests(unittest.TestCase):
             snapshot=snapshot,
         )
 
-        self.assertEqual(
-            "auto", result.manifest["scheduledTasks"][0]["permissionMode"]
-        )
+        self.assertEqual("auto", result.manifest["scheduledTasks"][0]["permissionMode"])
 
     def test_copy_without_a_mode_never_erases_one(self):
         chosen = dict(task("daily"), permissionMode="bypassPermissions")
         first_sync = transform_routine_manifests(
-            (sample("a", 10, manifest(chosen)), sample("b", 20, manifest(task("daily"))))
+            (
+                sample("a", 10, manifest(chosen)),
+                sample("b", 20, manifest(task("daily"))),
+            )
         )
         snapshot = RoutineSnapshot((("Work", "a", "org"),), first_sync.manifest)
         stale_new_account = transform_routine_manifests(
@@ -223,7 +224,10 @@ class RoutineTransformTests(unittest.TestCase):
         )
 
         result = transform_routine_manifests(
-            (sample("a", 10, manifest(task("daily"))), sample("b", 20, manifest(before))),
+            (
+                sample("a", 10, manifest(task("daily"))),
+                sample("b", 20, manifest(before)),
+            ),
             snapshot=snapshot,
         )
 
@@ -240,7 +244,11 @@ class RoutineTransformTests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 with self.assertRaisesRegex(RoutineError, "invalid"):
                     transform_routine_manifests(
-                        (sample("a", 10, manifest(dict(task("daily"), **{field: value}))),)
+                        (
+                            sample(
+                                "a", 10, manifest(dict(task("daily"), **{field: value}))
+                            ),
+                        )
                     )
 
     def test_local_runtime_changes_do_not_override_a_definition_edit(self):
@@ -298,9 +306,7 @@ class RoutineTransformTests(unittest.TestCase):
 
     def test_new_folder_cannot_bring_back_a_deleted_routine(self):
         # A folder from before the delete joins the sync for the first time.
-        snapshot = RoutineSnapshot(
-            (("Work", "a", "org"),), manifest(), {"daily": 5000}
-        )
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), manifest(), {"daily": 5000})
 
         result = transform_routine_manifests(
             (
@@ -331,9 +337,7 @@ class RoutineTransformTests(unittest.TestCase):
         self.assertEqual({"daily": 5000}, dict(result.snapshot.deleted))
 
     def test_routine_made_again_after_the_delete_comes_back(self):
-        snapshot = RoutineSnapshot(
-            (("Work", "a", "org"),), manifest(), {"daily": 5000}
-        )
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), manifest(), {"daily": 5000})
         again = dict(task("daily"), createdAt=6000)
 
         result = transform_routine_manifests(
@@ -347,9 +351,7 @@ class RoutineTransformTests(unittest.TestCase):
         self.assertEqual({}, dict(result.snapshot.deleted))
 
     def test_known_folder_can_add_a_deleted_routine_again(self):
-        snapshot = RoutineSnapshot(
-            (("Work", "a", "org"),), manifest(), {"daily": 5000}
-        )
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), manifest(), {"daily": 5000})
 
         result = transform_routine_manifests(
             (sample("a", 10, manifest(task("daily"))),), snapshot=snapshot
@@ -361,16 +363,20 @@ class RoutineTransformTests(unittest.TestCase):
         self.assertEqual({}, dict(result.snapshot.deleted))
 
     def test_snapshot_deletions_round_trip_and_are_validated(self):
-        snapshot = RoutineSnapshot(
-            (("Work", "a", "org"),), manifest(), {"daily": 5000}
-        )
+        snapshot = RoutineSnapshot((("Work", "a", "org"),), manifest(), {"daily": 5000})
         content = json.dumps(snapshot.as_dict()).encode("utf-8")
 
         self.assertEqual(
             {"daily": 5000}, dict(routines_module._decode_snapshot(content).deleted)
         )
         self.assertNotIn("deleted", RoutineSnapshot((), manifest()).as_dict())
-        for bad in ([], {"daily": "5000"}, {"daily": True}, {"bad id": 1}, {"daily": -1}):
+        for bad in (
+            [],
+            {"daily": "5000"},
+            {"daily": True},
+            {"bad id": 1},
+            {"daily": -1},
+        ):
             document = dict(snapshot.as_dict(), deleted=bad)
             with self.assertRaisesRegex(RoutineError, "invalid deletions"):
                 routines_module._decode_snapshot(json.dumps(document).encode("utf-8"))

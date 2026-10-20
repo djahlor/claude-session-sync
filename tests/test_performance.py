@@ -20,10 +20,10 @@ class PerformanceTests(unittest.TestCase):
                 target.mkdir(parents=True)
                 targets.append(target)
             for index in range(2_500):
-                session_id = "benchmark-{:04d}".format(index)
+                session_id = f"benchmark-{index:04d}"
                 content = json.dumps({"sessionId": session_id, "index": index}).encode()
                 for target in targets:
-                    (target / "local_{}.json".format(session_id)).write_bytes(content)
+                    (target / f"local_{session_id}.json").write_bytes(content)
 
             config = Config(
                 profiles=(
@@ -52,7 +52,7 @@ class PerformanceTests(unittest.TestCase):
 
             self.assertEqual((), warm.operations)
             self.assertLess(
-                elapsed, 3.0, "warm 5,000-replica plan took {:.3f}s".format(elapsed)
+                elapsed, 3.0, f"warm 5,000-replica plan took {elapsed:.3f}s"
             )
 
 

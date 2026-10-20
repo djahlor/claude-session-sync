@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from claude_session_sync.launcher import LaunchError, Launcher
+from claude_session_sync.launcher import Launcher, LaunchError
 
 
 class LauncherTests(unittest.TestCase):

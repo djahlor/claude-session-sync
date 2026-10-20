@@ -68,14 +68,14 @@ class ChatSyncFixture(unittest.TestCase):
     def write(self, folder, session_id, **fields):
         body = {"sessionId": "local_" + session_id, "title": "t", "lastActivityAt": 100}
         body.update(fields)
-        path = folder / "local_{}.json".format(session_id)
+        path = folder / f"local_{session_id}.json"
         path.write_text(json.dumps(body), encoding="utf-8")
         old = time.time() - 60
         os.utime(path, (old, old))
         return path
 
     def read(self, folder, session_id):
-        path = folder / "local_{}.json".format(session_id)
+        path = folder / f"local_{session_id}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def planner(self):
@@ -88,7 +88,9 @@ class ChatSyncFixture(unittest.TestCase):
             "".join(
                 "{} [info] [account] Login-state transition (loggedOut: true → false, "
                 "uuid: {} → {}), clearing oauth cache\n".format(
-                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - ago)),
+                    time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - ago)
+                    ),
                     before,
                     after,
                 )
@@ -98,7 +100,9 @@ class ChatSyncFixture(unittest.TestCase):
         )
 
     def sync(self, **options):
-        engine = TransactionEngine(self.config.state_dir, process_probe=lambda: self.running)
+        engine = TransactionEngine(
+            self.config.state_dir, process_probe=lambda: self.running
+        )
         return run_chat_sync(self.config, self.planner(), engine, **options)
 
     def agree(self, session_id, **fields):
@@ -122,7 +126,7 @@ class ChatSyncFixture(unittest.TestCase):
         ]
 
     def keys(self):
-        return ["Work/{}/{}".format(A_ACCOUNT, A_ORG), "Work/{}/{}".format(B_ACCOUNT, B_ORG)]
+        return [f"Work/{A_ACCOUNT}/{A_ORG}", f"Work/{B_ACCOUNT}/{B_ORG}"]
 
 
 class ChatSyncTests(ChatSyncFixture):
@@ -172,19 +176,19 @@ class ChatSyncTests(ChatSyncFixture):
         self.write(self.b, X, title="two", lastActivityAt=100)
         self.agree(X, title="zero")
 
-        self.sync(prefer="Work/{}/{}".format(A_ACCOUNT, A_ORG))
+        self.sync(prefer=f"Work/{A_ACCOUNT}/{A_ORG}")
 
         self.assertEqual(self.read(self.b, X)["title"], "one")
 
     def test_a_deleted_chat_stays_deleted(self):
         self.write(self.a, X, lastActivityAt=100)
-        (self.b / "deleted_{}".format(X)).write_text(str(NOW_MS - 1_000), encoding="ascii")
+        (self.b / f"deleted_{X}").write_text(str(NOW_MS - 1_000), encoding="ascii")
         self.agree(X)
 
         self.sync()
 
         self.assertIsNone(self.read(self.a, X))
-        self.assertTrue((self.a / "deleted_{}".format(X)).exists())
+        self.assertTrue((self.a / f"deleted_{X}").exists())
         runs = list((self.config.state_dir / "runs").iterdir())
         self.assertEqual(len(runs), 1, "the retired record is kept in the run journal")
 
@@ -192,7 +196,7 @@ class ChatSyncTests(ChatSyncFixture):
         self.write(self.a, X)
         self.write(self.b, X)
         self.sync()
-        (self.b / "local_{}.json".format(X)).unlink()
+        (self.b / f"local_{X}.json").unlink()
 
         run = self.sync()
 
@@ -224,8 +228,11 @@ class ChatSyncTests(ChatSyncFixture):
         # The new account logged in 10 minutes ago. A is signed in again now.
         self.log_logins((A_ACCOUNT, new_account, 600), (new_account, A_ACCOUNT, 60))
         self.write(self.a, X)
-        chat = new_folder / "local_{}.json".format(Y)
-        chat.write_text(json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8")
+        chat = new_folder / f"local_{Y}.json"
+        chat.write_text(
+            json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}),
+            encoding="utf-8",
+        )
         saved = time.time() - 300
         os.utime(chat, (saved, saved))
 
@@ -253,7 +260,7 @@ class ChatSyncTests(ChatSyncFixture):
 
         first = self.sync()
 
-        new_key = "Work/{}/{}".format(new_account, A_ORG)
+        new_key = f"Work/{new_account}/{A_ORG}"
         self.assertEqual("committed", first.receipt.status)
         self.assertEqual(2, first.receipt.operation_count)
         self.assertEqual(1, first.newly_enrolled)
@@ -266,10 +273,10 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertIsNone(self.read(leftover, Y))
         self.assertIn(new_key, load_state(state_path(self.config.state_dir)).enrolled)
         synced_files = [
-            self.a / "local_{}.json".format(X),
-            self.a / "local_{}.json".format(Y),
-            new_folder / "local_{}.json".format(X),
-            new_folder / "local_{}.json".format(Y),
+            self.a / f"local_{X}.json",
+            self.a / f"local_{Y}.json",
+            new_folder / f"local_{X}.json",
+            new_folder / f"local_{Y}.json",
         ]
         mtimes = {path: path.stat().st_mtime_ns for path in synced_files}
 
@@ -278,7 +285,9 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertEqual("noop", repeated.receipt.status)
         self.assertEqual(0, repeated.receipt.operation_count)
         self.assertEqual(0, repeated.newly_enrolled)
-        self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in synced_files})
+        self.assertEqual(
+            mtimes, {path: path.stat().st_mtime_ns for path in synced_files}
+        )
 
     def test_a_new_account_with_no_chats_yet_receives_the_others_history(self):
         # A brand new account's own folder is empty, because Claude writes no
@@ -295,7 +304,7 @@ class ChatSyncTests(ChatSyncFixture):
 
         first = self.sync()
 
-        new_key = "Work/{}/{}".format(new_account, new_org)
+        new_key = f"Work/{new_account}/{new_org}"
         self.assertEqual("committed", first.receipt.status)
         self.assertEqual(1, first.newly_enrolled)
         self.assertIn(new_key, load_state(state_path(self.config.state_dir)).enrolled)
@@ -328,11 +337,14 @@ class ChatSyncTests(ChatSyncFixture):
         self.write(self.a, X)
         older = self.write(new_folder, Y)
         os.utime(str(older), (time.time() - 900, time.time() - 900))
-        self.assertEqual(0, self.sync().newly_enrolled, "no chat was saved there after the login")
+        self.assertEqual(
+            0, self.sync().newly_enrolled, "no chat was saved there after the login"
+        )
 
         self.app_log.write_text("", encoding="utf-8")
-        (new_folder / "local_{}.json".format(Y)).write_text(
-            json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}), encoding="utf-8"
+        (new_folder / f"local_{Y}.json").write_text(
+            json.dumps({"sessionId": "local_" + Y, "lastActivityAt": 5}),
+            encoding="utf-8",
         )
         run = self.sync()
 
@@ -360,6 +372,7 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertIsNone(self.read(self.b, X))
         self.assertFalse(state_path(self.config.state_dir).exists())
 
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -369,10 +382,11 @@ class RecoveryTests(ChatSyncFixture):
 
     def test_a_crash_right_after_a_removal_neither_blocks_sync_nor_loses_the_file(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
 
         self.write(self.a, X, lastActivityAt=100)
-        (self.b / "deleted_{}".format(X)).write_text(str(NOW_MS - 1_000), encoding="ascii")
+        (self.b / f"deleted_{X}").write_text(str(NOW_MS - 1_000), encoding="ascii")
         self.agree(X)
         real_unlink = transaction.durable_unlink
 
@@ -387,7 +401,9 @@ class RecoveryTests(ChatSyncFixture):
         run_id = next((self.config.state_dir / "runs").iterdir()).name
 
         # The removed record can still be put back from the journal.
-        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(run_id)
+        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(
+            run_id
+        )
         self.assertIsNotNone(self.read(self.a, X))
 
         # And the next live run is not blocked by the crash.
@@ -398,11 +414,14 @@ class RecoveryTests(ChatSyncFixture):
 
     def test_an_interrupted_run_is_closed_and_the_next_run_goes_on(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
         from claude_session_sync.journal import RunJournal
 
         self.write(self.a, X)
-        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+        with patch.object(
+            transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")
+        ):
             with self.assertRaises(KeyboardInterrupt):
                 self.sync()
 
@@ -415,13 +434,16 @@ class RecoveryTests(ChatSyncFixture):
         self.assertEqual(
             ["committed", "recovered"],
             sorted(
-                RunJournal.load(self.config.state_dir, path.name).manifest["receipt"]["status"]
+                RunJournal.load(self.config.state_dir, path.name).manifest["receipt"][
+                    "status"
+                ]
                 for path in (self.config.state_dir / "runs").iterdir()
             ),
         )
 
     def test_a_run_whose_rollback_failed_blocks_chat_sync_until_it_is_rolled_back(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
 
         z = "33333333-3333-4333-8333-333333333333"
@@ -434,8 +456,13 @@ class RecoveryTests(ChatSyncFixture):
             transaction.commit_staged(staged, destination)
             raise OSError("disk went away")
 
-        with patch.object(transaction, "commit_staged_new", write_then_fail), patch.object(
-            transaction.TransactionEngine, "_rollback_locked", side_effect=OSError("still gone")
+        with (
+            patch.object(transaction, "commit_staged_new", write_then_fail),
+            patch.object(
+                transaction.TransactionEngine,
+                "_rollback_locked",
+                side_effect=OSError("still gone"),
+            ),
         ):
             with self.assertRaises(transaction.RecoveryError):
                 self.sync()
@@ -446,9 +473,13 @@ class RecoveryTests(ChatSyncFixture):
             self.sync()
 
         self.assertEqual(["RECOVERY_REQUIRED"], self.phases())
-        self.assertIsNone(self.read(self.b, z), "nothing more is written over a half-restored run")
+        self.assertIsNone(
+            self.read(self.b, z), "nothing more is written over a half-restored run"
+        )
         run_id = next((self.config.state_dir / "runs").iterdir()).name
-        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(run_id)
+        TransactionEngine(self.config.state_dir, process_probe=lambda: False).rollback(
+            run_id
+        )
         self.assertEqual("t", self.read(self.b, X)["title"])
 
         run = self.sync()
@@ -460,11 +491,14 @@ class RecoveryTests(ChatSyncFixture):
 
     def test_a_rollback_cut_short_is_not_closed_as_recovered(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
         from claude_session_sync.journal import RunJournal
 
         self.write(self.a, X)
-        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+        with patch.object(
+            transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")
+        ):
             with self.assertRaises(KeyboardInterrupt):
                 self.sync()
         run_id = next((self.config.state_dir / "runs").iterdir()).name
@@ -476,15 +510,17 @@ class RecoveryTests(ChatSyncFixture):
         self.assertEqual(["ABORTING"], self.phases())
 
     def test_staged_copies_left_by_a_killed_run_are_swept(self):
-        leftover = self.b / ".local_{}.json.0123.stage".format(X)
+        leftover = self.b / f".local_{X}.json.0123.stage"
         leftover.write_text("{}", encoding="utf-8")
         old = time.time() - 3600
         os.utime(leftover, (old, old))
-        fresh = self.b / ".local_{}.json.4567.stage".format(Y)
+        fresh = self.b / f".local_{Y}.json.4567.stage"
         fresh.write_text("{}", encoding="utf-8")
         self.write(self.a, X)
 
         self.sync()
 
         self.assertFalse(leftover.exists())
-        self.assertTrue(fresh.exists(), "a staged copy this new may belong to a running sync")
+        self.assertTrue(
+            fresh.exists(), "a staged copy this new may belong to a running sync"
+        )

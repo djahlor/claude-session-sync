@@ -86,16 +86,24 @@ class RecordJournalTests(unittest.TestCase):
 
     def test_an_open_journal_in_the_old_format_stops_recovery_and_writes_nothing(self):
         self.root.mkdir()
-        (self.root / "old.json").write_text(json.dumps({
-            "version": 1,
-            "state": "PREPARED",
-            "records": [{"path": "a", "before": None, "after_sha256": digest(b"new-a")}],
-        }))
+        (self.root / "old.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "state": "PREPARED",
+                    "records": [
+                        {"path": "a", "before": None, "after_sha256": digest(b"new-a")}
+                    ],
+                }
+            )
+        )
 
         with self.assertRaisesRegex(RecordRecoveryError, "version is unsupported"):
             self.journal().recover()
 
-        self.assertEqual(([], {"a": b"old-a", "b": b"old-b"}), (self.writes, self.values))
+        self.assertEqual(
+            ([], {"a": b"old-a", "b": b"old-b"}), (self.writes, self.values)
+        )
 
     def test_commit_preserves_exact_preimages_and_hashes(self):
         before = {"a": b' {"x": 1} \n', "b": None}
@@ -146,12 +154,18 @@ class RecordJournalTests(unittest.TestCase):
                 with self.subTest(phase=phase, equivalent=equivalent):
                     self.values = {"a": b"old-a", "b": b"old-b"}
                     path = self.pending()
-                    self.values = {key: (phase + "-" + key).encode() + (
-                        b"|metadata" if equivalent else b""
-                    ) for key in self.values}
+                    self.values = {
+                        key: (phase + "-" + key).encode()
+                        + (b"|metadata" if equivalent else b"")
+                        for key in self.values
+                    }
                     journal = self.journal(recovery_equivalent=self.metadata_equivalent)
-                    journal.before_mutation = lambda: self.values.update(a=b"new independent edit")
-                    with self.assertRaisesRegex(RecordRecoveryError, "changed during recovery"):
+                    journal.before_mutation = lambda: self.values.update(
+                        a=b"new independent edit"
+                    )
+                    with self.assertRaisesRegex(
+                        RecordRecoveryError, "changed during recovery"
+                    ):
                         journal.recover()
                     self.assertEqual([], self.writes)
                     self.assertEqual("PREPARED", json.loads(path.read_text())["state"])
@@ -162,12 +176,16 @@ class RecordJournalTests(unittest.TestCase):
                 with self.subTest(phase=phase, equivalent=equivalent):
                     self.values = {"a": b"old-a", "b": b"old-b"}
                     path = self.pending()
-                    self.values = {key: (phase + "-" + key).encode() + (
-                        b"|metadata" if equivalent else b""
-                    ) for key in self.values}
+                    self.values = {
+                        key: (phase + "-" + key).encode()
+                        + (b"|metadata" if equivalent else b"")
+                        for key in self.values
+                    }
                     self.running = True
                     with self.assertRaisesRegex(RuntimeError, "Claude running"):
-                        self.journal(recovery_equivalent=self.metadata_equivalent).recover()
+                        self.journal(
+                            recovery_equivalent=self.metadata_equivalent
+                        ).recover()
                     self.assertEqual("PREPARED", json.loads(path.read_text())["state"])
                     self.assertEqual([], self.writes)
 
@@ -177,14 +195,19 @@ class RecordJournalTests(unittest.TestCase):
                 with self.subTest(phase=phase, equivalent=equivalent):
                     self.values = {"a": b"old-a", "b": b"old-b"}
                     path = self.pending()
-                    self.values = {key: (phase + "-" + key).encode() + (
-                        b"|metadata" if equivalent else b""
-                    ) for key in self.values}
+                    self.values = {
+                        key: (phase + "-" + key).encode()
+                        + (b"|metadata" if equivalent else b"")
+                        for key in self.values
+                    }
                     current = self.values.copy()
                     journal = self.journal(recovery_equivalent=self.metadata_equivalent)
                     journal.recover()
                     document = json.loads(path.read_text())
-                    self.assertEqual("ROLLED_BACK" if phase == "old" else "COMMITTED", document["state"])
+                    self.assertEqual(
+                        "ROLLED_BACK" if phase == "old" else "COMMITTED",
+                        document["state"],
+                    )
                     self.assertEqual(current, self.values)
                     self.assertEqual(equivalent, "recovery_comparison" in document)
                     self.assertEqual(equivalent, "recovery_observed_sha256" in document)
@@ -317,8 +340,8 @@ class RecordJournalTests(unittest.TestCase):
         os.mkfifo(path)
         code = (
             "from pathlib import Path; from claude_session_sync.record_journal import RecordJournal, RecordRecoveryError; "
-            "\ntry: RecordJournal._load(None, Path({!r}))\nexcept RecordRecoveryError: pass\nelse: raise AssertionError('accepted FIFO')"
-        ).format(str(path))
+            f"\ntry: RecordJournal._load(None, Path({str(path)!r}))\nexcept RecordRecoveryError: pass\nelse: raise AssertionError('accepted FIFO')"
+        )
         result = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, timeout=3
         )

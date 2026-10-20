@@ -11,7 +11,8 @@ state, the latest title, every trusted git folder and every published page.
 Anything else that differs keeps the tie, so a tie-break never drops data.
 """
 
-from typing import Any, Iterable, Mapping, Optional
+from collections.abc import Iterable, Mapping
+from typing import Any, Optional
 
 from .fingerprint import VOLATILE_KEYS
 
@@ -41,14 +42,17 @@ def tie_break(copies: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
     """The folder key of a copy that covers all the others, or None."""
 
     for key in sorted(copies):
-        if all(covers(copies[key], other) for name, other in copies.items() if name != key):
+        if all(
+            covers(copies[key], other) for name, other in copies.items() if name != key
+        ):
             return key
     return None
 
 
 def covers(winner: Mapping[str, Any], other: Mapping[str, Any]) -> bool:
     differing = {
-        key for key in set(winner) | set(other)
+        key
+        for key in set(winner) | set(other)
         if key not in RUNTIME_KEYS and winner.get(key) != other.get(key)
     }
     if not differing:
@@ -66,11 +70,15 @@ def covers(winner: Mapping[str, Any], other: Mapping[str, Any]) -> bool:
             return False
         differing -= TITLE_KEYS
     if "gitAnchors" in differing:
-        if not _contains(winner.get("gitAnchors"), other.get("gitAnchors"), ("gitRoot", "commonDir")):
+        if not _contains(
+            winner.get("gitAnchors"), other.get("gitAnchors"), ("gitRoot", "commonDir")
+        ):
             return False
         differing.discard("gitAnchors")
     if "publishedArtifacts" in differing:
-        if not _covers_artifacts(winner.get("publishedArtifacts"), other.get("publishedArtifacts")):
+        if not _covers_artifacts(
+            winner.get("publishedArtifacts"), other.get("publishedArtifacts")
+        ):
             return False
         differing.discard("publishedArtifacts")
     return not differing
@@ -87,7 +95,10 @@ def _pull_requests(record: Mapping[str, Any]) -> dict:
         if isinstance(item, dict) and isinstance(item.get("url"), str):
             found[item["url"]] = item
     if isinstance(record.get("prUrl"), str) and record["prUrl"] not in found:
-        found[record["prUrl"]] = {"url": record["prUrl"], "state": record.get("prState")}
+        found[record["prUrl"]] = {
+            "url": record["prUrl"],
+            "state": record.get("prState"),
+        }
     return found
 
 
@@ -115,14 +126,20 @@ def _covers_title(winner: Mapping[str, Any], other: Mapping[str, Any]) -> bool:
     if _turn(winner) != _turn(other):
         return _turn(winner) > _turn(other)
     if winner.get("title") == other.get("title"):
-        return set(_strings(other.get("previousTitles"))) <= set(_strings(winner.get("previousTitles")))
+        return set(_strings(other.get("previousTitles"))) <= set(
+            _strings(winner.get("previousTitles"))
+        )
     if winner.get("titleSource") == "user" and other.get("titleSource") != "user":
         return True
     return other.get("title") in _strings(winner.get("previousTitles"))
 
 
 def _strings(values: Any) -> Iterable[str]:
-    return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+    return (
+        [value for value in values if isinstance(value, str)]
+        if isinstance(values, list)
+        else []
+    )
 
 
 def _contains(mine: Any, theirs: Any, identity: tuple) -> bool:
@@ -142,13 +159,16 @@ def _covers_artifacts(mine: Any, theirs: Any) -> bool:
     if theirs is not None and not isinstance(theirs, list):
         return False
     held = {
-        item.get("url"): item for item in (mine if isinstance(mine, list) else ())
+        item.get("url"): item
+        for item in (mine if isinstance(mine, list) else ())
         if isinstance(item, dict)
     }
     for item in theirs or ():
         if not isinstance(item, dict):
             return False
         kept = held.get(item.get("url"))
-        if kept is None or str(kept.get("updatedAt") or "") < str(item.get("updatedAt") or ""):
+        if kept is None or str(kept.get("updatedAt") or "") < str(
+            item.get("updatedAt") or ""
+        ):
             return False
     return True

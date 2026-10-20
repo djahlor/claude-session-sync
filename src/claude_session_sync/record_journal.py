@@ -11,13 +11,13 @@ import hashlib
 import os
 import stat
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable
 
 from . import strict_json as json
 from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_directory
-
 
 VERSION = 2
 TERMINAL = {"COMMITTED", "ROLLED_BACK"}
@@ -33,15 +33,15 @@ class RecordRecoveryError(RecordJournalError):
     """Recovery needs attention before this adapter can write again."""
 
 
-def digest(value: Optional[bytes]) -> Optional[str]:
+def digest(value: bytes | None) -> str | None:
     return None if value is None else hashlib.sha256(value).hexdigest()
 
 
 @dataclass(frozen=True)
 class Record:
     target: str
-    before: Optional[bytes]
-    after: Optional[bytes]
+    before: bytes | None
+    after: bytes | None
 
 
 class RecordJournal:
@@ -49,15 +49,14 @@ class RecordJournal:
         self,
         root: Path,
         *,
-        read: Callable[[str], Optional[bytes]],
+        read: Callable[[str], bytes | None],
         write: Callable[[str, bytes], None],
         delete: Callable[[str], None],
         validate: Callable[[str], None],
         before_mutation: Callable[[], None],
         retention: int,
-        recovery_equivalent: Optional[
-            Callable[[str, Optional[bytes], Optional[bytes]], bool]
-        ] = None,
+        recovery_equivalent: Callable[[str, bytes | None, bytes | None], bool]
+        | None = None,
     ) -> None:
         self.root = root
         self.read = read
@@ -70,7 +69,7 @@ class RecordJournal:
         # Partial rollback and normal commits always require exact bytes.
         self.recovery_equivalent = recovery_equivalent
 
-    def _load(self, path: Path) -> Dict[str, Any]:
+    def _load(self, path: Path) -> dict[str, Any]:
         try:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
             descriptor = os.open(str(path), flags)
@@ -135,7 +134,7 @@ class RecordJournal:
         return records
 
     @staticmethod
-    def _decode(value: Any) -> Optional[bytes]:
+    def _decode(value: Any) -> bytes | None:
         if value is None:
             return None
         if not isinstance(value, str):
@@ -143,10 +142,10 @@ class RecordJournal:
         return base64.b64decode(value, validate=True)
 
     @staticmethod
-    def _encode(value: Optional[bytes]) -> Optional[str]:
+    def _encode(value: bytes | None) -> str | None:
         return None if value is None else base64.b64encode(value).decode("ascii")
 
-    def _current(self, records: Sequence[Record]) -> Dict[str, Optional[bytes]]:
+    def _current(self, records: Sequence[Record]) -> dict[str, bytes | None]:
         current = {}
         for record in records:
             self.validate(record.target)
@@ -176,17 +175,20 @@ class RecordJournal:
                 raise RecordRecoveryError("rollback failed verification")
 
     def _settled_phase(
-        self, records: Sequence[Record], current: Mapping[str, Optional[bytes]]
-    ) -> Tuple[Optional[str], bool]:
+        self, records: Sequence[Record], current: Mapping[str, bytes | None]
+    ) -> tuple[str | None, bool]:
         if all(current[item.target] == item.before for item in records):
             return "ROLLED_BACK", False
         if all(current[item.target] == item.after for item in records):
             return "COMMITTED", False
         if self.recovery_equivalent is not None:
             for phase, attribute in (("ROLLED_BACK", "before"), ("COMMITTED", "after")):
-                if all(self.recovery_equivalent(
-                    item.target, getattr(item, attribute), current[item.target]
-                ) for item in records):
+                if all(
+                    self.recovery_equivalent(
+                        item.target, getattr(item, attribute), current[item.target]
+                    )
+                    for item in records
+                ):
                     return phase, True
         return None, False
 
@@ -219,15 +221,15 @@ class RecordJournal:
                     document["state"] = "RECOVERY_REQUIRED"
                     self._save(path, document)
                     raise RecordRecoveryError(
-                        "recovery requires attention: {}".format(error)
+                        f"recovery requires attention: {error}"
                     ) from error
                 document["state"] = "ROLLED_BACK"
             self._save(path, document)
 
     def commit(
         self,
-        current: Mapping[str, Optional[bytes]],
-        replacements: Mapping[str, Optional[bytes]],
+        current: Mapping[str, bytes | None],
+        replacements: Mapping[str, bytes | None],
     ) -> None:
         if not replacements:
             return
@@ -240,7 +242,7 @@ class RecordJournal:
             raise RecordJournalError("data changed before synchronization")
         self.before_mutation()
         ensure_private_directory(self.root)
-        path = self.root / "{}.json".format(uuid.uuid4().hex)
+        path = self.root / f"{uuid.uuid4().hex}.json"
         document = {
             "version": VERSION,
             "state": "PREPARED",
@@ -282,7 +284,7 @@ class RecordJournal:
                 document["state"] = "RECOVERY_REQUIRED"
                 self._save(path, document)
                 raise RecordRecoveryError(
-                    "recovery requires attention: {}".format(recovery_error)
+                    f"recovery requires attention: {recovery_error}"
                 ) from error
             document["state"] = "ROLLED_BACK"
             self._save(path, document)

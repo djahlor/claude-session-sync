@@ -7,10 +7,12 @@ rules leave alone are reported as problems and never block the rest.
 
 import hashlib
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional
 
+from . import strict_json
 from .chat_model import (
     Copy,
     CreateRecord,
@@ -24,7 +26,6 @@ from .chat_model import (
 from .chat_state import ChatState, load_state, state_path
 from .config import Config, ConfigError
 from .enrollment import new_login_targets, select_targets, target_key
-from . import strict_json
 from .filesystem import normalized_path, read_bounded
 from .hash_cache import HashCache
 from .logins import default_app_log, record_logins
@@ -40,19 +41,19 @@ from .rules import plan as plan_rules
 from .store import SessionStore
 from .tie_break import tie_break
 
-
 # A chat record is metadata, not the conversation; this bounds a bad file.
 TIE_BREAK_MAX_BYTES = 64 * 1024 * 1024
+
 
 @dataclass
 class PlanContext:
     """What the run needs after planning: state, the folders, and a way to rescan."""
 
     state: ChatState
-    targets: Dict[str, Target]
-    snapshots: List[Snapshot]
-    newly_enrolled: List[str] = field(default_factory=list)
-    rescan: Optional[Callable[[], List[Snapshot]]] = None
+    targets: dict[str, Target]
+    snapshots: list[Snapshot]
+    newly_enrolled: list[str] = field(default_factory=list)
+    rescan: Optional[Callable[[], list[Snapshot]]] = None
 
 
 class Planner:
@@ -96,7 +97,7 @@ class Planner:
         cache = HashCache(config.state_dir / "hash-cache.sqlite3")
         return SessionStore(cache, clock_ns=self._clock_ns), cache
 
-    def sync_targets(self, config: Config) -> Tuple[Target, ...]:
+    def sync_targets(self, config: Config) -> tuple[Target, ...]:
         """The folders the next sync will use, including ones it would enroll.
 
         Reads the chat state and Claude's log without writing either.
@@ -107,7 +108,10 @@ class Planner:
 
     def _select(self, config, found: Discovery, state: ChatState):
         """Record logins and enroll new folders in ``state``, then select."""
-        roots = {profile.name: normalized_path(profile.data_root) for profile in config.profiles}
+        roots = {
+            profile.name: normalized_path(profile.data_root)
+            for profile in config.profiles
+        }
         default_roots = {
             roots[profile.name] for profile in config.profiles if profile.is_default
         }
@@ -162,13 +166,15 @@ class Planner:
             decided = plan_rules(
                 snapshots, state.sync, prefer_key, prefer_session, tie_breaks=breaks
             )
-        operations = tuple(_operation(action, targets, index) for action in decided.actions)
+        operations = tuple(
+            _operation(action, targets, index) for action in decided.actions
+        )
 
         total_bytes = sum(
             operation.size for operation in operations if operation.kind != "retire"
         )
 
-        def rescan() -> List[Snapshot]:
+        def rescan() -> list[Snapshot]:
             # The planning store's cache is closed by now; open a fresh one.
             fresh_store, fresh_cache = self._open_store(config)
             try:
@@ -196,7 +202,7 @@ class Planner:
 
 
 def _snapshots(targets: Mapping[str, Target], scanned: Discovery):
-    by_target: Dict[str, Dict[str, Dict[str, Any]]] = {
+    by_target: dict[str, dict[str, dict[str, Any]]] = {
         key: {"records": {}, "markers": {}, "tmps": {}} for key in targets
     }
     for replica in scanned.replicas:
@@ -213,7 +219,8 @@ def _snapshots(targets: Mapping[str, Target], scanned: Discovery):
             for session_id, replica in entry["records"].items()
         }
         tombstones = {
-            session_id: marker.deleted_at for session_id, marker in entry["markers"].items()
+            session_id: marker.deleted_at
+            for session_id, marker in entry["markers"].items()
         }
         orphans = frozenset(
             session_id for session_id in entry["tmps"] if session_id not in records
@@ -226,24 +233,44 @@ def _operation(action, targets: Mapping[str, Target], index) -> Operation:
     session_id = action.session_id
     if isinstance(action, CreateRecord):
         source = index[action.source]["records"][session_id]
-        destination = targets[action.target].path / "local_{}.json".format(session_id)
+        destination = targets[action.target].path / f"local_{session_id}.json"
         return Operation(
-            "create", session_id, source.path, destination, source.digest, None,
-            source.size, "record", source.state_hash,
+            "create",
+            session_id,
+            source.path,
+            destination,
+            source.digest,
+            None,
+            source.size,
+            "record",
+            source.state_hash,
         )
     if isinstance(action, ReplaceRecord):
         source = index[action.source]["records"][session_id]
         held = index[action.target]["records"][session_id]
         return Operation(
-            "replace", session_id, source.path, held.path, source.digest, held.digest,
-            source.size, "record", source.state_hash,
+            "replace",
+            session_id,
+            source.path,
+            held.path,
+            source.digest,
+            held.digest,
+            source.size,
+            "record",
+            source.state_hash,
         )
     if isinstance(action, CreateTombstone):
         source = index[action.source]["markers"][session_id]
-        destination = targets[action.target].path / "deleted_{}".format(session_id)
+        destination = targets[action.target].path / f"deleted_{session_id}"
         return Operation(
-            "create", session_id, source.path, destination, source.digest, None,
-            source.size, "marker",
+            "create",
+            session_id,
+            source.path,
+            destination,
+            source.digest,
+            None,
+            source.size,
+            "marker",
         )
     if isinstance(action, RetireRecord):
         held = index[action.target]["records"][session_id]
@@ -255,21 +282,29 @@ def _operation(action, targets: Mapping[str, Target], index) -> Operation:
         held = index[action.target]["markers"][session_id]
         artifact = "marker"
     else:  # pragma: no cover - the rules emit only the kinds above
-        raise ValueError("unknown action: {!r}".format(action))
+        raise ValueError(f"unknown action: {action!r}")
     return Operation(
-        "retire", session_id, held.path, held.path, held.digest, held.digest,
-        held.size, artifact,
+        "retire",
+        session_id,
+        held.path,
+        held.path,
+        held.digest,
+        held.digest,
+        held.size,
+        artifact,
     )
 
 
-def _tie_breaks(problems, snapshots, index) -> Dict[str, str]:
+def _tie_breaks(problems, snapshots, index) -> dict[str, str]:
     """Read the leading copies of each tied chat and name the one that covers the rest.
 
     Only tied chats are read again, so a warm plan stays cheap. A copy that no
     longer matches what the scan hashed keeps its chat tied for this run.
     """
-    breaks = {}  # type: Dict[str, str]
-    for session_id in sorted({problem.session_id for problem in problems if problem.kind == "tied"}):
+    breaks: dict[str, str] = {}
+    for session_id in sorted(
+        {problem.session_id for problem in problems if problem.kind == "tied"}
+    ):
         holders = [s for s in snapshots if session_id in s.records]
         latest = max(s.records[session_id].last_activity_at for s in holders)
         copies = {}
@@ -279,7 +314,10 @@ def _tie_breaks(problems, snapshots, index) -> Dict[str, str]:
             replica = index[snapshot.key]["records"][session_id]
             try:
                 raw = read_bounded(replica.path, TIE_BREAK_MAX_BYTES)
-                if not replica.digest or hashlib.sha256(raw).hexdigest() != replica.digest:
+                if (
+                    not replica.digest
+                    or hashlib.sha256(raw).hexdigest() != replica.digest
+                ):
                     break
                 copies[snapshot.key] = strict_json.loads(raw)
             except (OSError, ValueError):
@@ -291,12 +329,14 @@ def _tie_breaks(problems, snapshots, index) -> Dict[str, str]:
     return breaks
 
 
-def _resolve_prefer(prefer: Optional[str], targets: Mapping[str, Target]) -> Optional[str]:
+def _resolve_prefer(
+    prefer: Optional[str], targets: Mapping[str, Target]
+) -> Optional[str]:
     if prefer is None:
         return None
     for key, target in targets.items():
-        short = "{}/{}".format(target.account_id[:8], target.workspace_id[:8])
-        if prefer in (key, short, "{}/{}".format(target.account_id, target.workspace_id)):
+        short = f"{target.account_id[:8]}/{target.workspace_id[:8]}"
+        if prefer in (key, short, f"{target.account_id}/{target.workspace_id}"):
             return key
     raise ValueError("--prefer names no synced sidebar folder")
 
@@ -305,10 +345,7 @@ def _run_label(operations: Sequence[Operation]) -> str:
     """A short label for receipts and journals, from the planned steps. Nothing compares it."""
 
     steps = "\n".join(
-        "{} {} {} {} {}".format(
-            operation.kind, operation.artifact, operation.session_id,
-            operation.source, operation.destination,
-        )
+        f"{operation.kind} {operation.artifact} {operation.session_id} {operation.source} {operation.destination}"
         for operation in operations
     )
     return hashlib.sha256(steps.encode("utf-8")).hexdigest()[:12]

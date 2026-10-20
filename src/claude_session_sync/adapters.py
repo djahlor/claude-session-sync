@@ -1,13 +1,12 @@
 """One execution and reporting boundary for optional storage adapters."""
 
 import os
-import subprocess
 import stat
+import subprocess
 from pathlib import Path
 
 from . import strict_json as json
 from .filesystem import atomic_write_bytes, ensure_private_directory
-
 
 ADAPTERS = (
     (
@@ -159,7 +158,9 @@ def run_adapters(
     if not probe_only and probes:
         if names is not None:
             # A split run keeps what the other part recorded.
-            previous = read_status(config.state_dir, "compatibility-status.json").get("adapters")
+            previous = read_status(config.state_dir, "compatibility-status.json").get(
+                "adapters"
+            )
             if isinstance(previous, dict):
                 probes = {**previous, **probes}
         try:
@@ -198,14 +199,20 @@ def run_layout_first(
     try:
         if running():
             return {}
-        check = getattr(dependencies.layout_factory(config), "keeps_sidebar_per_account", None)
+        check = getattr(
+            dependencies.layout_factory(config), "keeps_sidebar_per_account", None
+        )
         if check is None or not check():
             return {}
     except Exception:
         # The run after the chat sync meets and reports the same problem.
         return {}
-    status = config.state_dir / next(entry[3] for entry in ADAPTERS if entry[0] == "layout")
-    status_before = status.read_bytes() if status.is_file() and not status.is_symlink() else None
+    status = config.state_dir / next(
+        entry[3] for entry in ADAPTERS if entry[0] == "layout"
+    )
+    status_before = (
+        status.read_bytes() if status.is_file() and not status.is_symlink() else None
+    )
     results = run_adapters(
         config,
         dependencies,

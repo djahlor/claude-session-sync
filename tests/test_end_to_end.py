@@ -11,7 +11,7 @@ from claude_session_sync.transaction import TransactionEngine
 
 def _replica(target: Path, session_id: str, marker: str) -> Path:
     target.mkdir(parents=True, exist_ok=True)
-    path = target / "local_{}.json".format(session_id)
+    path = target / f"local_{session_id}.json"
     path.write_text(
         json.dumps({"sessionId": "local_" + session_id, "marker": marker}),
         encoding="utf-8",

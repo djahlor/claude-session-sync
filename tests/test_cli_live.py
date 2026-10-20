@@ -14,6 +14,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from test_cli import (
+    FakeLauncher,
+    FakeLayout,
+    FakeRoutine,
+    ManualClock,
+    SequencedProcessProbe,
+)
+
 from claude_session_sync.chat_state import load_state, state_path
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import ApprovedTarget, Config
@@ -21,7 +29,6 @@ from claude_session_sync.locking import ExclusiveFileLock
 from claude_session_sync.model import Profile
 from claude_session_sync.planner import Planner
 from claude_session_sync.transaction import TransactionEngine
-from test_cli import FakeLauncher, FakeLayout, FakeRoutine, ManualClock, SequencedProcessProbe
 
 A_ACCOUNT = "aaaaaaaa-0000-4000-8000-000000000001"
 A_ORG = "aaaaaaaa-0000-4000-8000-0000000000a1"
@@ -90,19 +97,22 @@ class ChatCliFixture(unittest.TestCase):
     def write(self, folder, session_id, **fields):
         body = {"sessionId": "local_" + session_id, "title": "t", "lastActivityAt": 100}
         body.update(fields)
-        path = folder / "local_{}.json".format(session_id)
+        path = folder / f"local_{session_id}.json"
         path.write_text(json.dumps(body), encoding="utf-8")
         old = time.time() - 60
         os.utime(path, (old, old))
         return path
 
     def read(self, folder, session_id):
-        path = folder / "local_{}.json".format(session_id)
+        path = folder / f"local_{session_id}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def engine(self, **options):
         return lambda config: TransactionEngine(
-            config.state_dir, process_probe=lambda: self.running, retention=config.retention, **options
+            config.state_dir,
+            process_probe=lambda: self.running,
+            retention=config.retention,
+            **options,
         )
 
     def cli(self, *arguments, **dependencies):
@@ -114,7 +124,9 @@ class ChatCliFixture(unittest.TestCase):
                 planner_factory=lambda _config: Planner(app_log=self.app_log),
                 process_probe=FakeProbe(self),
                 engine_factory=self.engine(),
-                layout_factory=lambda _config: self.fail("pins and groups must not sync"),
+                layout_factory=lambda _config: self.fail(
+                    "pins and groups must not sync"
+                ),
                 routine_factory=lambda _config: self.fail("routines must not sync"),
             ),
             **dependencies,
@@ -132,7 +144,9 @@ class LiveCliTests(ChatCliFixture):
     def test_nothing_syncs_while_claude_is_open_and_the_next_quit_does(self):
         from dataclasses import replace
 
-        self.config = replace(self.config, sync_sidebar_layout=True, sync_code_routines=True)
+        self.config = replace(
+            self.config, sync_sidebar_layout=True, sync_code_routines=True
+        )
         self.running = True
         self.write(self.b, Y)
 
@@ -140,7 +154,11 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(0, code, errors)
         self.assertEqual(
-            {"state": "waiting", "reason": "claude-open", "progress": "waiting-for-Claude"},
+            {
+                "state": "waiting",
+                "reason": "claude-open",
+                "progress": "waiting-for-Claude",
+            },
             json.loads(out),
         )
         self.assertIsNone(self.read(self.a, Y))
@@ -148,7 +166,9 @@ class LiveCliTests(ChatCliFixture):
         self.assertFalse((self.config.state_dir / "runs").exists())
 
         self.running = False
-        self.config = replace(self.config, sync_sidebar_layout=False, sync_code_routines=False)
+        self.config = replace(
+            self.config, sync_sidebar_layout=False, sync_code_routines=False
+        )
         code, out, errors = self.cli("auto", "--json")
 
         self.assertEqual(0, code, errors)
@@ -157,10 +177,13 @@ class LiveCliTests(ChatCliFixture):
 
     def test_a_sync_reports_a_run_a_killed_process_left_open(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
 
         self.write(self.a, X)
-        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+        with patch.object(
+            transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")
+        ):
             with self.assertRaises(KeyboardInterrupt):
                 self.cli("sync", "--json")
 
@@ -191,8 +214,15 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual(1, json.loads(out)["counts"]["creates"])
         report = json.loads((self.config.state_dir / "plan-report.json").read_text())
         self.assertEqual(
-            [{"kind": "create", "artifact": "record", "session": X,
-              "from": "aaaaaaaa/aaaaaaaa", "to": "bbbbbbbb/bbbbbbbb"}],
+            [
+                {
+                    "kind": "create",
+                    "artifact": "record",
+                    "session": X,
+                    "from": "aaaaaaaa/aaaaaaaa",
+                    "to": "bbbbbbbb/bbbbbbbb",
+                }
+            ],
             report["actions"],
         )
         self.assertNotIn("private title", json.dumps(report))
@@ -222,14 +252,14 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual(2, json.loads(out)["counts"]["tied"])
         self.assertEqual("run-plan-report", json.loads(out)["next_action"])
 
-        self.cli("sync", "--prefer", "{}/{}".format(A_ACCOUNT[:8], A_ORG[:8]))
+        self.cli("sync", "--prefer", f"{A_ACCOUNT[:8]}/{A_ORG[:8]}")
 
         self.assertEqual("one", self.read(self.b, X)["title"])
 
     def test_forget_lost_lets_the_next_sync_put_a_chat_back(self):
         self.write(self.a, X)
         self.cli("sync")
-        (self.b / "local_{}.json".format(X)).unlink()
+        (self.b / f"local_{X}.json").unlink()
         _code, out, _errors = self.cli("sync", "--json")
         self.assertEqual(1, json.loads(out)["counts"]["lost"])
 
@@ -274,7 +304,7 @@ class LiveCliTests(ChatCliFixture):
         from claude_session_sync import layout
 
         scopes = {
-            "{}/{}".format(account, org): {
+            f"{account}/{org}": {
                 "groups": [{"id": "id-" + name, "name": name} for name in names],
                 "assignments": {},
                 "order": {},
@@ -288,9 +318,15 @@ class LiveCliTests(ChatCliFixture):
             "lastSidebarScopeKey": None,
         }
         records = {
-            layout.GROUP_SCOPES_KEY: layout._encode_record({"value": scopes, "timestamp": 1}),
-            layout.LOCAL_SLICE_KEY: layout._encode_record({"value": {"pinnedOrder": list(pins)}, "timestamp": 1}),
-            layout.DFRAME_STORE_KEY: layout._encode_record({"state": state, "version": 4}),
+            layout.GROUP_SCOPES_KEY: layout._encode_record(
+                {"value": scopes, "timestamp": 1}
+            ),
+            layout.LOCAL_SLICE_KEY: layout._encode_record(
+                {"value": {"pinnedOrder": list(pins)}, "timestamp": 1}
+            ),
+            layout.DFRAME_STORE_KEY: layout._encode_record(
+                {"state": state, "version": 4}
+            ),
             layout.SYNC_OWNER_KEY: b"\x01" + signed_in.encode("utf-8"),
         }
 
@@ -313,8 +349,11 @@ class LiveCliTests(ChatCliFixture):
         helper.chmod(0o700)
         return patch.object(layout, "LevelDatabase", FakeDatabase)
 
-    def test_keep_sidebar_lists_accounts_and_marks_the_signed_in_one_for_the_next_closed_sync(self):
+    def test_keep_sidebar_lists_accounts_and_marks_the_signed_in_one_for_the_next_closed_sync(
+        self,
+    ):
         from dataclasses import replace
+
         from claude_session_sync.layout import read_pending_adoption
 
         self.config = replace(self.config, sync_sidebar_layout=True)
@@ -340,18 +379,26 @@ class LiveCliTests(ChatCliFixture):
 
             code, out, _errors = self.cli("keep-sidebar", "--apply")
         self.assertEqual(0, code)
-        self.assertTrue(out.endswith("state=pending account=1 next_action=restart-claude\n"))
-        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), read_pending_adoption(self.config.state_dir))
+        self.assertTrue(
+            out.endswith("state=pending account=1 next_action=restart-claude\n")
+        )
+        self.assertEqual(
+            f"{A_ACCOUNT}/{A_ORG}", read_pending_adoption(self.config.state_dir)
+        )
 
-    def test_keep_sidebar_lists_accounts_the_next_sync_would_join_on_a_fresh_install(self):
+    def test_keep_sidebar_lists_accounts_the_next_sync_would_join_on_a_fresh_install(
+        self,
+    ):
         from dataclasses import replace
 
-        self.config = replace(self.config, sync_sidebar_layout=True, approved_targets=())
+        self.config = replace(
+            self.config, sync_sidebar_layout=True, approved_targets=()
+        )
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 600))
         self.app_log.write_text(
             "".join(
-                "{} [info] [account] Login-state transition (loggedOut: true \u2192 false, "
-                "uuid: <none> \u2192 {}), clearing oauth cache\n".format(stamp, account)
+                f"{stamp} [info] [account] Login-state transition (loggedOut: true \u2192 false, "
+                f"uuid: <none> \u2192 {account}), clearing oauth cache\n"
                 for account in (B_ACCOUNT, A_ACCOUNT)
             ),
             encoding="utf-8",
@@ -360,7 +407,8 @@ class LiveCliTests(ChatCliFixture):
         self.write(self.b, Y)
 
         with self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old", "Ideas"]}, signed_in=A_ACCOUNT
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old", "Ideas"]},
+            signed_in=A_ACCOUNT,
         ):
             code, out, errors = self.cli("keep-sidebar", "--dry-run")
 
@@ -371,7 +419,9 @@ class LiveCliTests(ChatCliFixture):
             "state=planned account=1 next_action=restart-claude\n",
             out,
         )
-        self.assertFalse(state_path(self.config.state_dir).exists(), "listing writes no chat state")
+        self.assertFalse(
+            state_path(self.config.state_dir).exists(), "listing writes no chat state"
+        )
 
     def test_keep_sidebar_shows_three_group_names_then_how_many_more(self):
         from dataclasses import replace
@@ -379,7 +429,10 @@ class LiveCliTests(ChatCliFixture):
         self.config = replace(self.config, sync_sidebar_layout=True)
         long_name = "A very long group name that keeps going"
         with self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus", "Line\nbreak", long_name, "Four", "Five"], (B_ACCOUNT, B_ORG): []},
+            {
+                (A_ACCOUNT, A_ORG): ["Focus", "Line\nbreak", long_name, "Four", "Five"],
+                (B_ACCOUNT, B_ORG): [],
+            },
             signed_in=A_ACCOUNT,
         ):
             code, out, _errors = self.cli("keep-sidebar", "--dry-run")
@@ -390,19 +443,25 @@ class LiveCliTests(ChatCliFixture):
             "Focus, Line break, A very long group name that k\u2026 and 2 more",
             out.splitlines()[0],
         )
-        self.assertEqual("  2                0 groups     0 pins       0 chats", out.splitlines()[1])
+        self.assertEqual(
+            "  2                0 groups     0 pins       0 chats", out.splitlines()[1]
+        )
 
     def test_keep_sidebar_keeps_another_account_by_its_row_number(self):
         from dataclasses import replace
+
         from claude_session_sync.layout import read_pending_adoption
 
         self.config = replace(self.config, sync_sidebar_layout=True)
         with self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old"]}, signed_in=A_ACCOUNT
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Old"]},
+            signed_in=A_ACCOUNT,
         ):
             code, out, _errors = self.cli("keep-sidebar", "--account", "2", "--apply")
             self.assertEqual(0, code)
-            self.assertEqual("{}/{}".format(B_ACCOUNT, B_ORG), read_pending_adoption(self.config.state_dir))
+            self.assertEqual(
+                f"{B_ACCOUNT}/{B_ORG}", read_pending_adoption(self.config.state_dir)
+            )
 
             code, out, _errors = self.cli("keep-sidebar", "--account", "3", "--apply")
             self.assertEqual(1, code)
@@ -413,7 +472,8 @@ class LiveCliTests(ChatCliFixture):
 
         self.config = replace(self.config, sync_sidebar_layout=True)
         with self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Focus"]}, signed_in=OLD_ACCOUNT
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): ["Focus"]},
+            signed_in=OLD_ACCOUNT,
         ):
             code, out, _errors = self.cli("keep-sidebar", "--dry-run")
 
@@ -432,7 +492,6 @@ class LiveCliTests(ChatCliFixture):
         self.assertEqual(1, code)
         self.assertIn("sidebar-sync-off", out)
 
-
     def install(self, answers, *, tty=True, output_tty=True, second_profile=False):
         from claude_session_sync.installer import InstallReport
 
@@ -444,7 +503,12 @@ class LiveCliTests(ChatCliFixture):
                 {"profile": "Work", "account": B_ACCOUNT, "workspace": B_ORG},
             ],
             "profiles": [
-                {"name": "Work", "data_root": str(self.data_root), "launch_command": ["open"], "is_default": True}
+                {
+                    "name": "Work",
+                    "data_root": str(self.data_root),
+                    "launch_command": ["open"],
+                    "is_default": True,
+                }
             ],
             "state_dir": str(self.config.state_dir),
             "retention": 5,
@@ -455,8 +519,12 @@ class LiveCliTests(ChatCliFixture):
         }
         if second_profile:
             document["profiles"].append(
-                {"name": "Personal", "data_root": str(self.root / "Personal"), "launch_command": ["open"],
-                 "is_default": False}
+                {
+                    "name": "Personal",
+                    "data_root": str(self.root / "Personal"),
+                    "launch_command": ["open"],
+                    "is_default": False,
+                }
             )
         config_path = self.root / "config.json"
         config_path.write_text(json.dumps(document), encoding="utf-8")
@@ -476,8 +544,15 @@ class LiveCliTests(ChatCliFixture):
             installer_factory=lambda _path: Installer(),
         )
         code = run(
-            ["--config", str(config_path), "setup", "--automatic-targets", "--sync-layout",
-             "--ask-main-account", "--apply"],
+            [
+                "--config",
+                str(config_path),
+                "setup",
+                "--automatic-targets",
+                "--sync-layout",
+                "--ask-main-account",
+                "--apply",
+            ],
             dependencies=dependencies,
             stdout=out,
             stderr=io.StringIO(),
@@ -494,7 +569,8 @@ class LiveCliTests(ChatCliFixture):
         self.write(self.a, X)
         self.write(self.b, Y)
         return self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Old"]}, signed_in=A_ACCOUNT
+            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Old"]},
+            signed_in=A_ACCOUNT,
         )
 
     def test_the_question_shows_the_accounts_and_keeps_the_typed_one(self):
@@ -512,7 +588,7 @@ class LiveCliTests(ChatCliFixture):
             "the next time Claude closes.\n\n",
             out[: out.index("state=")],
         )
-        self.assertEqual("{}/{}".format(B_ACCOUNT, B_ORG), self.pending())
+        self.assertEqual(f"{B_ACCOUNT}/{B_ORG}", self.pending())
 
     def test_enter_keeps_the_signed_in_account_after_a_wrong_answer(self):
         with self.two_grouped_accounts():
@@ -520,29 +596,34 @@ class LiveCliTests(ChatCliFixture):
 
         self.assertEqual(0, code)
         self.assertIn("Choose a number from the list that has groups.\n", out)
-        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), self.pending())
+        self.assertEqual(f"{A_ACCOUNT}/{A_ORG}", self.pending())
 
     def test_no_question_without_a_terminal(self):
         for tty, output_tty in ((False, True), (True, False)):
-            with self.subTest(tty=tty, output_tty=output_tty), self.two_grouped_accounts():
+            with (
+                self.subTest(tty=tty, output_tty=output_tty),
+                self.two_grouped_accounts(),
+            ):
                 code, out = self.install("2\n", tty=tty, output_tty=output_tty)
 
                 self.assertEqual((0, None), (code, self.pending()))
                 self.assertNotIn("Which account", out)
 
-    def test_a_number_python_cannot_read_asks_again_instead_of_failing_the_install(self):
+    def test_a_number_python_cannot_read_asks_again_instead_of_failing_the_install(
+        self,
+    ):
         with self.two_grouped_accounts():
             code, out = self.install("\u00b2\n\n")
 
         self.assertEqual(0, code)
         self.assertIn("Choose a number from the list that has groups.\n", out)
-        self.assertEqual("{}/{}".format(A_ACCOUNT, A_ORG), self.pending())
+        self.assertEqual(f"{A_ACCOUNT}/{A_ORG}", self.pending())
 
     def test_keys_pressed_before_the_question_do_not_answer_it(self):
         from claude_session_sync.cli import _discard_typeahead
 
         main, follower = os.openpty()
-        with open(follower, "r", encoding="utf-8") as terminal:
+        with open(follower, encoding="utf-8") as terminal:
             os.write(main, b"\n")  # Enter pressed while setup compiled
             _discard_typeahead(terminal)
             os.write(main, b"2\n")
@@ -553,7 +634,9 @@ class LiveCliTests(ChatCliFixture):
 
     def test_no_question_when_only_one_account_has_groups(self):
         self.write(self.a, X)
-        with self.sidebar({(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): []}, signed_in=A_ACCOUNT):
+        with self.sidebar(
+            {(A_ACCOUNT, A_ORG): ["Focus"], (B_ACCOUNT, B_ORG): []}, signed_in=A_ACCOUNT
+        ):
             code, out = self.install("2\n")
 
         self.assertEqual((0, None), (code, self.pending()))
@@ -563,19 +646,26 @@ class LiveCliTests(ChatCliFixture):
         self.write(self.a, X)
         self.write(self.b, Y)
         with self.sidebar(
-            {(A_ACCOUNT, A_ORG): ["Focus", "Admin"], (B_ACCOUNT, B_ORG): ["Admin", "Focus"]}, signed_in=A_ACCOUNT
+            {
+                (A_ACCOUNT, A_ORG): ["Focus", "Admin"],
+                (B_ACCOUNT, B_ORG): ["Admin", "Focus"],
+            },
+            signed_in=A_ACCOUNT,
         ):
             code, out = self.install("2\n")
 
         self.assertEqual((0, None), (code, self.pending()))
         self.assertNotIn("Which account", out)
 
-    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled_until_setup_drops_one(self):
+    def test_a_main_account_is_refused_plainly_with_two_profiles_enabled_until_setup_drops_one(
+        self,
+    ):
         from dataclasses import replace
 
         self.config = replace(
             self.config,
-            profiles=self.config.profiles + (Profile("Personal", self.root / "Personal", ("open",), False),),
+            profiles=self.config.profiles
+            + (Profile("Personal", self.root / "Personal", ("open",), False),),
             acknowledge_cross_profile_copy=True,
             sync_sidebar_layout=True,
         )
@@ -583,7 +673,8 @@ class LiveCliTests(ChatCliFixture):
         with self.two_grouped_accounts():
             code, out, _errors = self.cli("keep-sidebar", "--account", "2", "--apply")
             self.assertEqual(
-                (1, reason + "\nstate=blocked reason=needs-one-default-profile\n"), (code, out)
+                (1, reason + "\nstate=blocked reason=needs-one-default-profile\n"),
+                (code, out),
             )
             self.assertIsNone(self.pending())
 
@@ -599,7 +690,7 @@ class LiveCliTests(ChatCliFixture):
         state_dir = self.config.state_dir
         state_dir.mkdir(parents=True)
         (state_dir / "sidebar-layout-0.json").write_text(
-            json.dumps({"version": 1, "adopted_scope": "{}/{}".format(A_ACCOUNT, A_ORG)})
+            json.dumps({"version": 1, "adopted_scope": f"{A_ACCOUNT}/{A_ORG}"})
         )
         with self.two_grouped_accounts():
             code, out = self.install("2\n")
@@ -612,7 +703,9 @@ class LiveCliTests(ChatCliFixture):
         code, out = self.install("2\n")  # no sidebar database or helper
 
         self.assertEqual((0, None), (code, self.pending()))
-        self.assertIn("Skipped the main-account question: sidebar helper is not installed\n", out)
+        self.assertIn(
+            "Skipped the main-account question: sidebar helper is not installed\n", out
+        )
         self.assertIn("state=installed", out)
 
 
@@ -622,7 +715,9 @@ class ChatCommandTests(ChatCliFixture):
     def test_plan_counts_the_steps_without_naming_a_chat_or_a_path(self):
         size = self.write(self.a, X, title="private title").stat().st_size
 
-        code, out, errors = self.cli("plan", "--json", clock=itertools.count(5.0, 0.012).__next__)
+        code, out, errors = self.cli(
+            "plan", "--json", clock=itertools.count(5.0, 0.012).__next__
+        )
 
         self.assertEqual((0, ""), (code, errors))
         payload = json.loads(out)
@@ -631,8 +726,12 @@ class ChatCommandTests(ChatCliFixture):
             {
                 "bytes": size,
                 "counts": {
-                    "creates": 1, "ignored_folders": 1, "invalid_replicas": 0,
-                    "operations": 1, "replaces": 0, "retires": 0,
+                    "creates": 1,
+                    "ignored_folders": 1,
+                    "invalid_replicas": 0,
+                    "operations": 1,
+                    "replaces": 0,
+                    "retires": 0,
                 },
                 "duration_ms": 12,
                 "state": "planned",
@@ -642,7 +741,9 @@ class ChatCommandTests(ChatCliFixture):
         for private in ("private title", X, str(self.root)):
             self.assertNotIn(private, out)
 
-    def test_an_unapproved_folder_blocks_manual_approval_mode_and_says_how_to_go_on(self):
+    def test_an_unapproved_folder_blocks_manual_approval_mode_and_says_how_to_go_on(
+        self,
+    ):
         self.config = replace(self.config, target_policy="approved-only")
         self.write(self.a, X)
 
@@ -652,14 +753,20 @@ class ChatCommandTests(ChatCliFixture):
         self.assertEqual(1, code)
         self.assertEqual(
             ("blocked_invalid", 1, "approve-targets-or-enable-automatic-targets"),
-            (payload["state"], payload["counts"]["invalid_replicas"], payload["next_action"]),
+            (
+                payload["state"],
+                payload["counts"]["invalid_replicas"],
+                payload["next_action"],
+            ),
         )
         self.assertNotIn(OLD_ACCOUNT[:8], out)
 
     def test_sync_copies_a_chat_and_reports_the_run(self):
         size = self.write(self.a, X).stat().st_size
 
-        code, out, errors = self.cli("sync", "--json", clock=itertools.count(10.0, 0.012).__next__)
+        code, out, errors = self.cli(
+            "sync", "--json", clock=itertools.count(10.0, 0.012).__next__
+        )
 
         self.assertEqual((0, ""), (code, errors))
         payload = json.loads(out)
@@ -680,32 +787,42 @@ class ChatCommandTests(ChatCliFixture):
     def test_auto_reports_the_chat_sync_in_plain_text(self):
         size = self.write(self.a, X).stat().st_size
 
-        code, out, errors = self.cli("auto", clock=itertools.count(20.0, 0.012).__next__)
+        code, out, errors = self.cli(
+            "auto", clock=itertools.count(20.0, 0.012).__next__
+        )
 
         self.assertEqual((0, ""), (code, errors))
         self.assertRegex(
             out,
-            r"^bytes={} counts=\{{'operations': 1, 'planned': 1, 'ignored_folders': 1\}} "
-            r"duration_ms=12 plan_id=\S+ run_id=[0-9a-f]{{32}} state=committed progress=finished\n$".format(size),
+            rf"^bytes={size} counts=\{{'operations': 1, 'planned': 1, 'ignored_folders': 1\}} "
+            r"duration_ms=12 plan_id=\S+ run_id=[0-9a-f]{32} state=committed progress=finished\n$",
         )
 
     def test_auto_waits_without_writing_while_another_writer_holds_the_lock(self):
         self.write(self.a, X)
 
         with ExclusiveFileLock(self.config.state_dir / "transaction.lock"):
-            code, out, errors = self.cli("auto", engine_factory=self.engine(lock_timeout=0))
+            code, out, errors = self.cli(
+                "auto", engine_factory=self.engine(lock_timeout=0)
+            )
 
-        self.assertEqual((0, "state=skipped reason=busy progress=waiting-for-sync\n", ""), (code, out, errors))
+        self.assertEqual(
+            (0, "state=skipped reason=busy progress=waiting-for-sync\n", ""),
+            (code, out, errors),
+        )
         self.assertIsNone(self.read(self.b, X))
         self.assertFalse(state_path(self.config.state_dir).exists())
 
     def test_a_run_left_half_rolled_back_stops_sync_without_naming_it(self):
         from unittest.mock import patch
+
         from claude_session_sync import transaction
         from claude_session_sync.journal import RunJournal
 
         self.write(self.a, X)
-        with patch.object(transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")):
+        with patch.object(
+            transaction, "commit_staged_new", side_effect=KeyboardInterrupt("killed")
+        ):
             with self.assertRaises(KeyboardInterrupt):
                 self.cli("sync")
         run_id = next((self.config.state_dir / "runs").iterdir()).name
@@ -750,8 +867,11 @@ class ChatCommandTests(ChatCliFixture):
 
         self.write(self.a, X)
         code, out, _errors = self.cli(
-            "sync", "--json",
-            engine_factory=lambda config: TransactionEngine(config.state_dir, process_probe=slow_probe),
+            "sync",
+            "--json",
+            engine_factory=lambda config: TransactionEngine(
+                config.state_dir, process_probe=slow_probe
+            ),
         )
 
         payload = json.loads(out)
@@ -781,7 +901,9 @@ class SwitchTests(ChatCliFixture):
             writer.release()
 
         code, out, errors = self.cli(
-            "switch", "Work", "--json",
+            "switch",
+            "Work",
+            "--json",
             engine_factory=self.engine(lock_timeout=0),
             launcher=FakeLauncher(launches),
             sleeper=sleep,
@@ -806,7 +928,10 @@ class SwitchTests(ChatCliFixture):
                         return PictureReceipt("synced", 1, 2)
 
                 code, out, errors = self.cli(
-                    "switch", "Work", "--json", *extra,
+                    "switch",
+                    "Work",
+                    "--json",
+                    *extra,
                     launcher=FakeLauncher([]),
                     picture_factory=lambda _config: Fixer(),
                 )
@@ -820,8 +945,14 @@ class SwitchTests(ChatCliFixture):
         launches = []
 
         code, _out, errors = self.cli(
-            "switch", "Work", "--wait-for-exit", "1",
-            process_probe=probe, launcher=FakeLauncher(launches), monotonic=clock, sleeper=clock.sleep,
+            "switch",
+            "Work",
+            "--wait-for-exit",
+            "1",
+            process_probe=probe,
+            launcher=FakeLauncher(launches),
+            monotonic=clock,
+            sleeper=clock.sleep,
         )
 
         self.assertEqual((0, ""), (code, errors))
@@ -842,40 +973,62 @@ class SwitchTests(ChatCliFixture):
 
         thread = threading.Thread(
             target=lambda: first.append(
-                self.cli("switch", "Work", process_probe=HeldProbe(), launcher=FakeLauncher(launches))
+                self.cli(
+                    "switch",
+                    "Work",
+                    process_probe=HeldProbe(),
+                    launcher=FakeLauncher(launches),
+                )
             )
         )
         thread.start()
         self.assertTrue(entered.wait(timeout=5))
         second = self.cli(
-            "switch", "Work",
-            planner_factory=lambda _config: self.fail("the second switch must not plan"),
+            "switch",
+            "Work",
+            planner_factory=lambda _config: self.fail(
+                "the second switch must not plan"
+            ),
             launcher=FakeLauncher(launches),
         )
         release.set()
         thread.join(timeout=5)
 
-        self.assertEqual((1, "state=blocked_switch reason=handoff-running\n", ""), second)
+        self.assertEqual(
+            (1, "state=blocked_switch reason=handoff-running\n", ""), second
+        )
         self.assertEqual(0, first[0][0], first)
         self.assertTrue(self.launched(launches))
 
     def test_a_failed_launch_command_is_reported_and_the_next_switch_still_syncs(self):
         self.config = replace(
             self.config,
-            profiles=(replace(self.config.profiles[0], launch_command=("/bin/sh", "-c", "exit 3")),),
+            profiles=(
+                replace(
+                    self.config.profiles[0], launch_command=("/bin/sh", "-c", "exit 3")
+                ),
+            ),
         )
         self.write(self.a, X)
         first = self.cli("switch", "Work")
         self.write(self.a, Y)
         second = self.cli("switch", "Work")
 
-        self.assertEqual([(1, "state=launch_failed reason=launch-command-failed\n", "")] * 2, [first, second])
-        self.assertIsNotNone(self.read(self.b, Y), "a failed launch must not block the next switch")
+        self.assertEqual(
+            [(1, "state=launch_failed reason=launch-command-failed\n", "")] * 2,
+            [first, second],
+        )
+        self.assertIsNotNone(
+            self.read(self.b, Y), "a failed launch must not block the next switch"
+        )
 
     def test_a_claude_that_has_not_shown_up_yet_does_not_block_the_next_switch(self):
         # The command succeeds, but Claude never shows up in the process list.
         self.config = replace(
-            self.config, profiles=(replace(self.config.profiles[0], launch_command=("/usr/bin/true",)),)
+            self.config,
+            profiles=(
+                replace(self.config.profiles[0], launch_command=("/usr/bin/true",)),
+            ),
         )
         self.write(self.a, X)
         first = self.cli("switch", "Work")[0]
@@ -889,7 +1042,9 @@ class SwitchTests(ChatCliFixture):
         self.write(self.a, X)
         seen = []
         launcher = SimpleNamespace(
-            launch=lambda command: seen.append((tuple(command), self.read(self.b, X) is not None))
+            launch=lambda command: seen.append(
+                (tuple(command), self.read(self.b, X) is not None)
+            )
         )
 
         code, out, errors = self.cli("switch", "Work", "--json", launcher=launcher)
@@ -899,10 +1054,12 @@ class SwitchTests(ChatCliFixture):
         self.assertEqual("finished", json.loads(out)["progress"])
 
     def test_a_switch_blocked_by_an_unsafe_chat_file_still_reopens_claude(self):
-        (self.a / "local_{}.json".format(Y)).symlink_to(self.root / "elsewhere.json")
+        (self.a / f"local_{Y}.json").symlink_to(self.root / "elsewhere.json")
         launches = []
 
-        code, out, _errors = self.cli("switch", "Work", "--json", launcher=FakeLauncher(launches))
+        code, out, _errors = self.cli(
+            "switch", "Work", "--json", launcher=FakeLauncher(launches)
+        )
 
         payload = json.loads(out)
         self.assertEqual(1, code)
@@ -920,8 +1077,12 @@ class SwitchTests(ChatCliFixture):
         launches = []
 
         code, out, _errors = self.cli(
-            "switch", "Work", "--json",
-            engine_factory=lambda config: TransactionEngine(config.state_dir, process_probe=broken_probe),
+            "switch",
+            "Work",
+            "--json",
+            engine_factory=lambda config: TransactionEngine(
+                config.state_dir, process_probe=broken_probe
+            ),
             launcher=FakeLauncher(launches),
         )
 
@@ -930,7 +1091,12 @@ class SwitchTests(ChatCliFixture):
         self.assertTrue(self.launched(launches))
         self.assertEqual(
             ("failed", "chat-sync-error", "needs-attention", "started"),
-            (payload["state"], payload["reason"], payload["progress"], payload["launch"]),
+            (
+                payload["state"],
+                payload["reason"],
+                payload["progress"],
+                payload["launch"],
+            ),
         )
         self.assertNotIn("private", out)
 
@@ -938,8 +1104,12 @@ class SwitchTests(ChatCliFixture):
         from unittest import mock
 
         launches = []
-        with mock.patch("claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")):
-            code, _out, errors = self.cli("switch", "Work", launcher=FakeLauncher(launches))
+        with mock.patch(
+            "claude_session_sync.cli.finish_progress", side_effect=OSError("disk full")
+        ):
+            code, _out, errors = self.cli(
+                "switch", "Work", launcher=FakeLauncher(launches)
+            )
 
         self.assertEqual(1, code)
         self.assertIn("disk full", errors)
@@ -955,22 +1125,53 @@ class SwitchSidebarFirstTests(ChatCliFixture):
     Sort by and Show back to that account's old values.
     """
 
-    A_SCOPE = "{}/{}".format(A_ACCOUNT, A_ORG)
-    B_SCOPE = "{}/{}".format(B_ACCOUNT, B_ORG)
+    A_SCOPE = f"{A_ACCOUNT}/{A_ORG}"
+    B_SCOPE = f"{B_ACCOUNT}/{B_ORG}"
 
     @staticmethod
     def slot(group_by, sort_by):
-        sections = [{"id": "pinned", "kind": "pinned", "v": 2, "name": "", "order": 0,
-                     "sortBy": sort_by, "ascending": False}]
+        sections = [
+            {
+                "id": "pinned",
+                "kind": "pinned",
+                "v": 2,
+                "name": "",
+                "order": 0,
+                "sortBy": sort_by,
+                "ascending": False,
+            }
+        ]
         for order, name in enumerate(("Popcorn", "Clients"), start=1):
-            sections.append({
-                "id": "cg-" + name.lower(), "kind": "manual", "v": 2, "name": name,
-                "order": order, "members": ["code:local_" + name.lower()],
-                "groupBy": group_by, "sortBy": sort_by, "ascending": False,
-                "show": {"metadata": False, "emptyGroups": group_by == "none", "sideChats": False},
-            })
-        sections.append({"id": "sessions", "kind": "sessions", "v": 2, "name": "", "order": 3,
-                         "groupBy": group_by, "sortBy": sort_by, "ascending": False})
+            sections.append(
+                {
+                    "id": "cg-" + name.lower(),
+                    "kind": "manual",
+                    "v": 2,
+                    "name": name,
+                    "order": order,
+                    "members": ["code:local_" + name.lower()],
+                    "groupBy": group_by,
+                    "sortBy": sort_by,
+                    "ascending": False,
+                    "show": {
+                        "metadata": False,
+                        "emptyGroups": group_by == "none",
+                        "sideChats": False,
+                    },
+                }
+            )
+        sections.append(
+            {
+                "id": "sessions",
+                "kind": "sessions",
+                "v": 2,
+                "name": "",
+                "order": 3,
+                "groupBy": group_by,
+                "sortBy": sort_by,
+                "ascending": False,
+            }
+        )
         return {"sections": sections, "migratedFrom": 1, "prefsSeeded": True}
 
     def setUp(self):
@@ -987,15 +1188,19 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         self.main_slot = self.slot("none", "created")
         self.server_slot = self.slot("date", "recency")
         state = {
-            "codeSidebarByScope": {self.A_SCOPE: self.main_slot, self.B_SCOPE: self.server_slot},
+            "codeSidebarByScope": {
+                self.A_SCOPE: self.main_slot,
+                self.B_SCOPE: self.server_slot,
+            },
             "customGroupsByScope": {},
             "lastSidebarScopeKey": self.B_SCOPE,
             "pinnedOrder": [],
         }
         self.records = {
-            layout.DFRAME_STORE_KEY: b"\x01" + json.dumps(
-                {"state": state, "version": 1}, separators=(",", ":")
-            ).encode("ascii"),
+            layout.DFRAME_STORE_KEY: b"\x01"
+            + json.dumps({"state": state, "version": 1}, separators=(",", ":")).encode(
+                "ascii"
+            ),
             layout.SYNC_OWNER_KEY: b"\x01" + B_ACCOUNT.encode("ascii"),
             layout.SYNC_ACTIVE_KEY: b"\x011",
         }
@@ -1032,7 +1237,9 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         )
 
     def signed_in_slot(self):
-        state = json.loads(self.records[self.layout.DFRAME_STORE_KEY][1:].decode("ascii"))["state"]
+        state = json.loads(
+            self.records[self.layout.DFRAME_STORE_KEY][1:].decode("ascii")
+        )["state"]
         return state["codeSidebarByScope"][self.B_SCOPE]
 
     def reopening_planner(self, _config):
@@ -1040,7 +1247,9 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         self.running = True
         return Planner(app_log=self.app_log)
 
-    def test_claude_reopening_during_the_chat_sync_no_longer_skips_the_sidebar_copy(self):
+    def test_claude_reopening_during_the_chat_sync_no_longer_skips_the_sidebar_copy(
+        self,
+    ):
         self.write(self.a, X)
         launches = []
         clock = [0.0]
@@ -1049,7 +1258,10 @@ class SwitchSidebarFirstTests(ChatCliFixture):
             clock[0] += seconds
 
         code, out, _errors = self.cli(
-            "switch", "Work", "--after-account-switch", "--json",
+            "switch",
+            "Work",
+            "--after-account-switch",
+            "--json",
             planner_factory=self.reopening_planner,
             layout_factory=self.synchronizer,
             launcher=FakeLauncher(launches),
@@ -1060,14 +1272,17 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         payload = json.loads(out)
         self.assertEqual(self.main_slot["sections"], self.signed_in_slot()["sections"])
         self.assertEqual(
-            b"\x01" + self.B_SCOPE.encode("ascii"), self.records[self.layout.GROUP_UPLOAD_KEY]
+            b"\x01" + self.B_SCOPE.encode("ascii"),
+            self.records[self.layout.GROUP_UPLOAD_KEY],
         )
         self.assertEqual(
             ("per-account", "claude-uploads-copy-on-next-start"),
             (payload["layout"]["state"], payload["layout"]["reason"]),
         )
         # The chat sync still stops for the open Claude, as before.
-        self.assertEqual(("failed", "claude-open"), (payload["state"], payload["reason"]))
+        self.assertEqual(
+            ("failed", "claude-open"), (payload["state"], payload["reason"])
+        )
         self.assertEqual(1, code)
         self.assertEqual([("launch", ("open",))], launches)
 
@@ -1079,7 +1294,10 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         self.addCleanup(writer.release)
 
         code, out, errors = self.cli(
-            "switch", "Work", "--after-account-switch", "--json",
+            "switch",
+            "Work",
+            "--after-account-switch",
+            "--json",
             engine_factory=self.engine(lock_timeout=0),
             layout_factory=self.synchronizer,
             launcher=FakeLauncher([]),
@@ -1088,8 +1306,12 @@ class SwitchSidebarFirstTests(ChatCliFixture):
 
         payload = json.loads(out)
         self.assertEqual((0, ""), (code, errors))
-        self.assertEqual(("committed", "finished"), (payload["state"], payload["progress"]))
-        self.assertEqual("claude-uploads-copy-on-next-start", payload["layout"]["reason"])
+        self.assertEqual(
+            ("committed", "finished"), (payload["state"], payload["progress"])
+        )
+        self.assertEqual(
+            "claude-uploads-copy-on-next-start", payload["layout"]["reason"]
+        )
         self.assertEqual(self.main_slot["sections"], self.signed_in_slot()["sections"])
 
     def test_a_put_off_first_attempt_leaves_the_sidebar_status_as_it_was(self):
@@ -1107,7 +1329,10 @@ class SwitchSidebarFirstTests(ChatCliFixture):
 
         self.write(self.a, X)
         code, out, _errors = self.cli(
-            "switch", "Work", "--after-account-switch", "--json",
+            "switch",
+            "Work",
+            "--after-account-switch",
+            "--json",
             engine_factory=self.engine(lock_timeout=0),
             layout_factory=self.synchronizer,
             launcher=FakeLauncher([]),
@@ -1115,15 +1340,24 @@ class SwitchSidebarFirstTests(ChatCliFixture):
         )
 
         self.assertEqual(1, code)
-        self.assertEqual({"state": "deferred", "reason": "app-running"}, json.loads(out)["layout"])
-        self.assertEqual('{"state": "per-account"}\n', status.read_text(encoding="utf-8"))
-        self.assertEqual(self.server_slot["sections"], self.signed_in_slot()["sections"])
+        self.assertEqual(
+            {"state": "deferred", "reason": "app-running"}, json.loads(out)["layout"]
+        )
+        self.assertEqual(
+            '{"state": "per-account"}\n', status.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            self.server_slot["sections"], self.signed_in_slot()["sections"]
+        )
 
     def test_the_sidebar_step_runs_after_chats_unless_claude_keeps_it_per_account(self):
         from test_cli import FakeLayoutReceipt
 
-        for per_account, expected in ((True, ["layout", "chats"]), (False, ["chats", "layout"]),
-                                      (None, ["chats", "layout"])):
+        for per_account, expected in (
+            (True, ["layout", "chats"]),
+            (False, ["chats", "layout"]),
+            (None, ["chats", "layout"]),
+        ):
             with self.subTest(per_account=per_account):
                 events = []
 
@@ -1133,14 +1367,19 @@ class SwitchSidebarFirstTests(ChatCliFixture):
                         return FakeLayoutReceipt()
 
                 if per_account is not None:
-                    RecordingLayout.keeps_sidebar_per_account = lambda _self, value=per_account: value
+                    RecordingLayout.keeps_sidebar_per_account = (
+                        lambda _self, value=per_account: value
+                    )
 
                 def planner(_config):
                     events.append("chats")
                     return Planner(app_log=self.app_log)
 
                 code, out, errors = self.cli(
-                    "switch", "Work", "--after-account-switch", "--json",
+                    "switch",
+                    "Work",
+                    "--after-account-switch",
+                    "--json",
                     planner_factory=planner,
                     layout_factory=lambda _config: RecordingLayout(),
                     launcher=FakeLauncher([]),
@@ -1167,7 +1406,14 @@ class AdapterBesideChatTests(ChatCliFixture):
         self.assertEqual((0, ""), (code, errors))
         self.assertEqual("committed", payload["state"])
         self.assertEqual(
-            {"state": "synced", "profiles": 1, "targets": 3, "manifests": 2, "tasks": 4, "writes": 1},
+            {
+                "state": "synced",
+                "profiles": 1,
+                "targets": 3,
+                "manifests": 2,
+                "tasks": 4,
+                "writes": 1,
+            },
             payload["routines"],
         )
 
@@ -1178,11 +1424,17 @@ class AdapterBesideChatTests(ChatCliFixture):
 
         self.config = replace(self.config, sync_code_routines=True)
 
-        code, payload, _errors = self.sync(routine_factory=lambda _config: BrokenRoutine())
+        code, payload, _errors = self.sync(
+            routine_factory=lambda _config: BrokenRoutine()
+        )
 
         self.assertEqual(1, code)
         self.assertEqual(
-            ("committed", "needs-attention", {"state": "skipped", "reason": "routine-error"}),
+            (
+                "committed",
+                "needs-attention",
+                {"state": "skipped", "reason": "routine-error"},
+            ),
             (payload["state"], payload["progress"], payload["routines"]),
         )
 
@@ -1196,18 +1448,25 @@ class AdapterBesideChatTests(ChatCliFixture):
                 calls.append(adopt_current_sidebar)
                 return FakeLayoutReceipt()
 
-        self.config = replace(self.config, sync_sidebar_layout=True, sync_code_routines=True)
+        self.config = replace(
+            self.config, sync_sidebar_layout=True, sync_code_routines=True
+        )
         self.write(self.a, X)
 
         code, out, errors = self.cli(
-            "sync", "--adopt-current-sidebar", "--json",
+            "sync",
+            "--adopt-current-sidebar",
+            "--json",
             layout_factory=lambda _config: RecordingLayout(),
             routine_factory=lambda _config: FakeRoutine(),
         )
 
         self.assertEqual((0, ""), (code, errors))
         self.assertEqual([True], calls)
-        self.assertEqual(("committed", "synced"), (json.loads(out)["state"], json.loads(out)["layout"]["state"]))
+        self.assertEqual(
+            ("committed", "synced"),
+            (json.loads(out)["state"], json.loads(out)["layout"]["state"]),
+        )
 
     def test_pins_and_groups_report_beside_a_committed_chat_sync(self):
         self.config = replace(self.config, sync_sidebar_layout=True)
@@ -1217,7 +1476,14 @@ class AdapterBesideChatTests(ChatCliFixture):
         self.assertEqual((0, ""), (code, errors))
         self.assertEqual("committed", payload["state"])
         self.assertEqual(
-            {"state": "synced", "profiles": 1, "records": 2, "groups": 4, "assignments": 12, "pins": 3},
+            {
+                "state": "synced",
+                "profiles": 1,
+                "records": 2,
+                "groups": 4,
+                "assignments": 12,
+                "pins": 3,
+            },
             payload["layout"],
         )
 
@@ -1235,8 +1501,15 @@ class AdapterBesideChatTests(ChatCliFixture):
         self.assertEqual((0, ""), (code, errors))
         self.assertEqual("finished", payload["progress"])
         self.assertEqual(
-            {"state": "noop", "reason": "no-groups-yet", "profiles": 1, "records": 0,
-             "groups": 0, "assignments": 0, "pins": 0},
+            {
+                "state": "noop",
+                "reason": "no-groups-yet",
+                "profiles": 1,
+                "records": 0,
+                "groups": 0,
+                "assignments": 0,
+                "pins": 0,
+            },
             payload["layout"],
         )
 
@@ -1247,11 +1520,17 @@ class AdapterBesideChatTests(ChatCliFixture):
 
         self.config = replace(self.config, sync_sidebar_layout=True)
 
-        code, payload, _errors = self.sync(layout_factory=lambda _config: BrokenLayout())
+        code, payload, _errors = self.sync(
+            layout_factory=lambda _config: BrokenLayout()
+        )
 
         self.assertEqual(1, code)
         self.assertEqual(
-            ("committed", "needs-attention", {"state": "skipped", "reason": "layout-error"}),
+            (
+                "committed",
+                "needs-attention",
+                {"state": "skipped", "reason": "layout-error"},
+            ),
             (payload["state"], payload["progress"], payload["layout"]),
         )
 
@@ -1264,12 +1543,24 @@ class AdapterBesideChatTests(ChatCliFixture):
 
         self.config = replace(self.config, sync_sidebar_layout=True)
 
-        code, payload, _errors = self.sync(layout_factory=lambda _config: UnsafeLayout())
+        code, payload, _errors = self.sync(
+            layout_factory=lambda _config: UnsafeLayout()
+        )
 
         self.assertEqual(1, code)
         self.assertEqual(
-            ("committed", "needs-attention", "unsafe-layout", "custom group records contain conflicting ids"),
-            (payload["state"], payload["progress"], payload["layout"]["reason"], payload["layout"]["detail"]),
+            (
+                "committed",
+                "needs-attention",
+                "unsafe-layout",
+                "custom group records contain conflicting ids",
+            ),
+            (
+                payload["state"],
+                payload["progress"],
+                payload["layout"]["reason"],
+                payload["layout"]["detail"],
+            ),
         )
 
 

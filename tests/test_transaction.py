@@ -11,17 +11,15 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
 from unittest.mock import patch
 
 from claude_session_sync.journal import abandoned_preparations, pending_recovery_runs
-
 from claude_session_sync.transaction import (
     AppRunningError,
     PlanBlockedError,
-    RevalidationError,
     RecoveryError,
     RecoveryPendingError,
+    RevalidationError,
     TransactionEngine,
 )
 
@@ -30,7 +28,7 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def make_plan(source: Path, destination: Path, destination_before: Optional[bytes]):
+def make_plan(source: Path, destination: Path, destination_before: bytes | None):
     source_bytes = source.read_bytes()
     operation = SimpleNamespace(
         kind="create" if destination_before is None else "replace",
@@ -56,14 +54,21 @@ class TransactionEngineTests(unittest.TestCase):
             fifo = Path(directory) / "fifo"
             os.mkfifo(fifo)
             result = subprocess.run(
-                [sys.executable, "-c", (
-                    "import sys\n"
-                    "from claude_session_sync.filesystem import digest_file, UnsafePathError\n"
-                    "try: digest_file(sys.argv[1])\n"
-                    "except UnsafePathError: pass\n"
-                    "else: raise AssertionError('FIFO was accepted')\n"
-                ), str(fifo)],
-                capture_output=True, text=True, timeout=3,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys\n"
+                        "from claude_session_sync.filesystem import digest_file, UnsafePathError\n"
+                        "try: digest_file(sys.argv[1])\n"
+                        "except UnsafePathError: pass\n"
+                        "else: raise AssertionError('FIFO was accepted')\n"
+                    ),
+                    str(fifo),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -75,7 +80,10 @@ class TransactionEngineTests(unittest.TestCase):
             destination.write_bytes(b"old")
             plan = make_plan(source, destination, b"old")
             engine = TransactionEngine(root / "state", process_probe=lambda: False)
-            with patch("claude_session_sync.journal.RunJournal._persist", side_effect=OSError("disk unavailable")):
+            with patch(
+                "claude_session_sync.journal.RunJournal._persist",
+                side_effect=OSError("disk unavailable"),
+            ):
                 with self.assertRaises(OSError):
                     engine.apply(plan)
             self.assertEqual(pending_recovery_runs(root / "state"), [])
@@ -99,7 +107,10 @@ class TransactionEngineTests(unittest.TestCase):
             destination.write_bytes(b"old")
             plan = make_plan(source, destination, b"old")
             engine = TransactionEngine(root / "state", process_probe=lambda: False)
-            with patch("claude_session_sync.journal.atomic_copy", side_effect=OSError("disk unavailable")):
+            with patch(
+                "claude_session_sync.journal.atomic_copy",
+                side_effect=OSError("disk unavailable"),
+            ):
                 with self.assertRaises(OSError):
                     engine.apply(plan)
             self.assertEqual(destination.read_bytes(), b"old")
@@ -330,9 +341,9 @@ class TransactionEngineTests(unittest.TestCase):
             target.mkdir()
             terminal_run_ids = []
             for index in range(2):
-                source = root / "source-{}.json".format(index)
-                destination = target / "local_{}.json".format(index)
-                source.write_bytes("source-{}".format(index).encode("utf-8"))
+                source = root / f"source-{index}.json"
+                destination = target / f"local_{index}.json"
+                source.write_bytes(f"source-{index}".encode())
                 receipt = TransactionEngine(
                     root / "state",
                     process_probe=lambda: False,
@@ -358,7 +369,9 @@ class TransactionEngineTests(unittest.TestCase):
                 ).apply(make_plan(crashing_source, crashing_destination, None))
 
             # A young terminal run doubles as the kept copy of what it replaced.
-            engine = TransactionEngine(root / "state", process_probe=lambda: False, retention=1)
+            engine = TransactionEngine(
+                root / "state", process_probe=lambda: False, retention=1
+            )
             engine.rollback(terminal_run_ids[0])
             runs = root / "state" / "runs"
             self.assertEqual(
@@ -436,9 +449,9 @@ class TransactionEngineTests(unittest.TestCase):
             target.mkdir()
             operations = []
             for index in range(40):
-                source = root / "source-{}.json".format(index)
-                destination = target / "local_{}.json".format(index)
-                source.write_bytes("source-{}".format(index).encode("utf-8"))
+                source = root / f"source-{index}.json"
+                destination = target / f"local_{index}.json"
+                source.write_bytes(f"source-{index}".encode())
                 operations.append(make_plan(source, destination, None).operations[0])
             bulk_plan = SimpleNamespace(
                 operations=tuple(operations),

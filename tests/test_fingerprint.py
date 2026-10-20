@@ -15,7 +15,9 @@ def record(**fields):
 class FingerprintTests(unittest.TestCase):
     def test_what_claude_rewrites_without_user_action_is_not_state(self):
         before = fingerprint(SID, record(error="never started", errorAt=111))
-        after = fingerprint(SID, record(error="never started", errorAt=222, lastFocusedAt=999))
+        after = fingerprint(
+            SID, record(error="never started", errorAt=222, lastFocusedAt=999)
+        )
 
         self.assertEqual(before.state_hash, after.state_hash)
 
@@ -55,16 +57,26 @@ class FingerprintTests(unittest.TestCase):
                 )
 
     def test_a_string_cut_through_an_emoji_is_still_a_readable_record(self):
-        cut = b'{"sessionId": "local_%s", "report": "done \\ud83d", "lastActivityAt": 7}' % SID.encode()
-        whole = b'{"sessionId": "local_%s", "report": "done", "lastActivityAt": 7}' % SID.encode()
+        cut = (
+            b'{"sessionId": "local_%s", "report": "done \\ud83d", "lastActivityAt": 7}'
+            % SID.encode()
+        )
+        whole = (
+            b'{"sessionId": "local_%s", "report": "done", "lastActivityAt": 7}'
+            % SID.encode()
+        )
 
         self.assertTrue(fingerprint(SID, cut).readable)
         self.assertEqual(fingerprint(SID, cut).last_activity_at, 7)
-        self.assertNotEqual(fingerprint(SID, cut).state_hash, fingerprint(SID, whole).state_hash)
+        self.assertNotEqual(
+            fingerprint(SID, cut).state_hash, fingerprint(SID, whole).state_hash
+        )
 
     def test_key_order_and_spacing_do_not_change_the_state(self):
         one = fingerprint(SID, b'{"sessionId":"local_%s","title":"t"}' % SID.encode())
-        two = fingerprint(SID, b'{ "title": "t",\n "sessionId": "local_%s" }' % SID.encode())
+        two = fingerprint(
+            SID, b'{ "title": "t",\n "sessionId": "local_%s" }' % SID.encode()
+        )
 
         self.assertEqual(one.state_hash, two.state_hash)
 
@@ -89,23 +101,32 @@ class FingerprintTests(unittest.TestCase):
         self.assertNotEqual(plain.state_hash, nested.state_hash)
 
     def test_activity_is_read_and_floored(self):
-        self.assertEqual(fingerprint(SID, record(lastActivityAt=1234)).last_activity_at, 1234)
-        self.assertEqual(fingerprint(SID, record(lastActivityAt=1234.9)).last_activity_at, 1234)
+        self.assertEqual(
+            fingerprint(SID, record(lastActivityAt=1234)).last_activity_at, 1234
+        )
+        self.assertEqual(
+            fingerprint(SID, record(lastActivityAt=1234.9)).last_activity_at, 1234
+        )
 
     def test_missing_or_odd_activity_reads_as_zero(self):
         for value in (None, "soon", True, -3, -0.5):
             with self.subTest(value=value):
-                self.assertEqual(fingerprint(SID, record(lastActivityAt=value)).last_activity_at, 0)
+                self.assertEqual(
+                    fingerprint(SID, record(lastActivityAt=value)).last_activity_at, 0
+                )
 
     def test_what_claude_would_not_accept_is_unreadable(self):
         cases = {
             "torn write": b'{"sessionId": "local_',
             "empty file": b"",
             "not an object": b"[1, 2]",
-            "another session": record(sessionId="local_22222222-2222-4222-8222-222222222222"),
+            "another session": record(
+                sessionId="local_22222222-2222-4222-8222-222222222222"
+            ),
             "no session id": b'{"title": "t"}',
             "not utf-8": b"\xff\xfe{}",
-            "duplicate keys": b'{"sessionId": "local_%s", "a": 1, "a": 2}' % SID.encode(),
+            "duplicate keys": b'{"sessionId": "local_%s", "a": 1, "a": 2}'
+            % SID.encode(),
             "non-finite number": b'{"sessionId": "local_%s", "a": NaN}' % SID.encode(),
         }
         for name, data in cases.items():

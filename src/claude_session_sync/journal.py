@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from . import strict_json as json
 import os
 import re
 import shutil
 import stat
 import uuid
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
+from typing import Any, Union
 
+from . import strict_json as json
 from .filesystem import (
     _open_regular_read,
     atomic_copy,
@@ -22,7 +23,6 @@ from .filesystem import (
     ensure_private_file,
     fsync_directory,
 )
-
 
 PathLike = Union[str, os.PathLike]
 
@@ -48,7 +48,7 @@ class RunJournal:
         self,
         state_root: PathLike,
         run_id: str,
-        manifest: Dict[str, Any],
+        manifest: dict[str, Any],
         authentication_key: bytes,
     ):
         self._validate_run_id(run_id)
@@ -66,8 +66,8 @@ class RunJournal:
         plan_id: str,
         records: Iterable[Mapping[str, Any]],
         *,
-        run_id: Optional[str] = None,
-    ) -> "RunJournal":
+        run_id: str | None = None,
+    ) -> RunJournal:
         state = ensure_private_directory(state_root)
         authentication_key = cls._load_or_create_key(state)
         runs = ensure_private_directory(state / "runs")
@@ -78,13 +78,13 @@ class RunJournal:
         # A run becomes recoverable only after every backup and its signed
         # manifest are durable. Failed preparations never changed live data.
         if os.path.lexists(str(runs / identifier)):
-            raise JournalError("run already exists: {}".format(identifier))
+            raise JournalError(f"run already exists: {identifier}")
         run_root = preparations / identifier
         try:
             run_root.mkdir(mode=0o700)
         except FileExistsError as error:
-            raise JournalError("run already exists: {}".format(identifier)) from error
-        materialized = []  # type: List[Dict[str, Any]]
+            raise JournalError(f"run already exists: {identifier}") from error
+        materialized: list[dict[str, Any]] = []
         try:
             fsync_directory(preparations)
             ensure_private_directory(run_root / "preimages")
@@ -93,7 +93,7 @@ class RunJournal:
                 record["index"] = index
                 record["applied"] = False
                 if record["existed"]:
-                    preimage_relative = "preimages/{:06d}.bin".format(index)
+                    preimage_relative = f"preimages/{index:06d}.bin"
                     preimage = run_root / preimage_relative
                     atomic_copy(Path(record["destination"]), preimage)
                     if digest_file(preimage) != record["destination_digest_before"]:
@@ -118,7 +118,7 @@ class RunJournal:
             journal._persist(destination=run_root / "manifest.json")
             fsync_directory(run_root)
             if os.path.lexists(str(journal.run_root)):
-                raise JournalError("run already exists: {}".format(identifier))
+                raise JournalError(f"run already exists: {identifier}")
             os.rename(str(run_root), str(journal.run_root))
             fsync_directory(runs)
             fsync_directory(preparations)
@@ -131,7 +131,7 @@ class RunJournal:
                 fsync_directory(preparations)
 
     @classmethod
-    def load(cls, state_root: PathLike, run_id: str) -> "RunJournal":
+    def load(cls, state_root: PathLike, run_id: str) -> RunJournal:
         cls._validate_run_id(run_id)
         state = ensure_private_directory(state_root)
         authentication_key = cls._load_or_create_key(state)
@@ -140,16 +140,16 @@ class RunJournal:
             with _open_regular_read(manifest_path) as stream:
                 raw = stream.read()
         except FileNotFoundError as error:
-            raise JournalError("unknown run: {}".format(run_id)) from error
+            raise JournalError(f"unknown run: {run_id}") from error
         try:
             manifest = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise JournalError("corrupt manifest for run {}".format(run_id)) from error
+            raise JournalError(f"corrupt manifest for run {run_id}") from error
         cls._validate_manifest(manifest, run_id, authentication_key)
         return cls(state, run_id, manifest, authentication_key)
 
     @property
-    def records(self) -> List[Dict[str, Any]]:
+    def records(self) -> list[dict[str, Any]]:
         return self.manifest["records"]
 
     @property
@@ -195,12 +195,12 @@ class RunJournal:
 
     def finish(self, phase: str, receipt: Mapping[str, Any]) -> None:
         if phase not in ("COMMITTED", "ROLLED_BACK"):
-            raise JournalError("invalid terminal phase: {}".format(phase))
+            raise JournalError(f"invalid terminal phase: {phase}")
         self.manifest["phase"] = phase
         self.manifest["receipt"] = dict(receipt)
         self._persist()
 
-    def _persist(self, *, destination: Optional[Path] = None) -> None:
+    def _persist(self, *, destination: Path | None = None) -> None:
         self.manifest["generation"] = int(self.manifest.get("generation", 0)) + 1
         self.manifest["checksum"] = self._checksum(
             self.manifest, self.authentication_key
@@ -218,12 +218,12 @@ class RunJournal:
         cls, manifest: Any, run_id: str, authentication_key: bytes
     ) -> None:
         if not isinstance(manifest, dict):
-            raise JournalError("invalid manifest for run {}".format(run_id))
+            raise JournalError(f"invalid manifest for run {run_id}")
         checksum = manifest.get("checksum")
         if not isinstance(checksum, str) or not hmac.compare_digest(
             checksum, cls._checksum(manifest, authentication_key)
         ):
-            raise JournalError("manifest checksum mismatch for run {}".format(run_id))
+            raise JournalError(f"manifest checksum mismatch for run {run_id}")
         records = manifest.get("records")
         if (
             manifest.get("version") != cls.VERSION
@@ -234,17 +234,17 @@ class RunJournal:
             or not isinstance(manifest.get("generation"), int)
             or manifest["generation"] < 1
         ):
-            raise JournalError("invalid manifest for run {}".format(run_id))
+            raise JournalError(f"invalid manifest for run {run_id}")
         receipt = manifest.get("receipt")
         if receipt is not None and not isinstance(receipt, dict):
-            raise JournalError("invalid receipt for run {}".format(run_id))
+            raise JournalError(f"invalid receipt for run {run_id}")
         for index, record in enumerate(records):
             cls._validate_record(record, index, run_id)
 
     @classmethod
     def _validate_record(cls, record: Any, index: int, run_id: str) -> None:
         if not isinstance(record, dict):
-            raise JournalError("invalid record for run {}".format(run_id))
+            raise JournalError(f"invalid record for run {run_id}")
         existed = record.get("existed")
         before_digest = record.get("destination_digest_before")
         staged_device = record.get("staged_device")
@@ -265,10 +265,7 @@ class RunJournal:
             or not isinstance(record.get("destination_size_before"), int)
             or record["destination_size_before"] < 0
             or not isinstance(record.get("session_id"), str)
-            or (
-                existed
-                and record.get("preimage") != "preimages/{:06d}.bin".format(index)
-            )
+            or (existed and record.get("preimage") != f"preimages/{index:06d}.bin")
             or (not existed and record.get("preimage") is not None)
             or (staged_device is None) != (staged_inode is None)
             or (
@@ -281,7 +278,7 @@ class RunJournal:
                 )
             )
         ):
-            raise JournalError("invalid record for run {}".format(run_id))
+            raise JournalError(f"invalid record for run {run_id}")
 
     @staticmethod
     def _checksum(manifest: Mapping[str, Any], authentication_key: bytes) -> str:
@@ -334,10 +331,10 @@ def prune_terminal_runs(
     state_root: PathLike,
     retention: int,
     *,
-    now: Optional[float] = None,
+    now: float | None = None,
     max_age_seconds: int = KEPT_MAX_AGE_SECONDS,
     max_bytes: int = KEPT_MAX_BYTES,
-) -> List[str]:
+) -> list[str]:
     """Best-effort deletion of old terminal journals only.
 
     Each journal holds the files its run replaced or removed, so it doubles as
@@ -394,7 +391,7 @@ def _tree_size(root: Path) -> int:
     return size
 
 
-def abandoned_preparations(state_root: PathLike) -> List[str]:
+def abandoned_preparations(state_root: PathLike) -> list[str]:
     """Expose crash residue without mistaking it for a published transaction."""
 
     root = Path(state_root) / "preparations"
@@ -411,7 +408,7 @@ def abandoned_preparations(state_root: PathLike) -> List[str]:
     return sorted(identifiers)
 
 
-def pending_recovery_runs(state_root: PathLike) -> List[str]:
+def pending_recovery_runs(state_root: PathLike) -> list[str]:
     """Return nonterminal runs; malformed state raises instead of being skipped."""
 
     state = ensure_private_directory(state_root)

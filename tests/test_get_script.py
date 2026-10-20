@@ -1,4 +1,3 @@
-from pathlib import Path
 import os
 import re
 import shutil
@@ -6,7 +5,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "get.sh"
 
@@ -22,7 +21,7 @@ class GetScriptTests(unittest.TestCase):
         installer.write_text(
             "#!/bin/sh\n"
             "printf 'SETUP_ARG=%s\\n' \"$@\"\n"
-            "printf 'SETUP_DIR=%s\\n' \"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+            'printf \'SETUP_DIR=%s\\n\' "$(cd "$(dirname "$0")" && pwd)"\n'
         )
         installer.chmod(0o755)
         archive = root / "main.tar.gz"
@@ -32,15 +31,17 @@ class GetScriptTests(unittest.TestCase):
         if claude_app:
             app.mkdir()
         environment = dict(os.environ)
-        environment.update({
-            "CLAUDE_SESSION_SYNC_ARCHIVE": archive.as_uri(),
-            "CLAUDE_SESSION_SYNC_CLAUDE_APP": str(app),
-        })
+        environment.update(
+            {
+                "CLAUDE_SESSION_SYNC_ARCHIVE": archive.as_uri(),
+                "CLAUDE_SESSION_SYNC_CLAUDE_APP": str(app),
+            }
+        )
         if not tools:
             stubs = root / "bin"
             stubs.mkdir()
             stub = stubs / "xcode-select"
-            stub.write_text("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\nexit 2\n")
+            stub.write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/calls"\nexit 2\n')
             stub.chmod(0o755)
             environment["PATH"] = "{}:{}".format(stubs, environment["PATH"])
         return subprocess.run(

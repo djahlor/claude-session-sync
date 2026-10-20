@@ -27,18 +27,37 @@ def config(root):
 def sent(path, uuid=UUID, *, size=None, is_image=True, extra=None):
     """One transcript line as Claude writes it after SendUserFile."""
 
-    attachment = {"path": str(path), "size": size, "isImage": is_image, "media_type": "image/png",
-                  "pathValidated": True, "file_uuid": uuid}
+    attachment = {
+        "path": str(path),
+        "size": size,
+        "isImage": is_image,
+        "media_type": "image/png",
+        "pathValidated": True,
+        "file_uuid": uuid,
+    }
     if size is None:
         del attachment["size"]
     line = {
         "type": "user",
-        "message": {"role": "user", "content": [{"type": "tool_result", "content":
-                    "1 file delivered to user.\n  {} → file_uuid: {}".format(path, uuid)}]},
-        "toolUseResult": {"caption": "x", "attachments": [attachment], "rendered_locally": True},
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": f"1 file delivered to user.\n  {path} → file_uuid: {uuid}",
+                }
+            ],
+        },
+        "toolUseResult": {
+            "caption": "x",
+            "attachments": [attachment],
+            "rendered_locally": True,
+        },
     }
     line.update(extra or {})
-    return (json.dumps(line, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    return (json.dumps(line, separators=(",", ":"), ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
 
 
 class PictureFixerTests(unittest.TestCase):
@@ -55,7 +74,7 @@ class PictureFixerTests(unittest.TestCase):
     def record(self, session_id, account="acct/org"):
         folder = self.root / "Claude" / "claude-code-sessions" / account
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "local_{}.json".format(session_id[:8])).write_text(
+        (folder / f"local_{session_id[:8]}.json").write_text(
             json.dumps({"sessionId": "local_x", "cliSessionId": session_id})
         )
 
@@ -63,13 +82,15 @@ class PictureFixerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def transcript(self, *lines, session_id=None):
-        path = self.projects / "{}.jsonl".format(session_id or SESSION)
+        path = self.projects / f"{session_id or SESSION}.jsonl"
         path.write_bytes(b"".join(lines))
         return path
 
     def test_local_picture_drops_its_upload_id_in_place(self):
         before = sent(self.picture, size=100)
-        path = self.transcript(b'{"type":"summary"}\n', before, b'{"type":"assistant"}\n')
+        path = self.transcript(
+            b'{"type":"summary"}\n', before, b'{"type":"assistant"}\n'
+        )
         size = path.stat().st_size
 
         receipt = self.fixer.sync()
@@ -81,9 +102,13 @@ class PictureFixerTests(unittest.TestCase):
         self.assertNotIn("file_uuid", record)
         self.assertEqual(UUID, record["orig_uuid"])
         # The model's own text keeps the id it was given.
-        self.assertIn("file_uuid: " + UUID, json.loads(line)["message"]["content"][0]["content"])
+        self.assertIn(
+            "file_uuid: " + UUID, json.loads(line)["message"]["content"][0]["content"]
+        )
         self.assertEqual(before.replace(b'"file_uuid":"', b'"orig_uuid":"'), line)
-        self.assertEqual(("synced", 1, 1), (receipt.state, receipt.file_count, receipt.picture_count))
+        self.assertEqual(
+            ("synced", 1, 1), (receipt.state, receipt.file_count, receipt.picture_count)
+        )
 
     def test_pictures_that_would_not_show_are_left_alone(self):
         missing = self.root / "gone.png"
@@ -153,7 +178,9 @@ class PictureFixerTests(unittest.TestCase):
         self.assertEqual(1, self.fixer.sync().picture_count)
 
     def test_malformed_and_unrelated_lines_are_kept(self):
-        broken = b'{"toolUseResult":{"attachments":[{"file_uuid":"' + UUID.encode() + b'"\n'
+        broken = (
+            b'{"toolUseResult":{"attachments":[{"file_uuid":"' + UUID.encode() + b'"\n'
+        )
         path = self.transcript(broken, b"not json\n", sent(self.picture))
         self.fixer.sync()
         lines = path.read_bytes().splitlines(keepends=True)
@@ -181,8 +208,15 @@ class PictureFixerTests(unittest.TestCase):
     def test_config_turns_the_fix_on_by_default(self):
         document = {
             "version": 1,
-            "profiles": [{"name": "Work", "data_root": str(self.root / "Claude"),
-                          "launch_command": ["/usr/bin/true"], "enabled": True, "is_default": True}],
+            "profiles": [
+                {
+                    "name": "Work",
+                    "data_root": str(self.root / "Claude"),
+                    "launch_command": ["/usr/bin/true"],
+                    "enabled": True,
+                    "is_default": True,
+                }
+            ],
             "approved_targets": [],
             "state_dir": str(self.root / "state"),
             "retention": 5,
@@ -214,7 +248,9 @@ class SyncStepTests(unittest.TestCase):
             payload = {"state": "committed"}
             deps = SimpleNamespace(picture_factory=lambda _config: fixer)
             _fix_chat_pictures(config(Path(directory)), deps, payload)
-            status = json.loads((Path(directory) / "state" / "chat-pictures-status.json").read_text())
+            status = json.loads(
+                (Path(directory) / "state" / "chat-pictures-status.json").read_text()
+            )
             return payload, status
 
     def test_quiet_when_nothing_changed(self):
@@ -230,7 +266,9 @@ class SyncStepTests(unittest.TestCase):
 
         fixer = type("F", (), {"sync": lambda self: PictureReceipt("synced", 2, 5)})()
         payload, _status = self.run_step(fixer)
-        self.assertEqual({"state": "synced", "files": 2, "pictures": 5}, payload["pictures"])
+        self.assertEqual(
+            {"state": "synced", "files": 2, "pictures": 5}, payload["pictures"]
+        )
 
     def test_a_failure_is_reported_and_the_sync_goes_on(self):
         def boom(_self):

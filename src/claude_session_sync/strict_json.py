@@ -11,7 +11,7 @@ def _invalid(message):
 
 
 def _constant(value):
-    return _invalid("Non-finite JSON number: {}".format(value))
+    return _invalid(f"Non-finite JSON number: {value}")
 
 
 def _float(value):

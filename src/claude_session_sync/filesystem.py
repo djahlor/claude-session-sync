@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO, Union
 
-
 PathLike = Union[str, os.PathLike]
 
 
@@ -34,9 +33,7 @@ def ensure_private_directory(path: PathLike) -> Path:
         candidate = candidate.parent
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if directory.is_symlink() or not directory.is_dir():
-        raise UnsafePathError(
-            "state directory is not a real directory: {}".format(directory)
-        )
+        raise UnsafePathError(f"state directory is not a real directory: {directory}")
     os.chmod(str(directory), 0o700)
     for created in reversed(missing):
         os.chmod(str(created), 0o700)
@@ -59,7 +56,7 @@ def _open_regular_read(path: PathLike) -> BinaryIO:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise UnsafePathError("not a regular file: {}".format(file_path))
+            raise UnsafePathError(f"not a regular file: {file_path}")
         return os.fdopen(descriptor, "rb")
     except BaseException:
         os.close(descriptor)
@@ -71,7 +68,7 @@ def read_bounded(path: PathLike, limit: int) -> bytes:
     with _open_regular_read(path) as source:
         content = source.read(limit + 1)
     if len(content) > limit:
-        raise UnsafePathError("file is larger than {} bytes: {}".format(limit, path))
+        raise UnsafePathError(f"file is larger than {limit} bytes: {path}")
     return content
 
 
@@ -103,9 +100,7 @@ def fsync_directory(path: PathLike) -> None:
 
 
 def _temporary_path(destination: Path, suffix: str) -> Path:
-    return destination.parent / ".{}.{}.{}".format(
-        destination.name, uuid.uuid4().hex, suffix
-    )
+    return destination.parent / f".{destination.name}.{uuid.uuid4().hex}.{suffix}"
 
 
 def stage_copy(source: PathLike, destination: PathLike) -> Path:
@@ -114,9 +109,7 @@ def stage_copy(source: PathLike, destination: PathLike) -> Path:
     destination_path = Path(destination)
     if destination_path.parent.is_symlink() or not destination_path.parent.is_dir():
         raise UnsafePathError(
-            "destination parent is not a real directory: {}".format(
-                destination_path.parent
-            )
+            f"destination parent is not a real directory: {destination_path.parent}"
         )
     temporary = _temporary_path(destination_path, "stage")
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -178,9 +171,7 @@ def atomic_write_bytes(destination: PathLike, content: bytes) -> None:
     destination_path = Path(destination)
     if destination_path.parent.is_symlink() or not destination_path.parent.is_dir():
         raise UnsafePathError(
-            "destination parent is not a real directory: {}".format(
-                destination_path.parent
-            )
+            f"destination parent is not a real directory: {destination_path.parent}"
         )
     temporary = _temporary_path(destination_path, "write")
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -220,7 +211,10 @@ def sweep_stale_stages(folders, now: float, max_age_seconds: int = 600) -> int:
                 continue
             try:
                 metadata = entry.stat(follow_symlinks=False)
-                if not stat.S_ISREG(metadata.st_mode) or now - metadata.st_mtime <= max_age_seconds:
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or now - metadata.st_mtime <= max_age_seconds
+                ):
                     continue
                 os.unlink(entry.path)
                 removed += 1

@@ -19,11 +19,11 @@ def main() -> None:
         destinations.mkdir()
         operations = []
         for index in range(700):
-            session_id = "benchmark-{:04d}".format(index)
+            session_id = f"benchmark-{index:04d}"
             content = json.dumps(
                 {"sessionId": session_id, "payload": "x" * 6_000}
             ).encode()
-            source = sources / "local_{}.json".format(session_id)
+            source = sources / f"local_{session_id}.json"
             source.write_bytes(content)
             operations.append(
                 Operation(

@@ -7,12 +7,12 @@ Claude's config.json, and only login lines from its main.log.
 import os
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Optional
 
 from . import strict_json as json
 from .filesystem import normalized_path
-
 
 APP_LOG_TAIL = 16 * 1024 * 1024  # Claude rotates main.log at about 10 MB
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
@@ -23,7 +23,7 @@ LOGIN_LINE = re.compile(
 )
 
 # data root -> account -> its first login this Mac recorded, in epoch ms
-Logins = Dict[str, Dict[str, int]]
+Logins = dict[str, dict[str, int]]
 
 
 def default_app_log() -> Path:
@@ -44,7 +44,7 @@ def last_known_account(data_root: Path) -> Optional[str]:
     return value.lower() if isinstance(value, str) and value else None
 
 
-def logins_in_app_log(app_log: Path, now_ms: int) -> List[Tuple[str, int]]:
+def logins_in_app_log(app_log: Path, now_ms: int) -> list[tuple[str, int]]:
     """Every login the end of Claude's log records, as (account, epoch ms), oldest first."""
 
     try:
@@ -59,7 +59,10 @@ def logins_in_app_log(app_log: Path, now_ms: int) -> List[Tuple[str, int]]:
         if match is None:
             continue
         try:
-            stamped = int(time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))) * 1000
+            stamped = (
+                int(time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")))
+                * 1000
+            )
         except (ValueError, OverflowError):
             continue
         found.append((match.group(2).lower(), min(stamped, now_ms)))

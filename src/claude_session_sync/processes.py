@@ -6,12 +6,12 @@ import os
 import shlex
 import subprocess
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence, Tuple
+from typing import Callable
 
 from .filesystem import normalized_path
-
 
 Runner = Callable[..., subprocess.CompletedProcess]
 DEFAULT_CLAUDE_EXECUTABLE = Path("/Applications/Claude.app/Contents/MacOS/Claude")
@@ -22,11 +22,11 @@ class ManagedProcess:
     """A running Claude process using one of the configured profile roots."""
 
     pid: int
-    argv: Tuple[str, ...]
+    argv: tuple[str, ...]
     user_data_dir: Path
 
 
-def _user_data_dir(argv: Sequence[str]) -> Tuple[bool, Optional[Path]]:
+def _user_data_dir(argv: Sequence[str]) -> tuple[bool, Path | None]:
     for index, argument in enumerate(argv[1:], start=1):
         if argument.startswith("--user-data-dir="):
             value = argument.partition("=")[2]
@@ -40,7 +40,7 @@ def _user_data_dir(argv: Sequence[str]) -> Tuple[bool, Optional[Path]]:
 
 def _raw_managed_user_data_dir(
     command: str, managed_roots: Iterable[Path]
-) -> Optional[Path]:
+) -> Path | None:
     """Match configured roots in macOS ``ps`` output, which drops quoting.
 
     A live argument containing ``Application Support`` is emitted as raw text,
@@ -68,8 +68,8 @@ def parse_process_table(
     *,
     executable: Path,
     managed_profile_roots: Iterable[Path],
-    default_profile_root: Optional[Path] = None,
-) -> Tuple[ManagedProcess, ...]:
+    default_profile_root: Path | None = None,
+) -> tuple[ManagedProcess, ...]:
     """Parse ``ps -axo pid=,command=`` without substring process matching."""
 
     expected_executable = os.fspath(normalized_path(executable))
@@ -129,9 +129,9 @@ class ProcessProbe:
         *,
         executable: Path,
         managed_profile_roots: Iterable[Path],
-        default_profile_root: Optional[Path] = None,
-        timeout: Optional[float] = None,
-    ) -> Tuple[ManagedProcess, ...]:
+        default_profile_root: Path | None = None,
+        timeout: float | None = None,
+    ) -> tuple[ManagedProcess, ...]:
         options = {
             "check": True,
             "text": True,
@@ -184,10 +184,10 @@ class ProcessProbe:
 def managed_processes(
     profiles: Iterable[object],
     *,
-    probe: Optional[ProcessProbe] = None,
+    probe: ProcessProbe | None = None,
     executable: Path = DEFAULT_CLAUDE_EXECUTABLE,
-    timeout: Optional[float] = None,
-) -> Tuple[ManagedProcess, ...]:
+    timeout: float | None = None,
+) -> tuple[ManagedProcess, ...]:
     """Probe profile-like objects without conflating launch and process commands."""
 
     roots = []

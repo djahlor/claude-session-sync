@@ -8,10 +8,9 @@ import os
 import stat
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 from .filesystem import ensure_private_directory
-
 
 PathLike = Union[str, os.PathLike]
 
@@ -37,9 +36,9 @@ class ExclusiveFileLock:
         self.mode = mode
         self.timeout = timeout
         self.poll_interval = poll_interval
-        self._descriptor: Optional[int] = None
+        self._descriptor: int | None = None
 
-    def acquire(self) -> "ExclusiveFileLock":
+    def acquire(self) -> ExclusiveFileLock:
         ensure_private_directory(self.path.parent)
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
@@ -62,7 +61,7 @@ class ExclusiveFileLock:
                 if self.mode == "auto" or time.monotonic() >= deadline:
                     os.close(descriptor)
                     raise LockUnavailableError(
-                        "another synchronization transaction holds {}".format(self.path)
+                        f"another synchronization transaction holds {self.path}"
                     )
                 time.sleep(
                     min(self.poll_interval, max(0.0, deadline - time.monotonic()))
@@ -78,7 +77,7 @@ class ExclusiveFileLock:
         finally:
             os.close(descriptor)
 
-    def __enter__(self) -> "ExclusiveFileLock":
+    def __enter__(self) -> ExclusiveFileLock:
         return self.acquire()
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
