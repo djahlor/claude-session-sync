@@ -1427,7 +1427,7 @@ def run(
         with contextlib.redirect_stderr(errors):
             arguments = _parser().parse_args(argv)
     except SystemExit as error:
-        return int(error.code)
+        return error.code if isinstance(error.code, int) else 2
 
     try:
         setup_command = _SETUP_COMMANDS.get(arguments.command)

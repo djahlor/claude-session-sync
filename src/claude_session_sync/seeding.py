@@ -10,6 +10,7 @@ starting point. Nothing outside the private state file is written.
 import hashlib
 import os
 from pathlib import Path
+from typing import cast
 
 from .chat_state import load_state, save_state, state_path
 from .enrollment import select_targets, target_key
@@ -59,7 +60,7 @@ def _seed(config, *, apply: bool) -> dict:
                 if not copy.readable:
                     unreadable.add(session_id)
                     continue
-                state_hash = copy.state_hash
+                state_hash = cast(str, copy.state_hash)  # readable copies have one
                 cache[digest] = state_hash
             versions.setdefault(session_id, set()).add(state_hash)
 
@@ -76,10 +77,10 @@ def _seed(config, *, apply: bool) -> dict:
         # version in step with the others is the old copy.
         for key, ids in present.items():
             state.sync.seen.setdefault(key, set()).update(ids)
-            folder = state.sync.synced.setdefault(key, {})
+            synced = state.sync.synced.setdefault(key, {})
             for session_id, state_hash in seeded.items():
                 if session_id in ids:
-                    folder[session_id] = state_hash
+                    synced[session_id] = state_hash
         save_state(state_path(config.state_dir), state)
     return {
         "state": "seeded" if apply else "planned",
@@ -94,7 +95,7 @@ def _seed(config, *, apply: bool) -> dict:
 
 
 def _record_ids(folder: Path) -> set[str]:
-    ids = set()
+    ids: set[str] = set()
     try:
         entries = list(os.scandir(str(folder)))
     except OSError:

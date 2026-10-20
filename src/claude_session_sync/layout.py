@@ -20,7 +20,14 @@ from typing import (
 
 from . import strict_json as json
 from .config import Config
-from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_directory
+from .filesystem import (
+    FileChangedError,
+    UnsafePathError,
+    atomic_write_bytes,
+    durable_unlink,
+    ensure_private_directory,
+    read_bounded,
+)
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .processes import managed_processes
 from .record_journal import (
@@ -598,24 +605,11 @@ def _snapshot_bytes(path: Path) -> bytes | None:
     if not os.path.lexists(str(path)):
         return None
     try:
-        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(str(path), flags)
-        with os.fdopen(descriptor, "rb") as stream:
-            metadata = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > MAX_RECORD_BYTES
-            ):
-                raise LayoutError("sidebar snapshot is not a regular bounded file")
-            content = stream.read(MAX_RECORD_BYTES + 1)
-            after = os.fstat(stream.fileno())
-        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) or len(content) > MAX_RECORD_BYTES:
-            raise LayoutError("sidebar snapshot changed while being read")
-        return content
+        return read_bounded(path, MAX_RECORD_BYTES, stable=True)
+    except FileChangedError as error:
+        raise LayoutError("sidebar snapshot changed while being read") from error
+    except UnsafePathError as error:
+        raise LayoutError("sidebar snapshot is not a regular bounded file") from error
     except OSError as error:
         raise LayoutError("sidebar snapshot is not a readable regular file") from error
 

@@ -4,6 +4,7 @@ import fcntl
 import os
 import stat
 from datetime import datetime, timezone
+from typing import cast
 
 from .adapters import desktop_build, read_status, save_status
 
@@ -87,7 +88,7 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
             "checking": "checking-account",
             "quitting": "quitting-Claude",
             "syncing": "syncing",
-        }[restart_phase]
+        }[cast(str, restart_phase)]  # restart_active implies one of these
     elif saved_state == "syncing":
         try:
             state = "syncing" if _writer_active(config) else "needs-attention"

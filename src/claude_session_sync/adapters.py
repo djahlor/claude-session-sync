@@ -1,12 +1,13 @@
 """One execution and reporting boundary for optional storage adapters."""
 
 import os
-import stat
 import subprocess
 from pathlib import Path
 
 from . import strict_json as json
-from .filesystem import atomic_write_bytes, ensure_private_directory
+from .filesystem import atomic_write_bytes, ensure_private_directory, read_bounded
+
+MAX_STATUS_BYTES = 256 * 1024 * 1024
 
 ADAPTERS = (
     (
@@ -72,18 +73,10 @@ def read_status(state_dir: Path, filename: str) -> dict:
     if not os.path.lexists(path):
         return {"state": "unknown"}
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, "rb") as stream:
-            metadata = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > 256 * 1024 * 1024
-            ):
-                return {"state": "unreadable"}
-            document = json.loads(stream.read(256 * 1024 * 1024 + 1))
-        return document if isinstance(document, dict) else {"state": "unreadable"}
+        document = json.loads(read_bounded(path, MAX_STATUS_BYTES))
     except (OSError, ValueError):
         return {"state": "unreadable"}
+    return document if isinstance(document, dict) else {"state": "unreadable"}
 
 
 def _failure(name, error) -> dict:

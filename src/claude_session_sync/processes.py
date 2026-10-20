@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .filesystem import normalized_path
 
@@ -200,7 +200,7 @@ def managed_processes(
             default_profile_root = roots[-1]
     if not roots:
         return ()
-    options = {
+    options: dict[str, Any] = {
         "executable": executable,
         "managed_profile_roots": roots,
         "default_profile_root": default_profile_root,

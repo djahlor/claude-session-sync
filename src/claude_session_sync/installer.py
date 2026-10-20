@@ -209,7 +209,7 @@ class Installer:
             template = json.loads(self._config_template().decode("utf-8"))
             claude_executable = Path(template["claude_executable"])
             watcher_status = Path(template["state_dir"]) / "watcher-status.json"
-        account_arguments = ()
+        account_arguments: tuple[str, ...] = ()
         if configured is not None and configured.target_policy in (
             "all-configured-profiles",
             "logins",

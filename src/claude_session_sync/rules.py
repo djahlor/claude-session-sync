@@ -9,7 +9,7 @@ Actions for one session are emitted in the order they must happen.
 """
 
 from collections.abc import Mapping
-from typing import Optional
+from typing import Optional, cast
 
 from .chat_model import (
     CreateRecord,
@@ -39,7 +39,7 @@ def plan(
     """
 
     result = RulePlan()
-    session_ids = set()
+    session_ids: set[str] = set()
     for snapshot in snapshots:
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
@@ -223,7 +223,7 @@ def settle(state: SyncState, snapshots: list[Snapshot]) -> SyncState:
     for snapshot in snapshots:
         seen.setdefault(snapshot.key, set()).update(snapshot.records)
 
-    known_ids = set()
+    known_ids: set[str] = set()
     for snapshot in snapshots:
         known_ids.update(
             snapshot.records, seen[snapshot.key], synced.get(snapshot.key, {})
@@ -240,7 +240,7 @@ def settle(state: SyncState, snapshots: list[Snapshot]) -> SyncState:
             # Agreement is about content alone, so a copy with an untrustworthy time still counts.
             hashes = {s.records[session_id].state_hash for s in holders}
             if len(hashes) == 1 and None not in hashes:
-                agreed = hashes.pop()
+                agreed = cast(str, hashes.pop())  # None was ruled out above
                 for key in keys:
                     synced.setdefault(key, {})[session_id] = agreed
 

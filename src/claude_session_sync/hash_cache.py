@@ -5,15 +5,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from .filesystem import ensure_private_directory
+from .filesystem import FileChangedError, ensure_private_directory
 
 # Bump when the table changes. A cache with another version is dropped and
 # rebuilt: it only saves rereading files.
 SCHEMA_VERSION = 2
-
-
-class FileChangedError(OSError):
-    """Raised when a file changes while it is being inspected."""
 
 
 def _signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:

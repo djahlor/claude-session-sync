@@ -16,6 +16,14 @@ class UnsafePathError(OSError):
     """Raised when transaction data is not a regular, non-symlink file."""
 
 
+class FileTooLargeError(UnsafePathError):
+    """The file is bigger than the caller allows."""
+
+
+class FileChangedError(OSError):
+    """The file changed while it was read or hashed."""
+
+
 def normalized_path(path: PathLike) -> Path:
     """The absolute path with ~ expanded. Symlinks are not resolved."""
 
@@ -63,13 +71,32 @@ def open_regular_read(path: PathLike) -> BinaryIO:
         raise
 
 
-def read_bounded(path: PathLike, limit: int) -> bytes:
-    """Read a regular file that is not a symlink, refusing anything over limit bytes."""
+def read_bounded_with_stat(
+    path: PathLike, limit: int, *, stable: bool = False
+) -> tuple[bytes, os.stat_result]:
+    """Read a regular, non-symlinked file of at most limit bytes.
+
+    With stable, the file must not change while it is read.
+    """
     with open_regular_read(path) as source:
+        before = os.fstat(source.fileno())
+        if before.st_size > limit:
+            raise FileTooLargeError(f"file is larger than {limit} bytes: {path}")
         content = source.read(limit + 1)
+        after = os.fstat(source.fileno())
     if len(content) > limit:
-        raise UnsafePathError(f"file is larger than {limit} bytes: {path}")
-    return content
+        raise FileTooLargeError(f"file is larger than {limit} bytes: {path}")
+    if stable and (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise FileChangedError(f"file changed while being read: {path}")
+    return content, before
+
+
+def read_bounded(path: PathLike, limit: int, *, stable: bool = False) -> bytes:
+    return read_bounded_with_stat(path, limit, stable=stable)[0]
 
 
 def digest_file(path: PathLike) -> str:

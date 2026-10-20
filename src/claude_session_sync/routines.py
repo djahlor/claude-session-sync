@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import os
 import re
-import stat
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -16,9 +15,13 @@ from typing import Any, Callable
 from . import strict_json as json
 from .config import Config
 from .filesystem import (
+    FileChangedError,
+    FileTooLargeError,
+    UnsafePathError,
     atomic_write_bytes,
     durable_unlink,
     ensure_private_directory,
+    read_bounded_with_stat,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .processes import managed_processes
@@ -432,35 +435,19 @@ def transform_routine_manifests(
 
 
 def _read_regular(path: Path) -> tuple[bytes, int]:
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(str(path), flags)
+        content, metadata = read_bounded_with_stat(
+            path, MAX_MANIFEST_BYTES, stable=True
+        )
+    except FileTooLargeError as error:
+        raise RoutineError("routine manifest is too large") from error
+    except FileChangedError as error:
+        raise RoutineError("routine manifest changed while being read") from error
+    except UnsafePathError as error:
+        raise RoutineError("routine manifest is not a regular file") from error
     except OSError as error:
         raise RoutineError("routine manifest is not a readable regular file") from error
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RoutineError("routine manifest is not a regular file")
-        if metadata.st_size > MAX_MANIFEST_BYTES:
-            raise RoutineError("routine manifest is too large")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            content = stream.read(MAX_MANIFEST_BYTES + 1)
-            after = os.fstat(stream.fileno())
-        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise RoutineError("routine manifest changed while being read")
-        if len(content) > MAX_MANIFEST_BYTES:
-            raise RoutineError("routine manifest is too large")
-        return content, metadata.st_mtime_ns
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    return content, metadata.st_mtime_ns
 
 
 def _read_optional(path: Path) -> bytes | None:

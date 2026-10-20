@@ -9,7 +9,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-import stat
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -17,7 +16,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import strict_json as json
-from .filesystem import atomic_write_bytes, durable_unlink, ensure_private_directory
+from .filesystem import (
+    UnsafePathError,
+    atomic_write_bytes,
+    durable_unlink,
+    ensure_private_directory,
+    read_bounded,
+)
 
 VERSION = 2
 TERMINAL = {"COMMITTED", "ROLLED_BACK"}
@@ -71,19 +76,9 @@ class RecordJournal:
 
     def _load(self, path: Path) -> dict[str, Any]:
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
-            descriptor = os.open(str(path), flags)
-            with os.fdopen(descriptor, "rb") as stream:
-                metadata = os.fstat(stream.fileno())
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_size > MAX_JOURNAL_BYTES
-                ):
-                    raise RecordRecoveryError("recovery record is unsafe")
-                content = stream.read(MAX_JOURNAL_BYTES + 1)
-            if len(content) > MAX_JOURNAL_BYTES:
-                raise RecordRecoveryError("recovery record exceeds size limit")
-            document = json.loads(content.decode("utf-8"))
+            document = json.loads(read_bounded(path, MAX_JOURNAL_BYTES).decode("utf-8"))
+        except UnsafePathError as error:
+            raise RecordRecoveryError("recovery record is unsafe") from error
         except (OSError, ValueError, UnicodeError) as error:
             raise RecordRecoveryError(
                 "recovery state is malformed or unsafe"

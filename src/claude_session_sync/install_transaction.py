@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import stat
+import subprocess
 import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -28,7 +29,7 @@ class InstallTransaction:
         state_roots: Iterable[Path],
         launch_agent: Path,
         recovery_root: Path,
-        runner: Callable[..., object],
+        runner: Callable[..., subprocess.CompletedProcess],
     ):
         self.targets = tuple(
             self._normalize_system_temp(Path(path)) for path in targets
@@ -45,7 +46,7 @@ class InstallTransaction:
         self.label = "com.claude-session-sync.watcher"
         self.root = self._normalize_system_temp(Path(recovery_root))
         self.snapshot = self.root / "snapshot"
-        self.locks = []
+        self.locks: list[ExclusiveFileLock] = []
         self.was_loaded = False
         self.preparation = None
 

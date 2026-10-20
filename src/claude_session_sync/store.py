@@ -1,5 +1,7 @@
 """Discovery and validation of Claude Code session replicas."""
 
+from __future__ import annotations
+
 import hashlib
 import os
 import re
@@ -8,7 +10,7 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, cast
 
 from .config import Config
 from .fingerprint import fingerprint, normalisation
@@ -29,10 +31,10 @@ MAX_MARKER_BYTES = 64
 STAT_WORKERS = 16
 
 
-def _lstat_all(paths: Sequence[Path]) -> list[Union[os.stat_result, OSError]]:
+def _lstat_all(paths: Sequence[Path]) -> list[os.stat_result | OSError]:
     """Each path's lstat, or the error it raised, in order."""
 
-    def one(path: Path) -> Union[os.stat_result, OSError]:
+    def one(path: Path) -> os.stat_result | OSError:
         try:
             return path.lstat()
         except OSError as error:
@@ -56,7 +58,7 @@ def _stat_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
 class SessionStore:
     def __init__(
         self,
-        hash_cache: Optional[HashCache] = None,
+        hash_cache: HashCache | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         self._hash_cache = hash_cache
@@ -232,7 +234,7 @@ class SessionStore:
                             hashlib.sha256(raw).hexdigest(),
                         )
                     )
-            else:
+            elif marker:
                 read = _read_small(path, before, limit=MAX_MARKER_BYTES)
                 if read is None:
                     continue
@@ -269,7 +271,7 @@ class SessionStore:
         session_id: str,
         before: os.stat_result,
         started_ns: int,
-    ) -> Optional[Replica]:
+    ) -> Replica | None:
         """None means the file is gone. A file that cannot be read is unreadable, never absent."""
 
         name = normalisation()
@@ -307,7 +309,7 @@ class SessionStore:
                     after,
                     session_id,
                     digest,
-                    copy.state_hash,
+                    cast(str, copy.state_hash),  # readable copies have one
                     copy.last_activity_at,
                     name,
                 )
@@ -342,7 +344,7 @@ class SessionStore:
         )
 
 
-def _read_small(path: Path, before: os.stat_result, limit: Optional[int]):
+def _read_small(path: Path, before: os.stat_result, limit: int | None):
     if limit is not None and before.st_size > limit:
         return None
     try:
@@ -359,7 +361,7 @@ def _target_key(target: Target) -> tuple[str, str, str]:
     return target.profile_name, target.account_id, target.workspace_id
 
 
-def _replica_key(replica: Replica) -> tuple[str, str, str, str]:
+def _replica_key(replica: Replica | Marker | TmpFile) -> tuple[str, str, str, str]:
     return (
         replica.target.profile_name,
         replica.target.account_id,
