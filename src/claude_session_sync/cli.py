@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -636,10 +637,11 @@ def _find_profile(config: Config, requested_name: str) -> Any:
 
 
 def _busy_reason(error: Exception) -> str | None:
-    name = type(error).__name__
-    if name in ("TransactionBusyError", "BlockingIOError", "TimeoutError"):
+    from .transaction import AppRunningError, TransactionBusyError
+
+    if isinstance(error, (TransactionBusyError, BlockingIOError, TimeoutError)):
         return "busy"
-    if name == "AppRunningError":
+    if isinstance(error, AppRunningError):
         return "claude-open"
     return None
 
@@ -1100,6 +1102,306 @@ def _exit_code(arguments, progress: str) -> int:
     return 0 if waiting and arguments.command == "auto" else 1
 
 
+def _install_report(report: Any, **counts: int) -> dict:
+    return {
+        "state": report.state,
+        "counts": {
+            "actions": report.change_count,
+            "backups": len(report.backups),
+            **counts,
+        },
+        "bytes": 0,
+        "duration_ms": 0,
+    }
+
+
+def _cmd_install(
+    arguments, deps: CliDependencies, output: TextIO, answers: TextIO
+) -> int:
+    installer = deps.installer_factory(arguments.config)
+    if arguments.command == "install":
+        report = installer.install(dry_run=arguments.dry_run)
+    else:
+        report = installer.uninstall(dry_run=arguments.dry_run)
+    _write(_install_report(report), as_json=False, stream=output)
+    return 0
+
+
+def _cmd_setup(
+    arguments, deps: CliDependencies, output: TextIO, answers: TextIO
+) -> int:
+    installer = deps.installer_factory(arguments.config)
+    if arguments.config.exists():
+        source = arguments.config.read_bytes()
+    else:
+        source = installer.default_config_data()
+    desired, config_payload = prepare_config_data(
+        source,
+        automatic_targets=arguments.automatic_targets,
+        sync_layout=arguments.sync_layout,
+        sync_routines=arguments.sync_routines,
+        sync_browser_logins=arguments.sync_browser_logins,
+    )
+    ask = None
+    if arguments.ask_main_account and arguments.apply:
+        desired_config = validate_config_data(desired)
+
+        def ask(helper: Path) -> None:
+            _ask_main_account(desired_config, deps, helper, answers, output)
+
+    report = installer.setup(
+        dry_run=arguments.dry_run,
+        config_data=desired,
+        before_activation=ask,
+    )
+    _write(
+        _install_report(report, **config_payload["counts"]),
+        as_json=False,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_configure(
+    arguments, deps: CliDependencies, output: TextIO, answers: TextIO
+) -> int:
+    payload = configure_file(
+        arguments.config,
+        automatic_targets=arguments.automatic_targets,
+        sync_layout=arguments.sync_layout,
+        sync_routines=arguments.sync_routines,
+        sync_browser_logins=arguments.sync_browser_logins,
+        apply=arguments.apply,
+    )
+    _write(payload, as_json=False, stream=output)
+    return 0
+
+
+def _cmd_restart_check(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    profile = _find_profile(config, arguments.profile)
+    if not profile.is_default or config.target_policy not in (
+        "all-configured-profiles",
+        "logins",
+    ):
+        raise ValueError(
+            "automatic restart is enabled only for the default profile in automatic mode"
+        )
+    try:
+        processes = _running_processes(config, deps)
+    except subprocess.TimeoutExpired as error:
+        _write(_chat_failure(error), as_json=True, stream=output)
+        return 1
+    selected_root = normalized_path(profile.data_root)
+    if any(
+        normalized_path(process.user_data_dir) != selected_root for process in processes
+    ):
+        raise ValueError(
+            "another managed profile is open; leave Claude open until it is closed"
+        )
+    _write(
+        {"state": "ready", "pids": [process.pid for process in processes]},
+        as_json=True,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_plan(arguments, config: Config, deps: CliDependencies, output: TextIO) -> int:
+    from .chat_sync import plan_chat_sync
+
+    started = deps.clock()
+    chat_run = plan_chat_sync(config, deps.planner_factory(config))
+    if arguments.report:
+        _write_plan_report(config, chat_run)
+    payload = _chat_plan_summary(chat_run, round((deps.clock() - started) * 1000))
+    _write(payload, as_json=arguments.as_json, stream=output)
+    return 0 if _plan_state(chat_run.plan) in ("planned", "noop") else 1
+
+
+def _cmd_seed_state(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    from .seeding import seed_from_unenrolled
+
+    _write(
+        seed_from_unenrolled(config, apply=arguments.apply),
+        as_json=False,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_restart_claude(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    from .filesystem import atomic_write_bytes, ensure_private_directory
+
+    ensure_private_directory(config.state_dir)
+    request = config.state_dir / "restart-request"
+    atomic_write_bytes(
+        request,
+        b"adopt-current-sidebar\n" if arguments.adopt_current_sidebar else b"restart\n",
+    )
+    os.chmod(str(request), 0o600)
+    _write({"state": "requested"}, as_json=False, stream=output)
+    return 0
+
+
+def _cmd_keep_sidebar(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    payload, exit_code, lines = _keep_sidebar(
+        config, deps, number=arguments.account, apply=arguments.apply
+    )
+    output.write("".join(line + "\n" for line in lines))
+    _write(payload, as_json=False, stream=output)
+    return exit_code
+
+
+def _cmd_forget_lost(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    from .chat_sync import forget_seen
+
+    folders = forget_seen(config, arguments.session_id)
+    _write(
+        {"state": "forgotten" if folders else "noop", "counts": {"folders": folders}},
+        as_json=False,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_rollback(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    started = deps.clock()
+    receipt = deps.engine_factory(config).rollback(arguments.run_id)
+    duration_ms = round((deps.clock() - started) * 1000)
+    _write(
+        _recovery_summary(receipt, duration_ms),
+        as_json=arguments.as_json,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_browser_logins(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    from .browser_logins import run_browser_logins
+
+    payload = run_browser_logins(
+        config,
+        lambda: bool(_running_processes(config, deps)),
+        arguments.action,
+    )
+    _write(payload, as_json=arguments.as_json, stream=output)
+    return 0 if payload["state"] in ("done", "disabled") else 1
+
+
+def _status_state(
+    running, layout_failure: int, routine_failure: int, watcher_error: int
+) -> str:
+    if running:
+        return "app-running"
+    if layout_failure:
+        return "layout-failed"
+    if routine_failure:
+        return "routines-failed"
+    if watcher_error:
+        return "watcher-failed"
+    return "idle"
+
+
+def _cmd_status(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    running = _running_processes(config, deps)
+    watcher_error = watcher_failure(config.state_dir)
+    layout_failure = adapter_failure(config, "layout")
+    routine_failure = adapter_failure(config, "routines")
+    abandoned = abandoned_preparation_count(config.state_dir)
+    progress = current_progress(
+        config,
+        app_running=bool(running),
+        failures=watcher_error + layout_failure + routine_failure + abandoned,
+    )
+    if abandoned:
+        progress["next_action"] = "inspect-preparations"
+    _write(
+        {
+            "bytes": 0,
+            "counts": {
+                "abandoned_preparations": abandoned,
+                "layout_failures": layout_failure,
+                "profiles": len(config.profiles),
+                "routine_failures": routine_failure,
+                "running_processes": len(running),
+                "watcher_failures": watcher_error,
+            },
+            "duration_ms": 0,
+            **progress,
+            "state": _status_state(
+                running, layout_failure, routine_failure, watcher_error
+            ),
+        },
+        as_json=arguments.as_json,
+        stream=output,
+    )
+    return 0
+
+
+def _cmd_doctor(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    payload = doctor_summary(
+        config, deps, lambda: bool(_running_processes(config, deps))
+    )
+    _write(payload, as_json=arguments.as_json, stream=output)
+    return 0 if payload["state"] == "healthy" else 1
+
+
+def _cmd_approve_current_targets(
+    arguments, config: Config, deps: CliDependencies, output: TextIO
+) -> int:
+    payload = approve_current_targets(arguments.config, config, apply=arguments.apply)
+    _write(payload, as_json=False, stream=output)
+    return 0 if payload["state"] != "blocked" else 1
+
+
+# Commands that work on the config file itself, before it can be loaded.
+_SETUP_COMMANDS: dict[str, Callable[..., int]] = {
+    "install": _cmd_install,
+    "uninstall": _cmd_install,
+    "setup": _cmd_setup,
+    "configure": _cmd_configure,
+}
+
+_COMMANDS: dict[str, Callable[..., int]] = {
+    "restart-check": _cmd_restart_check,
+    "plan": _cmd_plan,
+    "seed-state": _cmd_seed_state,
+    "restart-claude": _cmd_restart_claude,
+    "keep-sidebar": _cmd_keep_sidebar,
+    "forget-lost": _cmd_forget_lost,
+    "sync": _run_sync,
+    "auto": _run_sync,
+    "switch": _run_switch,
+    "rollback": _cmd_rollback,
+    "browser-logins": _cmd_browser_logins,
+    "status": _cmd_status,
+    "doctor": _cmd_doctor,
+    "approve-current-targets": _cmd_approve_current_targets,
+}
+
+# Errors the tool raises on purpose carry a message written for the person.
+# Anything else is a bug, so its traceback is shown.
+_EXPECTED_ERRORS = (ValueError, OSError, RuntimeError, subprocess.SubprocessError)
+
+
 def run(
     argv: Sequence[str] | None = None,
     *,
@@ -1121,77 +1423,13 @@ def run(
         return int(error.code)
 
     try:
-        if arguments.command in ("install", "uninstall"):
-            installer = deps.installer_factory(arguments.config)
-            if arguments.command == "install":
-                report = installer.install(dry_run=arguments.dry_run)
-            else:
-                report = installer.uninstall(dry_run=arguments.dry_run)
-            _write(
-                {
-                    "state": report.state,
-                    "counts": {
-                        "actions": report.change_count,
-                        "backups": len(report.backups),
-                    },
-                    "bytes": 0,
-                    "duration_ms": 0,
-                },
-                as_json=False,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "setup":
-            installer = deps.installer_factory(arguments.config)
-            if arguments.config.exists():
-                source = arguments.config.read_bytes()
-            else:
-                source = installer.default_config_data()
-            desired, config_payload = prepare_config_data(
-                source,
-                automatic_targets=arguments.automatic_targets,
-                sync_layout=arguments.sync_layout,
-                sync_routines=arguments.sync_routines,
-                sync_browser_logins=arguments.sync_browser_logins,
-            )
-            ask = None
-            if arguments.ask_main_account and arguments.apply:
-                desired_config = validate_config_data(desired)
-
-                def ask(helper: Path) -> None:
-                    _ask_main_account(desired_config, deps, helper, answers, output)
-
-            report = installer.setup(
-                dry_run=arguments.dry_run,
-                config_data=desired,
-                before_activation=ask,
-            )
-            _write(
-                {
-                    "state": report.state,
-                    "counts": {
-                        "actions": report.change_count,
-                        "backups": len(report.backups),
-                        **config_payload["counts"],
-                    },
-                    "bytes": 0,
-                    "duration_ms": 0,
-                },
-                as_json=False,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "configure":
-            payload = configure_file(
-                arguments.config,
-                automatic_targets=arguments.automatic_targets,
-                sync_layout=arguments.sync_layout,
-                sync_routines=arguments.sync_routines,
-                sync_browser_logins=arguments.sync_browser_logins,
-                apply=arguments.apply,
-            )
-            _write(payload, as_json=False, stream=output)
-            return 0
+        setup_command = _SETUP_COMMANDS.get(arguments.command)
+        if setup_command is not None:
+            return setup_command(arguments, deps, output, answers)
+        command = _COMMANDS.get(arguments.command)
+        if command is None:
+            errors.write("claude-session-sync: unsupported command\n")
+            return 2
         config = deps.config_loader(arguments.config)
         if getattr(arguments, "adopt_current_sidebar", False) or (
             getattr(arguments, "adopt_source_scope", None) is not None
@@ -1201,178 +1439,16 @@ def run(
             blocker = main_account_blocker(config)
             if blocker is not None:
                 raise ValueError(MAIN_ACCOUNT_BLOCKERS[blocker])
-        if arguments.command == "restart-check":
-            profile = _find_profile(config, arguments.profile)
-            if not profile.is_default or config.target_policy not in (
-                "all-configured-profiles",
-                "logins",
-            ):
-                raise ValueError(
-                    "automatic restart is enabled only for the default profile in automatic mode"
-                )
-            try:
-                processes = _running_processes(config, deps)
-            except subprocess.TimeoutExpired as error:
-                _write(_chat_failure(error), as_json=True, stream=output)
-                return 1
-            selected_root = normalized_path(profile.data_root)
-            if any(
-                normalized_path(process.user_data_dir) != selected_root
-                for process in processes
-            ):
-                raise ValueError(
-                    "another managed profile is open; leave Claude open until it is closed"
-                )
-            _write(
-                {"state": "ready", "pids": [process.pid for process in processes]},
-                as_json=True,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "plan":
-            from .chat_sync import plan_chat_sync
-
-            started = deps.clock()
-            chat_run = plan_chat_sync(config, deps.planner_factory(config))
-            if arguments.report:
-                _write_plan_report(config, chat_run)
-            payload = _chat_plan_summary(
-                chat_run, round((deps.clock() - started) * 1000)
-            )
-            _write(payload, as_json=arguments.as_json, stream=output)
-            return 0 if _plan_state(chat_run.plan) in ("planned", "noop") else 1
-        if arguments.command == "seed-state":
-            from .seeding import seed_from_unenrolled
-
-            _write(
-                seed_from_unenrolled(config, apply=arguments.apply),
-                as_json=False,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "restart-claude":
-            from .filesystem import atomic_write_bytes, ensure_private_directory
-
-            ensure_private_directory(config.state_dir)
-            request = config.state_dir / "restart-request"
-            atomic_write_bytes(
-                request,
-                b"adopt-current-sidebar\n"
-                if arguments.adopt_current_sidebar
-                else b"restart\n",
-            )
-            os.chmod(str(request), 0o600)
-            _write({"state": "requested"}, as_json=False, stream=output)
-            return 0
-        if arguments.command == "keep-sidebar":
-            payload, exit_code, lines = _keep_sidebar(
-                config, deps, number=arguments.account, apply=arguments.apply
-            )
-            output.write("".join(line + "\n" for line in lines))
-            _write(payload, as_json=False, stream=output)
-            return exit_code
-        if arguments.command == "forget-lost":
-            from .chat_sync import forget_seen
-
-            folders = forget_seen(config, arguments.session_id)
-            _write(
-                {
-                    "state": "forgotten" if folders else "noop",
-                    "counts": {"folders": folders},
-                },
-                as_json=False,
-                stream=output,
-            )
-            return 0
-        if arguments.command in ("sync", "auto"):
-            return _run_sync(arguments, config, deps, output)
-        if arguments.command == "switch":
-            return _run_switch(arguments, config, deps, output)
-        if arguments.command == "rollback":
-            started = deps.clock()
-            receipt = deps.engine_factory(config).rollback(arguments.run_id)
-            duration_ms = round((deps.clock() - started) * 1000)
-            _write(
-                _recovery_summary(receipt, duration_ms),
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "browser-logins":
-            from .browser_logins import run_browser_logins
-
-            payload = run_browser_logins(
-                config,
-                lambda: bool(_running_processes(config, deps)),
-                arguments.action,
-            )
-            _write(payload, as_json=arguments.as_json, stream=output)
-            return 0 if payload["state"] in ("done", "disabled") else 1
-        if arguments.command == "status":
-            running = _running_processes(config, deps)
-            watcher_error = watcher_failure(config.state_dir)
-            layout_failure = adapter_failure(config, "layout")
-            routine_failure = adapter_failure(config, "routines")
-            abandoned = abandoned_preparation_count(config.state_dir)
-            progress = current_progress(
-                config,
-                app_running=bool(running),
-                failures=watcher_error + layout_failure + routine_failure + abandoned,
-            )
-            if abandoned:
-                progress["next_action"] = "inspect-preparations"
-            _write(
-                {
-                    "bytes": 0,
-                    "counts": {
-                        "abandoned_preparations": abandoned,
-                        "layout_failures": layout_failure,
-                        "profiles": len(config.profiles),
-                        "routine_failures": routine_failure,
-                        "running_processes": len(running),
-                        "watcher_failures": watcher_error,
-                    },
-                    "duration_ms": 0,
-                    **progress,
-                    "state": (
-                        "app-running"
-                        if running
-                        else "layout-failed"
-                        if layout_failure
-                        else "routines-failed"
-                        if routine_failure
-                        else "watcher-failed"
-                        if watcher_error
-                        else "idle"
-                    ),
-                },
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0
-        if arguments.command == "doctor":
-            payload = doctor_summary(
-                config,
-                deps,
-                lambda: bool(_running_processes(config, deps)),
-            )
-            _write(
-                payload,
-                as_json=arguments.as_json,
-                stream=output,
-            )
-            return 0 if payload["state"] == "healthy" else 1
-        if arguments.command == "approve-current-targets":
-            payload = approve_current_targets(
-                arguments.config, config, apply=arguments.apply
-            )
-            _write(payload, as_json=False, stream=output)
-            return 0 if payload["state"] != "blocked" else 1
-    except Exception as error:
+        return command(arguments, config, deps, output)
+    except _EXPECTED_ERRORS as error:
         errors.write(f"claude-session-sync: {error}\n")
         return 1
-    errors.write("claude-session-sync: unsupported command\n")
-    return 2
+    except Exception:
+        errors.write(
+            "claude-session-sync: unexpected error, please report it with this output\n"
+        )
+        traceback.print_exc(file=errors)
+        return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
