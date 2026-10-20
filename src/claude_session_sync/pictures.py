@@ -189,9 +189,9 @@ class PictureFixer:
         return ids
 
     def _transcripts(self) -> Iterator[Path]:
-        if self.root.is_symlink() or not self.root.is_dir():
-            return
         ids = self._synced_chat_ids()
+        if not ids or self.root.is_symlink() or not self.root.is_dir():
+            return
         for project in sorted(self.root.iterdir()):
             if project.is_symlink() or not project.is_dir():
                 continue
