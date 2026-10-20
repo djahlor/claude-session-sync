@@ -13,7 +13,7 @@ ref="${CLAUDE_SESSION_SYNC_REF:-}"
 if [[ -z "$ref" && -z "${CLAUDE_SESSION_SYNC_ARCHIVE:-}" ]]; then
   # The newest release, or main while the repository has none. GitHub
   # redirects releases/latest to the release's tag page.
-  latest="$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/$repository/releases/latest" 2>/dev/null)" || latest=""
+  latest="$(curl -fsS --max-time 10 -o /dev/null -w '%{redirect_url}' "https://github.com/$repository/releases/latest" 2>/dev/null)" || latest=""
   if [[ "$latest" == */releases/tag/* ]]; then
     ref="${latest##*/releases/tag/}"
   fi
