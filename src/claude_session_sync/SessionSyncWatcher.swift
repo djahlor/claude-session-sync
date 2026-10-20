@@ -25,6 +25,22 @@ private struct RestartReceipt: Codable {
   }
 }
 
+private enum Limits {
+  // restart-check prints one short JSON line.
+  static let restartCheckOutputBytes = 4_096
+  // The CLI's bounded process probe plus interpreter startup time.
+  static let restartCheckSeconds = 10.0
+  // How much of a sync result the status file keeps.
+  static let syncOutputBytes = 65_536
+  static let readChunkBytes = 4_096
+}
+
+private enum BrowserLoginSchedule {
+  static let firstSnapshot: TimeInterval = 60
+  static let afterImport: TimeInterval = 5
+  static let every: TimeInterval = 900
+}
+
 private final class ProcessCompletion {
   private let lock = NSLock()
   private var exitStatus: Int32?
@@ -103,7 +119,7 @@ private final class SessionSyncWatcher: NSObject {
   private let importsURL: URL?
   private var importsStamp: Date?
   private var snapshotDue: Date?
-  private var nextPeriodicSnapshot = Date().addingTimeInterval(60)
+  private var nextPeriodicSnapshot = Date().addingTimeInterval(BrowserLoginSchedule.firstSnapshot)
   private var snapshotRunning = false
 
   init(command: [String], claudeExecutable: String, statusURL: URL,
@@ -202,27 +218,34 @@ private final class SessionSyncWatcher: NSObject {
     guard fsync(descriptor) == 0 else { throw CocoaError(.fileWriteUnknown) }
   }
 
-  private func restartPIDs() -> RestartCheck {
-    guard let executable = command.first, let profile = profile else { return .blocked }
+  // The sync tool runs with no shell and no keyboard, and its errors are
+  // dropped: everything it reports comes back as JSON on standard output.
+  private func cliProcess(_ arguments: [String], output: Any) -> Process? {
+    guard let executable = command.first else { return nil }
     let process = Process()
-    let pipe = Pipe()
     process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = Array(command.dropFirst()) + ["restart-check", profile]
+    process.arguments = Array(command.dropFirst()) + arguments
     process.standardInput = FileHandle.nullDevice
-    process.standardOutput = pipe
+    process.standardOutput = output
     process.standardError = FileHandle.nullDevice
+    return process
+  }
+
+  private func restartPIDs() -> RestartCheck {
+    let pipe = Pipe()
+    guard let profile = profile, let process = cliProcess(["restart-check", profile], output: pipe)
+    else { return .blocked }
     do {
       try process.run()
-      // Allow the CLI's bounded process probe plus interpreter startup time.
-      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Limits.restartCheckSeconds) {
         if process.isRunning { process.terminate() }
       }
-      let data = pipe.fileHandleForReading.readData(ofLength: 4_097)
+      let data = pipe.fileHandleForReading.readData(ofLength: Limits.restartCheckOutputBytes + 1)
       process.waitUntilExit()
       if process.terminationReason == .uncaughtSignal && process.terminationStatus == SIGTERM {
         return .retryable
       }
-      guard data.count <= 4_096,
+      guard data.count <= Limits.restartCheckOutputBytes,
         let document = try JSONSerialization.jsonObject(with: data) as? [String: Any]
       else { return .blocked }
       if process.terminationStatus != 0,
@@ -272,20 +295,15 @@ private final class SessionSyncWatcher: NSObject {
     // URL resource values are cached per URL object, so ask the file system each time.
     let stamp = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
     if stamp != importsStamp {
-      if importsStamp != nil || stamp != nil { snapshotDue = now.addingTimeInterval(5) }
+      if importsStamp != nil || stamp != nil { snapshotDue = now.addingTimeInterval(BrowserLoginSchedule.afterImport) }
       importsStamp = stamp
     }
     if now >= nextPeriodicSnapshot && snapshotDue == nil { snapshotDue = now }
     guard let due = snapshotDue, now >= due, !snapshotRunning, !running, !restartRequested else { return }
     snapshotDue = nil
-    nextPeriodicSnapshot = now.addingTimeInterval(900)
-    guard let executable = command.first else { return }
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: executable)
-    task.arguments = Array(command.dropFirst()) + ["browser-logins", "snapshot", "--json"]
-    task.standardInput = FileHandle.nullDevice
-    task.standardOutput = FileHandle.nullDevice
-    task.standardError = FileHandle.nullDevice
+    nextPeriodicSnapshot = now.addingTimeInterval(BrowserLoginSchedule.every)
+    guard let task = cliProcess(["browser-logins", "snapshot", "--json"], output: FileHandle.nullDevice)
+    else { return }
     task.terminationHandler = { [weak self] _ in self?.queue.async { self?.snapshotRunning = false } }
     do {
       try task.run()
@@ -451,12 +469,11 @@ private final class SessionSyncWatcher: NSObject {
       pending = true
       return
     }
-    guard let executable = command.first else { return }
+    guard !command.isEmpty else { return }
     running = true
-    let task = Process()
     let output = Pipe()
     let restarting = restartRequested && profile != nil
-    task.executableURL = URL(fileURLWithPath: executable)
+    var arguments = ["auto", "--json"]
     if restarting, let profile = profile {
       restartPhase = "syncing"
       do { try saveRestartState() } catch {
@@ -464,17 +481,15 @@ private final class SessionSyncWatcher: NSObject {
         restartFailed("Could not save sync status. Claude has not been reopened.")
         return
       }
-      var arguments = ["switch", profile, "--wait-for-exit", "30", "--json"]
+      arguments = ["switch", profile, "--wait-for-exit", "30", "--json"]
       if let mode = restartMode { arguments.append("--" + mode) }
-      task.arguments = Array(command.dropFirst()) + arguments
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"syncing\"}".utf8), launchFailed: false)
       showStatus("Syncing, then reopening Claude")
-    } else {
-      task.arguments = Array(command.dropFirst()) + ["auto", "--json"]
     }
-    task.standardInput = FileHandle.nullDevice
-    task.standardOutput = output
-    task.standardError = FileHandle.nullDevice
+    guard let task = cliProcess(arguments, output: output) else {
+      running = false
+      return
+    }
     let completion = ProcessCompletion { [weak self] exitStatus, data in
       self?.queue.async {
         self?.finishAuto(exitStatus: exitStatus, output: data, restarting: restarting)
@@ -490,9 +505,9 @@ private final class SessionSyncWatcher: NSObject {
       DispatchQueue.global(qos: .utility).async {
         var data = Data()
         while true {
-          let chunk = output.fileHandleForReading.readData(ofLength: 4_096)
+          let chunk = output.fileHandleForReading.readData(ofLength: Limits.readChunkBytes)
           if chunk.isEmpty { break }
-          data.append(chunk.prefix(max(0, 65_536 - data.count)))
+          data.append(chunk.prefix(max(0, Limits.syncOutputBytes - data.count)))
         }
         completion.record(output: data)
       }
