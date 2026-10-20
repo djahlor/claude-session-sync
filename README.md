@@ -13,6 +13,10 @@ for example a work account and a personal one. Keep using the regular Claude app
 ## What it syncs
 
 - Claude Code chat history.
+- Pictures sent in a chat. Claude loads a sent picture from the account that
+  sent it, so after a switch it showed as broken. The restart after a switch
+  now points those pictures at their file on your Mac, so they show in every
+  account. See [pictures sent in a chat](docs/technical-reference.md#pictures-sent-in-a-chat).
 - Pins and custom groups, copied from one main account to the others, on
   Claude versions that keep them on your Mac. Newer Claude versions keep them
   per account on Anthropic's servers and reload them at every sign-in. Sync

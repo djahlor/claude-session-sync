@@ -4,6 +4,16 @@ What each version changed. To get the newest one, run the install command in
 the [README](README.md#install) again. Check the installed version with
 `claude-session-sync --version`.
 
+## Unreleased
+
+- Fixed: a picture sent in a chat with SendUserFile showed as broken after an
+  account switch. Claude loads it from the account that sent it, and that
+  account is no longer signed in. The restart after a switch now points such a
+  picture at its file on your Mac, so it shows in every account. The chat
+  record keeps the original upload id, under another name, and its size does
+  not change. On by default; `fix_chat_pictures: false` in the config turns it
+  off.
+
 ## 0.5.3 (2026-10-17)
 
 - Fixed: a deleted routine came back when an account folder last used before
