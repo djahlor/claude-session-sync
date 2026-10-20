@@ -70,6 +70,6 @@ python_version = "3.10"
 files = ["src/claude_session_sync"]
 
 [[tool.mypy.overrides]]
-# Known errors in the largest module, cleared when it is split up.
+# 11 known errors, all optional LevelDB values used after a check. Next to clear.
 module = "claude_session_sync.layout"
 ignore_errors = true
