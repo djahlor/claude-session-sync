@@ -15,13 +15,13 @@ from typing import Any, Union
 
 from . import strict_json as json
 from .filesystem import (
-    _open_regular_read,
     atomic_copy,
     atomic_write_bytes,
     digest_file,
     ensure_private_directory,
     ensure_private_file,
     fsync_directory,
+    open_regular_read,
 )
 
 PathLike = Union[str, os.PathLike]
@@ -137,7 +137,7 @@ class RunJournal:
         authentication_key = cls._load_or_create_key(state)
         manifest_path = state / "runs" / run_id / "manifest.json"
         try:
-            with _open_regular_read(manifest_path) as stream:
+            with open_regular_read(manifest_path) as stream:
                 raw = stream.read()
         except FileNotFoundError as error:
             raise JournalError(f"unknown run: {run_id}") from error

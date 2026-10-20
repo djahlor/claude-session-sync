@@ -46,7 +46,7 @@ def ensure_private_file(path: PathLike) -> None:
     os.chmod(os.fspath(path), 0o600)
 
 
-def _open_regular_read(path: PathLike) -> BinaryIO:
+def open_regular_read(path: PathLike) -> BinaryIO:
     file_path = Path(path)
     # Reject FIFOs after opening without waiting for a writer indefinitely.
     flags = os.O_RDONLY | os.O_NONBLOCK
@@ -65,7 +65,7 @@ def _open_regular_read(path: PathLike) -> BinaryIO:
 
 def read_bounded(path: PathLike, limit: int) -> bytes:
     """Read a regular file that is not a symlink, refusing anything over limit bytes."""
-    with _open_regular_read(path) as source:
+    with open_regular_read(path) as source:
         content = source.read(limit + 1)
     if len(content) > limit:
         raise UnsafePathError(f"file is larger than {limit} bytes: {path}")
@@ -74,7 +74,7 @@ def read_bounded(path: PathLike, limit: int) -> bytes:
 
 def digest_file(path: PathLike) -> str:
     digest = hashlib.sha256()
-    with _open_regular_read(path) as source:
+    with open_regular_read(path) as source:
         while True:
             chunk = source.read(1024 * 1024)
             if not chunk:
@@ -84,7 +84,7 @@ def digest_file(path: PathLike) -> str:
 
 
 def regular_file_size(path: PathLike) -> int:
-    with _open_regular_read(path) as source:
+    with open_regular_read(path) as source:
         return os.fstat(source.fileno()).st_size
 
 
@@ -115,7 +115,7 @@ def stage_copy(source: PathLike, destination: PathLike) -> Path:
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with (
-            _open_regular_read(source) as input_file,
+            open_regular_read(source) as input_file,
             os.fdopen(descriptor, "wb") as output_file,
         ):
             descriptor = -1

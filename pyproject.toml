@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.6.5"
-description = "Safely synchronize Claude Desktop Code chats, routines, and sidebar layout across local accounts."
+dynamic = ["version"]
+description = "Keep Claude Desktop Code chats, groups, routines and built-in browser logins in sync across accounts on one Mac."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -20,11 +20,19 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/djahlor/claude-session-sync"
+Changelog = "https://github.com/djahlor/claude-session-sync/blob/main/CHANGELOG.md"
+Issues = "https://github.com/djahlor/claude-session-sync/issues"
+
 [project.scripts]
 claude-session-sync = "claude_session_sync.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "claude_session_sync.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

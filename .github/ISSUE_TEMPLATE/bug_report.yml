@@ -1,0 +1,33 @@
+name: Bug report
+description: Something did not sync, or sync stopped with an error.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste chat content, account IDs, workspace IDs, tokens or files from Claude's folders. `status` and `doctor` output is safe to share: it holds counts and states only.
+  - type: input
+    id: version
+    attributes:
+      label: Claude Session Sync version
+      description: Output of `claude-session-sync --version`.
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Desktop and macOS versions
+      placeholder: Claude Desktop 2.42304.2, macOS 15.5
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `status --json` and `doctor --json`
+      render: json

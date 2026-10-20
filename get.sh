@@ -9,7 +9,16 @@
 set -euo pipefail
 
 repository="${CLAUDE_SESSION_SYNC_REPOSITORY:-djahlor/claude-session-sync}"
-ref="${CLAUDE_SESSION_SYNC_REF:-main}"
+ref="${CLAUDE_SESSION_SYNC_REF:-}"
+if [[ -z "$ref" && -z "${CLAUDE_SESSION_SYNC_ARCHIVE:-}" ]]; then
+  # The newest release, or main while the repository has none. GitHub
+  # redirects releases/latest to the release's tag page.
+  latest="$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/$repository/releases/latest" 2>/dev/null)" || latest=""
+  if [[ "$latest" == */releases/tag/* ]]; then
+    ref="${latest##*/releases/tag/}"
+  fi
+fi
+ref="${ref:-main}"
 archive="${CLAUDE_SESSION_SYNC_ARCHIVE:-https://github.com/$repository/archive/$ref.tar.gz}"
 claude_app="${CLAUDE_SESSION_SYNC_CLAUDE_APP:-/Applications/Claude.app}"
 

@@ -19,10 +19,10 @@ from . import strict_json as json
 from .adapters import adapter_failure, run_adapters, run_layout_first
 from .config import Config, load_config
 from .config_commands import (
-    _approve_current_targets,
-    _configure,
-    _prepare_config_data,
-    _validate_config_data,
+    approve_current_targets,
+    configure_file,
+    prepare_config_data,
+    validate_config_data,
 )
 from .filesystem import normalized_path
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
@@ -1147,7 +1147,7 @@ def run(
                 source = arguments.config.read_bytes()
             else:
                 source = installer.default_config_data()
-            desired, config_payload = _prepare_config_data(
+            desired, config_payload = prepare_config_data(
                 source,
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
@@ -1156,7 +1156,7 @@ def run(
             )
             ask = None
             if arguments.ask_main_account and arguments.apply:
-                desired_config = _validate_config_data(desired)
+                desired_config = validate_config_data(desired)
 
                 def ask(helper: Path) -> None:
                     _ask_main_account(desired_config, deps, helper, answers, output)
@@ -1182,7 +1182,7 @@ def run(
             )
             return 0
         if arguments.command == "configure":
-            payload = _configure(
+            payload = configure_file(
                 arguments.config,
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
@@ -1363,7 +1363,7 @@ def run(
             )
             return 0 if payload["state"] == "healthy" else 1
         if arguments.command == "approve-current-targets":
-            payload = _approve_current_targets(
+            payload = approve_current_targets(
                 arguments.config, config, apply=arguments.apply
             )
             _write(payload, as_json=False, stream=output)
