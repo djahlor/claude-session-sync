@@ -792,6 +792,27 @@ class SwitchTests(ChatCliFixture):
         self.assertEqual("local_" + X, self.read(self.b, X)["sessionId"])
         self.assertTrue(self.launched(launches))
 
+    def test_only_the_restart_after_an_account_switch_fixes_pictures(self):
+        from claude_session_sync.pictures import PictureReceipt
+
+        for extra, runs in ((("--after-account-switch",), 1), ((), 0)):
+            with self.subTest(extra=extra):
+                calls = []
+
+                class Fixer:
+                    def sync(self):
+                        calls.append(1)
+                        return PictureReceipt("synced", 1, 2)
+
+                code, out, errors = self.cli(
+                    "switch", "Work", "--json", *extra,
+                    launcher=FakeLauncher([]),
+                    picture_factory=lambda _config: Fixer(),
+                )
+                self.assertEqual((0, ""), (code, errors))
+                self.assertEqual(runs, len(calls))
+                self.assertEqual(bool(runs), "pictures" in json.loads(out))
+
     def test_a_switch_waits_for_claude_to_finish_quitting(self):
         probe = SequencedProcessProbe(((object(),), (object(),), ()))
         clock = ManualClock()
