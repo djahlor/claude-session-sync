@@ -6,6 +6,12 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-20
+
+### Fixed
+
+- A switch could leave the new account on its old sidebar, with every section's Group by, Sort by and Show back to that account's old values. When Claude was opened again while the switch still synced chats, the sidebar step waited and never ran for that switch. On Claude versions that keep the sidebar per account, the switch now copies the sidebar first, right after Claude quits, and syncs chats after. The copy already carried each section's view settings; it now runs before Claude can come back.
+
 ## [0.6.0] - 2026-10-20
 
 ### Added

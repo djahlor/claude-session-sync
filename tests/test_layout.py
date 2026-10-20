@@ -1931,6 +1931,40 @@ class PerAccountCopyTests(unittest.TestCase):
             self.assertEqual(["COMMITTED"], [json.loads(run.read_text())["state"] for run in runs])
             self.assertIn("RECOVERY_REQUIRED", stuck.read_text())
 
+    def test_switch_copy_keeps_each_sections_group_sort_and_show_settings(self):
+        # The section menu's Group by, Sort by and Show live in each section.
+        views = {
+            "pinned": {"sortBy": "created", "ascending": True, "collapsed": True},
+            "cg-popcorn": {"groupBy": "none", "sortBy": "recency", "collapsed": False,
+                           "show": {"metadata": True, "emptyGroups": False, "sideChats": True}},
+            "cg-life": {"groupBy": "status", "sortBy": "created", "ascending": True},
+            "sessions": {"groupBy": "none", "sortBy": "created", "shown": True,
+                         "show": {"metadata": False, "emptyGroups": True, "sideChats": False}},
+        }
+        main = copy.deepcopy(self.MAIN)
+        for entry in main["sections"]:
+            entry.update(copy.deepcopy(views[entry["id"]]))
+        # The signed-in account's own server copy groups everything by date.
+        old = copy.deepcopy(self.OLD)
+        for entry in old["sections"]:
+            entry.update({"groupBy": "date", "sortBy": "recency", "ascending": False})
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), slots={"a/w": main, "b/w": old}
+            )
+            self.main_file(config, "a/w")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+
+            copied = decoded(data[DFRAME_STORE_KEY])["state"]["codeSidebarByScope"]["b/w"]
+            self.assertEqual(main["sections"], copied["sections"])
+            for entry in copied["sections"]:
+                with self.subTest(section=entry["id"]):
+                    for field, value in views[entry["id"]].items():
+                        self.assertEqual(value, entry[field])
+            self.assertEqual(b"\x01b/w", data[layout_module.GROUP_UPLOAD_KEY])
+            self.assertEqual("claude-uploads-copy-on-next-start", receipt.reason)
+
     def test_plain_quit_on_main_account_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             config, synchronizer, data, writes, fake = self.fixture(Path(directory))

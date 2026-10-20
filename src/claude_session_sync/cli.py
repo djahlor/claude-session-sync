@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional, Sequence, TextIO
 from .config import Config, load_config
 from . import __version__
 from . import strict_json as json
-from .adapters import adapter_failure, run_adapters
+from .adapters import adapter_failure, run_adapters, run_layout_first
 from .config_commands import (
     _approve_current_targets,
     _configure,
@@ -470,16 +470,27 @@ def _run_switch(
         record_progress(config, "syncing")
         browser_logins = None
         try:
+            def running() -> bool:
+                return bool(_running_processes(config, dependencies))
+
+            sidebar_options = {
+                "adopt_current_sidebar": getattr(arguments, "adopt_current_sidebar", False),
+                "after_account_switch": getattr(arguments, "after_account_switch", False),
+            }
+            # Claude can be opened again while a long chat sync runs. The
+            # sidebar copy goes first when it can, so that never skips it.
+            layout_first = run_layout_first(config, dependencies, running, **sidebar_options)
             payload = _switch_chat_result(config, dependencies)
             payload.update(
                 run_adapters(
                     config,
                     dependencies,
-                    lambda: bool(_running_processes(config, dependencies)),
-                    adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
-                    after_account_switch=getattr(arguments, "after_account_switch", False),
+                    running,
+                    names=("routines",) if layout_first else None,
+                    **sidebar_options,
                 )
             )
+            payload.update(layout_first)
             payload["progress"] = finish_progress(config, payload)
         finally:
             # Claude was closed for this switch. It reopens even when the sync

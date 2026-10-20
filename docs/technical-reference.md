@@ -352,7 +352,13 @@ reports `state: per-account`:
 - After a switch, it copies the main account's slot into the signed-in
   account's slot, rebuilds that account's `customGroupsByScope` entry from the
   sections, sets the pending-upload flag for that account, and makes it the
-  main one. The reason is `claude-uploads-copy-on-next-start`.
+  main one. The reason is `claude-uploads-copy-on-next-start`. The slot holds
+  each section's view settings too (`groupBy`, `sortBy`, `ascending`, `show`,
+  `collapsed`, `shown`), so Group by, Sort by and Show travel with the groups.
+- A switch runs this copy first, right after Claude quits, and syncs chats
+  after it. A long chat sync could otherwise end with Claude open again and
+  the copy skipped for that switch. When Claude is already back or another
+  writer holds the lock, the copy runs after the chat sync as before.
 - `keep-sidebar --account N --apply` copies that account's slot into the
   signed-in one the same way at the next closed sync.
 - It writes nothing when the owner is another account

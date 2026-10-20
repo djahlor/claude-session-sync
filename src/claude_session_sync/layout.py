@@ -1247,6 +1247,17 @@ class LayoutSynchronizer:
                     return True
         return False
 
+    def keeps_sidebar_per_account(self) -> bool:
+        """Whether sync copies one account's whole sidebar slot into another.
+
+        That copy needs nothing from the chat sync, so a switch can run it
+        first, in the moment right after Claude quits. Reads disposable copies
+        only and raises LayoutBusyError while Claude runs.
+        """
+        if not self.config.sync_sidebar_layout:
+            return False
+        return self._keeps_sidebar_on_server()
+
     def _account_journal_root(self) -> Path:
         return self.config.state_dir / ACCOUNT_JOURNAL_DIRNAME
 
