@@ -31,6 +31,7 @@ class Config:
     target_policy: str = "approved-only"
     sync_sidebar_layout: bool = False
     sync_code_routines: bool = False
+    sync_browser_logins: bool = False
     # Show sent pictures from the copy on this Mac, so an account switch keeps them.
     fix_chat_pictures: bool = True
     version: int = 1
@@ -48,12 +49,14 @@ _CONFIG_KEYS = {
     "target_policy",
     "sync_sidebar_layout",
     "sync_code_routines",
+    "sync_browser_logins",
     "fix_chat_pictures",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "target_policy",
     "sync_sidebar_layout",
     "sync_code_routines",
+    "sync_browser_logins",
     "fix_chat_pictures",
 }
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
@@ -216,6 +219,9 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_code_routines = document.get("sync_code_routines", False)
     if not isinstance(sync_code_routines, bool):
         raise ConfigError("sync_code_routines must be a boolean")
+    sync_browser_logins = document.get("sync_browser_logins", False)
+    if not isinstance(sync_browser_logins, bool):
+        raise ConfigError("sync_browser_logins must be a boolean")
     fix_chat_pictures = document.get("fix_chat_pictures", True)
     if not isinstance(fix_chat_pictures, bool):
         raise ConfigError("fix_chat_pictures must be a boolean")
@@ -235,6 +241,7 @@ def load_config(path: Union[str, Path]) -> Config:
         target_policy=target_policy,
         sync_sidebar_layout=sync_sidebar_layout,
         sync_code_routines=sync_code_routines,
+        sync_browser_logins=sync_browser_logins,
         fix_chat_pictures=fix_chat_pictures,
         version=version,
     )

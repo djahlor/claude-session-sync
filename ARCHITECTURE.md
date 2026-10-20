@@ -138,6 +138,20 @@ is a regular `SKILL.md` under its task ID. Multi-file writes have private exact
 preimages, verification, rollback, and crash recovery. Cowork routine manifests
 are excluded because their space context has different semantics.
 
+
+## Browser login adapter
+
+Claude clears its built-in browser partition (`persist:launch-preview-cowork-shared`),
+its local storage and its imported-site records on every account change, and
+keeps them across same-account restarts. The optional adapter
+(`sync_browser_logins`) keeps one copy per profile in the state folder:
+SQLite's backup API copies the cookie database while Claude runs, the watcher
+starts a snapshot every 15 minutes and after the import record changes, and
+an empty jar never replaces a saved copy. With Claude closed, `switch` and
+`auto` restore the copy only when the jar is empty and the account hash differs
+from the copy's; an empty jar under the same account is a deliberate clear and
+marks the copy as never to restore. The live jar is backed up before a restore.
+Only counts, times and a hash of the account id are recorded.
 ## State machine
 
 ```text

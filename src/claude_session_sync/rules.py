@@ -8,7 +8,7 @@ here, because every sync runs with Claude closed.
 Actions for one session are emitted in the order they must happen.
 """
 
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 from .chat_model import (
     CreateRecord,
@@ -29,8 +29,13 @@ def plan(
     state: SyncState,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
+    tie_breaks: Optional[Mapping[str, str]] = None,
 ) -> RulePlan:
-    """prefer settles ties for one partition, for one session if prefer_session is set."""
+    """prefer settles ties for one partition, for one session if prefer_session is set.
+
+    tie_breaks names, per session, the folder whose copy holds everything the
+    other leading copies hold (see tie_break.py). An explicit prefer comes first.
+    """
 
     result = RulePlan()
     session_ids = set()
@@ -38,6 +43,8 @@ def plan(
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
         preferred = prefer if prefer_session in (None, session_id) else None
+        if preferred is None and tie_breaks:
+            preferred = tie_breaks.get(session_id)
         _plan_session(session_id, snapshots, state, preferred, result)
     return result
 

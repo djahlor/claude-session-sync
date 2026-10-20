@@ -109,12 +109,16 @@ def run_adapters(
     adopt_current_sidebar=False,
     adopt_source_scope=None,
     after_account_switch=False,
+    names=None,
 ) -> dict:
-    """A failed adapter cannot prevent the other enabled adapter from running."""
+    """A failed adapter cannot prevent the other enabled adapter from running.
+
+    names, when given, runs only those adapters.
+    """
     results = {}
     probes = {}
     for name, flag, factory, filename, fields in ADAPTERS:
-        if not getattr(config, flag):
+        if not getattr(config, flag) or (names is not None and name not in names):
             continue
         try:
             if running():
@@ -153,6 +157,11 @@ def run_adapters(
             except OSError:
                 results[name] = dict(result, reporting_error="status-write-failed")
     if not probe_only and probes:
+        if names is not None:
+            # A split run keeps what the other part recorded.
+            previous = read_status(config.state_dir, "compatibility-status.json").get("adapters")
+            if isinstance(previous, dict):
+                probes = {**previous, **probes}
         try:
             save_status(
                 config.state_dir,
@@ -165,6 +174,60 @@ def run_adapters(
         except OSError:
             for result in results.values():
                 result["reporting_error"] = "compatibility-status-write-failed"
+    return results
+
+
+def run_layout_first(
+    config,
+    dependencies,
+    running,
+    *,
+    adopt_current_sidebar=False,
+    after_account_switch=False,
+) -> dict:
+    """Copy pins, groups and section views before a switch syncs chats.
+
+    On builds that keep the sidebar per account, the copy needs nothing from
+    the chat sync. Run first, it lands in the second after Claude quits, so
+    Claude opening again during a long chat sync can no longer skip it and
+    leave the new account on its old server sidebar. Returns the layout
+    result when the copy ran; otherwise {} and the switch keeps the old order.
+    """
+    if not config.sync_sidebar_layout:
+        return {}
+    try:
+        if running():
+            return {}
+        check = getattr(dependencies.layout_factory(config), "keeps_sidebar_per_account", None)
+        if check is None or not check():
+            return {}
+    except Exception:
+        # The run after the chat sync meets and reports the same problem.
+        return {}
+    status = config.state_dir / next(entry[3] for entry in ADAPTERS if entry[0] == "layout")
+    status_before = status.read_bytes() if status.is_file() and not status.is_symlink() else None
+    results = run_adapters(
+        config,
+        dependencies,
+        running,
+        adopt_current_sidebar=adopt_current_sidebar,
+        after_account_switch=after_account_switch,
+        names=("layout",),
+    )
+    layout = results.get("layout", {})
+    if layout.get("state") == "deferred" or layout.get("reason") == "writer-busy":
+        # Claude came back or another writer is finishing: retry in the old
+        # place, after the chat sync has waited for that writer. The status
+        # file goes back to what it said, since this attempt changed nothing.
+        try:
+            if status_before is not None:
+                atomic_write_bytes(status, status_before)
+                os.chmod(status, 0o600)
+            elif os.path.lexists(status):
+                os.unlink(status)
+        except OSError:
+            pass
+        return {}
     return results
 
 

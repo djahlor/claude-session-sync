@@ -81,6 +81,59 @@ class WatcherTests(unittest.TestCase):
                 process.terminate()
                 process.wait(timeout=5)
 
+    def test_an_import_starts_a_browser_login_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="watcher-browser-logins-test-") as directory:
+            root = Path(directory)
+            account = root / "config.json"
+            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            imports = root / "chrome-import-sites.json"
+            imports.write_text("[]")
+            calls = root / "calls"
+            command = root / "sync-command"
+            command.write_text(
+                "#!/bin/sh\n"
+                'echo "$*" >> "{}"\n'
+                'echo \'{{"state":"noop","progress":"finished"}}\'\n'.format(calls)
+            )
+            command.chmod(0o755)
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "--claude-executable", "/nonexistent/Claude",
+                    "--status", str(root / "watcher-status.json"),
+                    "--account-file", str(account),
+                    "--profile", "Work",
+                    "--", str(command),
+                ],
+                env=dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            def snapshots():
+                try:
+                    lines = calls.read_text().splitlines()
+                except FileNotFoundError:
+                    return 0
+                return lines.count("browser-logins snapshot --json")
+
+            def wait_for(count, seconds):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    if snapshots() >= count:
+                        return True
+                    time.sleep(0.1)
+                return False
+
+            try:
+                self.assertTrue(wait_for(1, 25), "no snapshot after the watcher started")
+                time.sleep(1.1)
+                imports.write_text('[{"jar":"persist:launch-preview-cowork-shared"}]')
+                self.assertTrue(wait_for(2, 25), "no snapshot after an import")
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_finished_result_is_persisted(self):
         result = self.result_for('print(\'{"state":"noop","progress":"finished"}\')')
         self.assertEqual("ok", result["state"])

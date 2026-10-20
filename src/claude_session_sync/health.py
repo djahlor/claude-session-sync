@@ -24,14 +24,15 @@ def abandoned_preparation_count(state_dir: Path) -> int:
 
 def _adapter_recovery_pending(config) -> int:
     count = 0
-    # A per-account sidebar is never written or recovered, so old layout
-    # journals stay on disk as history instead of blocking anything.
+    # A per-account sidebar keeps its own journals, so old layout journals
+    # stay on disk as history instead of blocking anything.
     layout_active = config.sync_sidebar_layout and read_status(
         config.state_dir, "sidebar-layout-status.json"
     ).get("state") != "per-account"
     for enabled, directory in (
         (config.sync_code_routines, "routine-runs"),
         (layout_active, "layout-runs"),
+        (config.sync_sidebar_layout, "layout-account-runs"),
     ):
         root = config.state_dir / directory
         if not enabled or not os.path.lexists(root):

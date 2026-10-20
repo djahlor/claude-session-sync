@@ -80,6 +80,8 @@ private final class SessionSyncWatcher: NSObject {
   private let profile: String?
   private let restartURL: URL
   private let restartRequestURL: URL
+  // The sync tool keeps this file while a switch syncs with Claude closed.
+  private let switchGuardURL: URL
   private var accountHash: String?
   private var candidateHash: String?
   private var candidateSince: Date?
@@ -96,6 +98,13 @@ private final class SessionSyncWatcher: NSObject {
   private var noticePanel: NSPanel?
   private var noticeGeneration = 0
   private var lastMessage = ""
+  // The built-in browser loses its site logins on every account change. A
+  // copy saved while it is healthy is what the switch puts back.
+  private let importsURL: URL?
+  private var importsStamp: Date?
+  private var snapshotDue: Date?
+  private var nextPeriodicSnapshot = Date().addingTimeInterval(60)
+  private var snapshotRunning = false
 
   init(command: [String], claudeExecutable: String, statusURL: URL,
        accountURL: URL?, profile: String?) {
@@ -107,6 +116,8 @@ private final class SessionSyncWatcher: NSObject {
     let directory = statusURL.deletingLastPathComponent()
     self.restartURL = directory.appendingPathComponent("account-restart.json")
     self.restartRequestURL = directory.appendingPathComponent("restart-request")
+    self.switchGuardURL = directory.appendingPathComponent("switch-guard")
+    self.importsURL = accountURL?.deletingLastPathComponent().appendingPathComponent("chrome-import-sites.json")
     super.init()
     if accountURL != nil {
       do {
@@ -249,7 +260,39 @@ private final class SessionSyncWatcher: NSObject {
       requestRestart(mode: request.contains("adopt-current-sidebar") ? "adopt-current-sidebar" : nil)
       return
     }
+    scheduleBrowserLoginSnapshot()
     checkAccount()
+  }
+
+  // Every 15 minutes, and a few seconds after Claude records an import.
+  // The sync tool decides whether the copy is worth keeping.
+  private func scheduleBrowserLoginSnapshot() {
+    guard let url = importsURL, profile != nil else { return }
+    let now = Date()
+    // URL resource values are cached per URL object, so ask the file system each time.
+    let stamp = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    if stamp != importsStamp {
+      if importsStamp != nil || stamp != nil { snapshotDue = now.addingTimeInterval(5) }
+      importsStamp = stamp
+    }
+    if now >= nextPeriodicSnapshot && snapshotDue == nil { snapshotDue = now }
+    guard let due = snapshotDue, now >= due, !snapshotRunning, !running, !restartRequested else { return }
+    snapshotDue = nil
+    nextPeriodicSnapshot = now.addingTimeInterval(900)
+    guard let executable = command.first else { return }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: executable)
+    task.arguments = Array(command.dropFirst()) + ["browser-logins", "snapshot", "--json"]
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    task.terminationHandler = { [weak self] _ in self?.queue.async { self?.snapshotRunning = false } }
+    do {
+      try task.run()
+      snapshotRunning = true
+    } catch {
+      NSLog("claude-session-sync watcher could not start a browser login snapshot")
+    }
   }
 
   private func checkAccount() {
@@ -627,6 +670,40 @@ private final class SessionSyncWatcher: NSObject {
     } catch { NSLog("claude-session-sync watcher could not persist status") }
   }
 
+  // A switch syncs chats with Claude closed. Claude opened again during that
+  // sync, by a sign-in page handing back to Claude or a click, stopped it on
+  // 20-10-2026. It is asked to quit again and reopens when the sync is done.
+  @objc func applicationLaunched(_ notification: Notification) {
+    guard
+      let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+        as? NSRunningApplication,
+      application.executableURL?.standardizedFileURL.path == claudeExecutable
+        || application.bundleIdentifier == "com.anthropic.claudefordesktop"
+    else { return }
+    queue.async { [weak self] in
+      guard let self = self, self.switchSyncing() else { return }
+      self.notify("Finishing the sync first. Claude reopens by itself.")
+      self.quitDuringSwitch(application, attempt: 1)
+    }
+  }
+
+  private func switchSyncing() -> Bool {
+    restartRequested && restartPhase == "syncing"
+      && FileManager.default.fileExists(atPath: switchGuardURL.path)
+  }
+
+  // A Claude still starting up can refuse a quit, so it is asked again.
+  private func quitDuringSwitch(_ application: NSRunningApplication, attempt: Int) {
+    guard attempt <= 20, switchSyncing() else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard !application.isTerminated else { return }
+      _ = application.terminate()
+      self?.queue.asyncAfter(deadline: .now() + 1.5) {
+        self?.quitDuringSwitch(application, attempt: attempt + 1)
+      }
+    }
+  }
+
   @objc func applicationTerminated(_ notification: Notification) {
     guard
       let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
@@ -692,6 +769,10 @@ private let watcher = SessionSyncWatcher(
 NSWorkspace.shared.notificationCenter.addObserver(
   watcher, selector: #selector(SessionSyncWatcher.applicationTerminated(_:)),
   name: NSWorkspace.didTerminateApplicationNotification, object: nil
+)
+NSWorkspace.shared.notificationCenter.addObserver(
+  watcher, selector: #selector(SessionSyncWatcher.applicationLaunched(_:)),
+  name: NSWorkspace.didLaunchApplicationNotification, object: nil
 )
 watcher.requestAuto()
 application.run()

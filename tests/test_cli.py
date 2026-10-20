@@ -581,8 +581,8 @@ class CliConfigureTests(unittest.TestCase):
             )
             self.assertEqual(
                 "state=planned counts={'actions': 1, 'backups': 0, 'changes': 4, "
-                "'automatic_targets': 1, 'layout_sync': 1, 'routine_sync': 1} "
-                "bytes=0 duration_ms=0\n",
+                "'automatic_targets': 1, 'layout_sync': 1, 'routine_sync': 1, "
+                "'browser_login_sync': 0} bytes=0 duration_ms=0\n",
                 output.getvalue(),
             )
             self.assertFalse(config_path.exists())

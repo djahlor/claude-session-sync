@@ -282,6 +282,15 @@ finish, then plans again and syncs. A separate handoff lock stops two switches
 at once from both launching Claude. The wait uses a wall-clock deadline and a
 bounded process probe, so slow process inspection cannot extend the limit.
 `switch` launches Claude after the sync, even when the sync failed.
+
+While `switch` syncs it keeps a `switch-guard` file in the state directory and
+removes it just before it launches Claude. A Claude opened during that time,
+for example by a sign-in page handing back to Claude, stops the chat sync
+before any write. The watcher sees the guard during a switch restart and asks
+that Claude to quit again, retrying every 1.5 seconds for 30 seconds while it
+starts up. `switch` then waits up to 45 seconds for it to close and syncs
+again, at most twice. A Claude that stays open ends the switch as before, and
+the next quit syncs.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
 returns success with `state=waiting` and `reason=claude-open`. If Claude opens
 again after the chats synced but before pins, groups, or routines did, those
@@ -333,17 +342,71 @@ down faster.
 ## Pins and custom groups
 
 Newer Claude builds keep pins, groups, and the sidebar view per account on
-Anthropic's servers. They mark each account's section list as seeded from
-account settings (`prefsSeeded` under `codeSidebarByScope`), clear the local
-copy at every sign-in, and load the new account's list. A copy written to disk
-is then dropped or never read, and the account just left may no longer have its
-groups on disk at all. When the layout adapter finds a seeded section list, it
-reads nothing else, writes nothing, runs no recovery, and reports
-`layout={'state': 'per-account', 'reason': 'claude-keeps-sidebar-per-account'}`.
-That counts as finished. Older layout run journals stay on disk unchanged and no
-longer count as pending recovery. Seen on Desktop 2.42304.0, where seeded lists
-go back to at least 7 October 2026. The rest of this section describes builds
-without seeded lists.
+Anthropic's servers, in the `ccd/dframe-store` entry of
+`/api/claude_code/organizations/{org}/user_settings`. They mark each account's
+section list as seeded from account settings (`prefsSeeded` under
+`codeSidebarByScope`). Local Storage keeps one slot per `ACCOUNT/WORKSPACE` in
+`codeSidebarByScope` and `customGroupsByScope`, and signing out keeps them. At
+startup Claude loads the account's server copy, except when
+`ccd-sync-pending:ccd/dframe-store` equals the signed-in `ACCOUNT/WORKSPACE`
+and `ccd-sync-owner` names that account: then the local slot wins and Claude
+uploads it. A `|migrate` suffix merges the server copy in first, so sync never
+writes it. Which local chat sits in which section is never uploaded.
+
+When the layout adapter finds a seeded section list, it works this way and
+reports `state: per-account`:
+
+- `sidebar-main-0.json` in the state folder names the main account: the one
+  signed in at the last closed sync.
+- After a switch, it copies the main account's slot into the signed-in
+  account's slot, rebuilds that account's `customGroupsByScope` entry from the
+  sections, sets the pending-upload flag for that account, and makes it the
+  main one. The reason is `claude-uploads-copy-on-next-start`. The slot holds
+  each section's view settings too (`groupBy`, `sortBy`, `ascending`, `show`,
+  `collapsed`, `shown`), so Group by, Sort by and Show travel with the groups.
+- A switch runs this copy first, right after Claude quits, and syncs chats
+  after it. A long chat sync could otherwise end with Claude open again and
+  the copy skipped for that switch. When Claude is already back or another
+  writer holds the lock, the copy runs after the chat sync as before.
+- `keep-sidebar --account N --apply` copies that account's slot into the
+  signed-in one the same way at the next closed sync.
+- It writes nothing when the owner is another account
+  (`signed-in-account-not-confirmed`), Claude's settings sync is quarantined
+  (`claude-settings-sync-quarantined`), another account's upload waits
+  (`another-upload-pending`), the signed-in slot is not loaded yet
+  (`signed-in-sidebar-not-loaded`), the main slot has no sections
+  (`main-account-has-no-groups`), or the account changed without the switch
+  restart (`account-changed-without-switch-restart`). A signed-in account with
+  its own upload waiting (`signed-in-edit-pending`) becomes the main one.
+- Writes use their own journal, `layout-account-runs`. Older `layout-runs`
+  journals stay on disk unchanged and no longer count as pending recovery.
+
+Verified on Desktop 2.42304.0 on 19 October 2026: after a copy, Claude cleared
+the flag within 10 seconds of opening and showed the copied sections. Seeded
+lists go back to at least 7 October 2026. The
+[sidebar-groups skill](../skills/sidebar-groups/SKILL.md) is a manual
+alternative that rebuilds groups through the Code tab's sidebar tools.
+
+To copy groups by hand with the skill:
+
+1. Install it once:
+
+   ```sh
+   mkdir -p ~/.claude/skills/sidebar-groups && curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/skills/sidebar-groups/SKILL.md -o ~/.claude/skills/sidebar-groups/SKILL.md
+   ```
+
+2. In the account whose groups you want to keep, open a chat in the Code tab
+   and ask Claude to save your sidebar groups.
+3. Sign in to another account, open a chat in the Code tab, and ask Claude to
+   sync your groups. It makes the same groups and files the same chats there.
+   Groups that are not in the saved list are removed, and their chats move to
+   the plain list. No chat is archived or deleted.
+4. Repeat step 3 once in each account. When you change your groups later, save
+   them again from that account first.
+
+The skill copies groups only, not pins.
+
+The rest of this section describes builds without seeded lists.
 
 Claude stores chat history and sidebar layout separately. The layout adapter
 reads and writes only the group-scope record, pin record, and matching dframe
@@ -442,6 +505,9 @@ The watcher owns a persistent menu-bar status item and a non-activating status
 window. It does not rely on AppleScript or Notification Center delivery.
 
 ## Pins and groups across accounts
+
+This section describes builds without seeded section lists. On newer builds,
+see [Pins and custom groups](#pins-and-custom-groups).
 
 Claude keeps pins and custom groups in its Local Storage database, which it
 locks while open, and each account's group list also lives in that account's
@@ -565,6 +631,58 @@ to each destination. Routine errors are reported separately
 and never change a completed chat result, but the overall command returns a
 nonzero exit code with `progress=needs-attention`. This tool syncs Claude Code routines only;
 Cowork routines use different space-specific context and are left untouched.
+
+## Built-in browser logins
+
+Optional, off by default (`sync_browser_logins`). Claude Desktop clears its
+built-in browser on every account change: the `launch-preview-cowork-shared`
+partition, its local storage, and that jar's entries in
+`chrome-import-sites.json`. A same-account restart keeps them.
+
+- `browser-logins snapshot` copies the jar into
+  `<state_dir>/browser-logins/<profile>/snapshot` with SQLite's backup API, so
+  it is safe while Claude runs. It skips an empty jar (`jar-empty`), an
+  unchanged one (`unchanged`), and waits one run before it accepts a drop to
+  less than half the saved cookies (`large-drop`). The watcher runs it every
+  15 minutes and five seconds after the import record changes.
+- `switch`, right after Claude quits and before the chat sync, and `auto`, at
+  a quit and before the chat sync, restore the copy when the jar is empty and
+  the account hash differs from the copy's. Claude can be opened again during
+  a long chat sync, and a jar is only put back while Claude is closed. The live
+  jar is copied to `backups/` first (last three kept).
+- An empty jar seen while Claude runs under another account marks the copy
+  `restore_pending`: a switch emptied it and nothing put it back yet. The next
+  restore with Claude closed brings it back, also under the copy's own account.
+  A new healthy snapshot drops the mark.
+- Otherwise an empty jar under the same account is a clear the person made in
+  Claude. The copy is then marked and never restored (`cleared-in-claude`),
+  until a new healthy snapshot replaces it.
+- An account change also sets `preferences.launchChromeImportPrompt` in
+  `claude_desktop_config.json` back to `pending`, and Claude then offers to
+  import cookies again. After a restore that value becomes `done`. Only that
+  value changes: the edit replaces its one occurrence, checks that both versions
+  parse to the same settings apart from it, and keeps the file's mode. Any other
+  layout is left alone (`unrecognised`).
+- `browser-logins status --json` reports counts, times, and whether the copy
+  belongs to the signed-in account. `last_restore` keeps the time, counts and
+  prompt result of the last restore after newer copies are saved. Cookie values
+  and the account id are never read into output; the account is stored as a
+  SHA-256 hash.
+- A failure here never blocks chat sync or the relaunch.
+
+## Ties
+
+Copies of a chat that differ at the same `lastActivityAt` are a tie. Claude
+changes some fields without touching that time: archiving, pull requests,
+titles, trusted git folders, published pages. The planner reads the leading
+copies of each tied chat again and lets one win when it holds everything the
+others hold (`tie_break.py`): archived if any copy is, every pull request at the
+same or a later state (`OPEN` < `CLOSED` < `MERGED`, dismissals kept), the title
+named at a later turn or a person's rename over an automatic name, every git
+folder and every published page at its latest update. Account and runtime
+fields (Remote Control ids, interruption and error marks, pending reminders)
+are ignored for this. Any other difference keeps the tie. `--prefer` still
+comes first.
 
 ## Failure handling
 

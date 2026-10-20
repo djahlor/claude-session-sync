@@ -5,6 +5,7 @@ set -euo pipefail
 automatic_targets=false
 sync_layout=false
 sync_routines=false
+sync_browser_logins=false
 
 for argument in "$@"; do
   case "$argument" in
@@ -17,9 +18,12 @@ for argument in "$@"; do
     --sync-routines)
       sync_routines=true
       ;;
+    --sync-browser-logins)
+      sync_browser_logins=true
+      ;;
     *)
       echo "Unknown option: $argument" >&2
-      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines]" >&2
+      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins]" >&2
       exit 2
       ;;
   esac
@@ -70,6 +74,9 @@ fi
 if [[ "$sync_routines" == true ]]; then
   setup_args+=(--sync-routines)
 fi
+if [[ "$sync_browser_logins" == true ]]; then
+  setup_args+=(--sync-browser-logins)
+fi
 run_source_cli setup "${setup_args[@]}" --apply
 
 echo
@@ -89,4 +96,7 @@ if [[ "$sync_layout" == true ]]; then
 fi
 if [[ "$sync_routines" == true ]]; then
   echo "Claude Code routines sync whenever Claude closes or restarts."
+fi
+if [[ "$sync_browser_logins" == true ]]; then
+  echo "The built-in browser's site logins come back after an account switch."
 fi

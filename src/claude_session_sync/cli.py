@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional, Sequence, TextIO
 from .config import Config, load_config
 from . import __version__
 from . import strict_json as json
-from .adapters import adapter_failure, run_adapters
+from .adapters import adapter_failure, run_adapters, run_layout_first
 from .config_commands import (
     _approve_current_targets,
     _configure,
@@ -38,6 +38,10 @@ RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
 SWITCH_WRITER_WAIT_SECONDS = 15.0
+# While this file exists the Sync helper quits a Claude opened mid-switch.
+SWITCH_GUARD_NAME = "switch-guard"
+SWITCH_REOPEN_WAIT_SECONDS = 45.0
+SWITCH_REOPEN_RETRIES = 2
 
 
 def _default_planner_factory(_config: Config) -> Any:
@@ -268,6 +272,12 @@ def _parser() -> argparse.ArgumentParser:
     rollback = commands.add_parser("rollback", help="restore an earlier run")
     rollback.add_argument("run_id")
     rollback.add_argument("--json", action="store_true", dest="as_json")
+    browser_logins = commands.add_parser(
+        "browser-logins",
+        help="save or restore the built-in browser's site logins",
+    )
+    browser_logins.add_argument("action", choices=("snapshot", "restore", "status"))
+    browser_logins.add_argument("--json", action="store_true", dest="as_json")
     status = commands.add_parser("status", help="show current adapter state")
     status.add_argument("--json", action="store_true", dest="as_json")
     doctor = commands.add_parser("doctor", help="validate configuration safety")
@@ -298,6 +308,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="sync Claude Code routines after Claude quits",
     )
+    configure.add_argument(
+        "--sync-browser-logins",
+        action="store_true",
+        help="keep the built-in browser's site logins across account switches",
+    )
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
     configure_mode.add_argument("--apply", action="store_true")
@@ -307,6 +322,7 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--automatic-targets", action="store_true")
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
+    setup.add_argument("--sync-browser-logins", action="store_true")
     setup.add_argument(
         "--ask-main-account",
         action="store_true",
@@ -392,6 +408,31 @@ def _running_processes(
     )
 
 
+def _settle_browser_logins(config: Config, dependencies: CliDependencies, profiles) -> dict:
+    """Claude is closed: put back logins a switch cleared, or save them. Never raises."""
+
+    from .browser_logins import run_browser_logins
+
+    try:
+        return run_browser_logins(
+            config,
+            lambda: bool(_running_processes(config, dependencies)),
+            "settle",
+            profiles=profiles,
+        )
+    except Exception as error:
+        return {"state": "failed", "reason": type(error).__name__}
+
+
+def _browser_logins_busy(result: dict) -> bool:
+    """True when a settle met another writer and gets one more try."""
+
+    if result.get("state") == "failed":
+        return True
+    profiles = result.get("profiles", {})
+    return any(entry.get("reason") == "busy" for entry in profiles.values())
+
+
 def _wait_for_managed_processes_to_exit(
     config: Config,
     dependencies: CliDependencies,
@@ -428,15 +469,40 @@ def _wait_for_managed_processes_to_exit(
 
 def _switch_chat_result(config: Config, dependencies: CliDependencies) -> dict:
     writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
+    reopened = 0
     while True:
         try:
             return _chat_payload(None, config, dependencies)
         except Exception as error:
             remaining = writer_deadline - dependencies.monotonic()
-            if _busy_reason(error) == "busy" and remaining > 0:
+            reason = _busy_reason(error)
+            if reason == "busy" and remaining > 0:
                 dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
                 continue
+            if reason == "claude-open" and reopened < SWITCH_REOPEN_RETRIES:
+                # Claude was opened during the sync. The Sync helper asks it
+                # to quit again; once it is gone the sync runs once more.
+                reopened += 1
+                if _wait_for_managed_processes_to_exit(
+                    config, dependencies, SWITCH_REOPEN_WAIT_SECONDS
+                ):
+                    continue
             return _chat_failure(error)
+
+
+def _set_switch_guard(config: Config, on: bool) -> None:
+    from .filesystem import atomic_write_bytes, ensure_private_directory
+
+    guard = config.state_dir / SWITCH_GUARD_NAME
+    try:
+        if on:
+            ensure_private_directory(config.state_dir)
+            atomic_write_bytes(guard, b"switch\n")
+            os.chmod(str(guard), 0o600)
+        elif os.path.lexists(str(guard)):
+            os.unlink(str(guard))
+    except OSError:
+        pass  # without the guard a reopened Claude only stops this sync, as before
 
 
 def _run_switch(
@@ -477,7 +543,24 @@ def _run_switch(
             )
             return 1
         record_progress(config, "syncing")
+        _set_switch_guard(config, True)
+        # The account change just cleared the built-in browser. Its logins go
+        # back first, in the second after Claude quits, because a jar is only
+        # put back while Claude is closed and Claude can be opened again during
+        # the long chat sync. Claude then starts with the new account already
+        # known and does not clear it again.
+        browser_logins = _settle_browser_logins(config, dependencies, (profile,))
         try:
+            def running() -> bool:
+                return bool(_running_processes(config, dependencies))
+
+            sidebar_options = {
+                "adopt_current_sidebar": getattr(arguments, "adopt_current_sidebar", False),
+                "after_account_switch": getattr(arguments, "after_account_switch", False),
+            }
+            # Claude can be opened again while a long chat sync runs. The
+            # sidebar copy goes first when it can, so that never skips it.
+            layout_first = run_layout_first(config, dependencies, running, **sidebar_options)
             payload = _switch_chat_result(config, dependencies)
             if getattr(arguments, "after_account_switch", False):
                 _fix_chat_pictures(config, dependencies, payload)
@@ -485,15 +568,19 @@ def _run_switch(
                 run_adapters(
                     config,
                     dependencies,
-                    lambda: bool(_running_processes(config, dependencies)),
-                    adopt_current_sidebar=getattr(arguments, "adopt_current_sidebar", False),
-                    after_account_switch=getattr(arguments, "after_account_switch", False),
+                    running,
+                    names=("routines",) if layout_first else None,
+                    **sidebar_options,
                 )
             )
+            payload.update(layout_first)
             payload["progress"] = finish_progress(config, payload)
         finally:
             # Claude was closed for this switch. It reopens even when the sync
             # failed, so a failed sync never leaves Claude closed.
+            if _browser_logins_busy(browser_logins):
+                browser_logins = _settle_browser_logins(config, dependencies, (profile,))
+            _set_switch_guard(config, False)
             launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
         if launch_failed:
             _write(
@@ -504,6 +591,8 @@ def _run_switch(
             return 1
         if not arguments.no_launch:
             payload["launch"] = "started"
+        if browser_logins is not None and browser_logins["state"] != "disabled":
+            payload["browser_logins"] = browser_logins
         _write(payload, as_json=as_json, stream=output)
         return 0 if payload["progress"] == "finished" else 1
     finally:
@@ -900,6 +989,9 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         if running:
             return _report_waiting(arguments, config, output, "claude-open")
         record_progress(config, "syncing")
+        # Before the chat sync, while Claude is surely closed: a restore a
+        # switch missed comes back now, else the jar is saved.
+        browser_logins = _settle_browser_logins(config, deps, config.profiles)
         try:
             payload = _chat_payload(arguments, config, deps)
         except Exception as error:
@@ -914,6 +1006,10 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
                 adopt_source_scope=getattr(arguments, "adopt_source_scope", None),
             )
         )
+        if _browser_logins_busy(browser_logins):
+            browser_logins = _settle_browser_logins(config, deps, config.profiles)
+        if browser_logins["state"] != "disabled":
+            payload["browser_logins"] = browser_logins
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
         return _exit_code(arguments, payload["progress"])
@@ -1002,6 +1098,7 @@ def run(
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
+                sync_browser_logins=arguments.sync_browser_logins,
             )
             ask = None
             if arguments.ask_main_account and arguments.apply:
@@ -1036,6 +1133,7 @@ def run(
                 automatic_targets=arguments.automatic_targets,
                 sync_layout=arguments.sync_layout,
                 sync_routines=arguments.sync_routines,
+                sync_browser_logins=arguments.sync_browser_logins,
                 apply=arguments.apply,
             )
             _write(payload, as_json=False, stream=output)
@@ -1128,6 +1226,16 @@ def run(
                 stream=output,
             )
             return 0
+        if arguments.command == "browser-logins":
+            from .browser_logins import run_browser_logins
+
+            payload = run_browser_logins(
+                config,
+                lambda: bool(_running_processes(config, deps)),
+                arguments.action,
+            )
+            _write(payload, as_json=arguments.as_json, stream=output)
+            return 0 if payload["state"] in ("done", "disabled") else 1
         if arguments.command == "status":
             running = _running_processes(config, deps)
             watcher_error = watcher_failure(config.state_dir)

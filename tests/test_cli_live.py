@@ -12,6 +12,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from claude_session_sync.chat_state import load_state, state_path
 from claude_session_sync.cli import CliDependencies, run
@@ -943,6 +944,211 @@ class SwitchTests(ChatCliFixture):
         self.assertEqual(1, code)
         self.assertIn("disk full", errors)
         self.assertTrue(self.launched(launches))
+
+
+class SwitchSidebarFirstTests(ChatCliFixture):
+    """A switch copies the per-account sidebar before the chat sync.
+
+    Live case, 20-10-2026: Claude was opened again 20 seconds into a switch's
+    chat sync. The chat sync stopped, the sidebar step was deferred, and the
+    new account kept its old server sidebar, with every section's Group by,
+    Sort by and Show back to that account's old values.
+    """
+
+    A_SCOPE = "{}/{}".format(A_ACCOUNT, A_ORG)
+    B_SCOPE = "{}/{}".format(B_ACCOUNT, B_ORG)
+
+    @staticmethod
+    def slot(group_by, sort_by):
+        sections = [{"id": "pinned", "kind": "pinned", "v": 2, "name": "", "order": 0,
+                     "sortBy": sort_by, "ascending": False}]
+        for order, name in enumerate(("Popcorn", "Clients"), start=1):
+            sections.append({
+                "id": "cg-" + name.lower(), "kind": "manual", "v": 2, "name": name,
+                "order": order, "members": ["code:local_" + name.lower()],
+                "groupBy": group_by, "sortBy": sort_by, "ascending": False,
+                "show": {"metadata": False, "emptyGroups": group_by == "none", "sideChats": False},
+            })
+        sections.append({"id": "sessions", "kind": "sessions", "v": 2, "name": "", "order": 3,
+                         "groupBy": group_by, "sortBy": sort_by, "ascending": False})
+        return {"sections": sections, "migratedFrom": 1, "prefsSeeded": True}
+
+    def setUp(self):
+        super().setUp()
+        from claude_session_sync import layout
+
+        self.layout = layout
+        self.config = replace(self.config, sync_sidebar_layout=True)
+        (self.data_root / "Local Storage" / "leveldb").mkdir(parents=True)
+        self.helper = self.root / "layoutdb"
+        self.helper.write_bytes(b"placeholder")
+        os.chmod(self.helper, 0o700)
+        # The account just left: no grouping. The signed-in account's own server copy: by date.
+        self.main_slot = self.slot("none", "created")
+        self.server_slot = self.slot("date", "recency")
+        state = {
+            "codeSidebarByScope": {self.A_SCOPE: self.main_slot, self.B_SCOPE: self.server_slot},
+            "customGroupsByScope": {},
+            "lastSidebarScopeKey": self.B_SCOPE,
+            "pinnedOrder": [],
+        }
+        self.records = {
+            layout.DFRAME_STORE_KEY: b"\x01" + json.dumps(
+                {"state": state, "version": 1}, separators=(",", ":")
+            ).encode("ascii"),
+            layout.SYNC_OWNER_KEY: b"\x01" + B_ACCOUNT.encode("ascii"),
+            layout.SYNC_ACTIVE_KEY: b"\x011",
+        }
+        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.state_dir / "sidebar-main-0.json").write_text(
+            json.dumps({"version": 1, "main_scope": self.A_SCOPE}), encoding="utf-8"
+        )
+        records = self.records
+
+        class FakeDatabase:
+            def __init__(self, helper, database):
+                self.database = Path(database)
+
+            def get(self, key):
+                return records[key]
+
+            def get_optional(self, key):
+                return records.get(key)
+
+            def write(self, changes, state_dir):
+                for key, value in changes.items():
+                    if value is None:
+                        records.pop(key, None)
+                    else:
+                        records[key] = value
+
+        patcher = mock.patch.object(layout, "LevelDatabase", FakeDatabase)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def synchronizer(self, _config):
+        return self.layout.LayoutSynchronizer(
+            self.config, helper=self.helper, process_probe=lambda: self.running
+        )
+
+    def signed_in_slot(self):
+        state = json.loads(self.records[self.layout.DFRAME_STORE_KEY][1:].decode("ascii"))["state"]
+        return state["codeSidebarByScope"][self.B_SCOPE]
+
+    def reopening_planner(self, _config):
+        # Claude is opened again once the chat sync has started.
+        self.running = True
+        return Planner(app_log=self.app_log)
+
+    def test_claude_reopening_during_the_chat_sync_no_longer_skips_the_sidebar_copy(self):
+        self.write(self.a, X)
+        launches = []
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        code, out, _errors = self.cli(
+            "switch", "Work", "--after-account-switch", "--json",
+            planner_factory=self.reopening_planner,
+            layout_factory=self.synchronizer,
+            launcher=FakeLauncher(launches),
+            monotonic=lambda: clock[0],
+            sleeper=sleep,
+        )
+
+        payload = json.loads(out)
+        self.assertEqual(self.main_slot["sections"], self.signed_in_slot()["sections"])
+        self.assertEqual(
+            b"\x01" + self.B_SCOPE.encode("ascii"), self.records[self.layout.GROUP_UPLOAD_KEY]
+        )
+        self.assertEqual(
+            ("per-account", "claude-uploads-copy-on-next-start"),
+            (payload["layout"]["state"], payload["layout"]["reason"]),
+        )
+        # The chat sync still stops for the open Claude, as before.
+        self.assertEqual(("failed", "claude-open"), (payload["state"], payload["reason"]))
+        self.assertEqual(1, code)
+        self.assertEqual([("launch", ("open",))], launches)
+
+    def test_a_switch_waits_for_another_writer_before_the_sidebar_copy(self):
+        from claude_session_sync.locking import ExclusiveFileLock
+
+        self.write(self.a, X)
+        writer = ExclusiveFileLock(self.config.state_dir / "transaction.lock").acquire()
+        self.addCleanup(writer.release)
+
+        code, out, errors = self.cli(
+            "switch", "Work", "--after-account-switch", "--json",
+            engine_factory=self.engine(lock_timeout=0),
+            layout_factory=self.synchronizer,
+            launcher=FakeLauncher([]),
+            sleeper=lambda _seconds: writer.release(),
+        )
+
+        payload = json.loads(out)
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual(("committed", "finished"), (payload["state"], payload["progress"]))
+        self.assertEqual("claude-uploads-copy-on-next-start", payload["layout"]["reason"])
+        self.assertEqual(self.main_slot["sections"], self.signed_in_slot()["sections"])
+
+    def test_a_put_off_first_attempt_leaves_the_sidebar_status_as_it_was(self):
+        from claude_session_sync.locking import ExclusiveFileLock
+
+        status = self.config.state_dir / "sidebar-layout-status.json"
+        status.write_text('{"state": "per-account"}\n', encoding="utf-8")
+        writer = ExclusiveFileLock(self.config.state_dir / "transaction.lock").acquire()
+        self.addCleanup(writer.release)
+
+        def sleep(_seconds):
+            # The other writer finishes, and Claude is opened again meanwhile.
+            writer.release()
+            self.running = True
+
+        self.write(self.a, X)
+        code, out, _errors = self.cli(
+            "switch", "Work", "--after-account-switch", "--json",
+            engine_factory=self.engine(lock_timeout=0),
+            layout_factory=self.synchronizer,
+            launcher=FakeLauncher([]),
+            sleeper=sleep,
+        )
+
+        self.assertEqual(1, code)
+        self.assertEqual({"state": "deferred", "reason": "app-running"}, json.loads(out)["layout"])
+        self.assertEqual('{"state": "per-account"}\n', status.read_text(encoding="utf-8"))
+        self.assertEqual(self.server_slot["sections"], self.signed_in_slot()["sections"])
+
+    def test_the_sidebar_step_runs_after_chats_unless_claude_keeps_it_per_account(self):
+        from test_cli import FakeLayoutReceipt
+
+        for per_account, expected in ((True, ["layout", "chats"]), (False, ["chats", "layout"]),
+                                      (None, ["chats", "layout"])):
+            with self.subTest(per_account=per_account):
+                events = []
+
+                class RecordingLayout:
+                    def sync(self, **_options):
+                        events.append("layout")
+                        return FakeLayoutReceipt()
+
+                if per_account is not None:
+                    RecordingLayout.keeps_sidebar_per_account = lambda _self, value=per_account: value
+
+                def planner(_config):
+                    events.append("chats")
+                    return Planner(app_log=self.app_log)
+
+                code, out, errors = self.cli(
+                    "switch", "Work", "--after-account-switch", "--json",
+                    planner_factory=planner,
+                    layout_factory=lambda _config: RecordingLayout(),
+                    launcher=FakeLauncher([]),
+                )
+
+                self.assertEqual((0, ""), (code, errors))
+                self.assertEqual(expected, events)
+                self.assertEqual("synced", json.loads(out)["layout"]["state"])
 
 
 class AdapterBesideChatTests(ChatCliFixture):
