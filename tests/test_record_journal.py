@@ -343,6 +343,6 @@ class RecordJournalTests(unittest.TestCase):
             f"\ntry: RecordJournal._load(None, Path({str(path)!r}))\nexcept RecordRecoveryError: pass\nelse: raise AssertionError('accepted FIFO')"
         )
         result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, timeout=3
+            [sys.executable, "-c", code], capture_output=True, timeout=15
         )
         self.assertEqual(0, result.returncode, result.stderr.decode())

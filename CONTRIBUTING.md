@@ -22,7 +22,7 @@ ruff check .
 ruff format --check .
 ```
 
-CI runs the same checks on Python 3.9, 3.12 and 3.13. The [technical reference](docs/technical-reference.md#development) has the opt-in installer tests and a live test with Claude closed.
+CI runs the same checks on Python 3.9, 3.12 and 3.13. The wall-clock benchmark runs only with `RUN_PERFORMANCE_TESTS=1`, on an idle Mac. The [technical reference](docs/technical-reference.md#development) has the opt-in installer tests and a live test with Claude closed.
 
 ## Rules for a pull request
 

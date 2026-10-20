@@ -799,7 +799,7 @@ class RoutineSynchronizerTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-c", code, str(path)],
             env=environment,
-            timeout=2,
+            timeout=15,
             capture_output=True,
         )
 

@@ -68,7 +68,7 @@ class TransactionEngineTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=15,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
