@@ -282,6 +282,15 @@ finish, then plans again and syncs. A separate handoff lock stops two switches
 at once from both launching Claude. The wait uses a wall-clock deadline and a
 bounded process probe, so slow process inspection cannot extend the limit.
 `switch` launches Claude after the sync, even when the sync failed.
+
+While `switch` syncs it keeps a `switch-guard` file in the state directory and
+removes it just before it launches Claude. A Claude opened during that time,
+for example by a sign-in page handing back to Claude, stops the chat sync
+before any write. The watcher sees the guard during a switch restart and asks
+that Claude to quit again, retrying every 1.5 seconds for 30 seconds while it
+starts up. `switch` then waits up to 45 seconds for it to close and syncs
+again, at most twice. A Claude that stays open ends the switch as before, and
+the next quit syncs.
 `auto` is intended for the watcher. While Claude is open it writes nothing and
 returns success with `state=waiting` and `reason=claude-open`. If Claude opens
 again after the chats synced but before pins, groups, or routines did, those

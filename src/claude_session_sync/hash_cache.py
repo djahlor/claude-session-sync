@@ -3,7 +3,7 @@
 import os
 import sqlite3
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from .filesystem import ensure_private_directory
 
@@ -62,6 +62,24 @@ class HashCache:
             """
         )
         self._connection.commit()
+        # One read of the whole table, then lookups in memory. A query per
+        # file took about a millisecond on a loaded Mac: 32 seconds for 29,000
+        # chat files, while Claude waited closed for a switch (20-10-2026).
+        self._rows = None  # type: Optional[Dict[str, Tuple[Any, ...]]]
+
+    def _loaded(self) -> Dict[str, Tuple[Any, ...]]:
+        if self._rows is None:
+            self._rows = {
+                str(row[0]): ((row[1], row[2], row[3], row[4]),) + tuple(row[5:])
+                for row in self._connection.execute(
+                    """
+                    SELECT path, size, mtime_ns, ctime_ns, inode, session_id, normalisation,
+                           digest, state_hash, activity
+                    FROM file_hashes
+                    """
+                )
+            }
+        return self._rows
 
     def lookup_record(
         self,
@@ -72,18 +90,10 @@ class HashCache:
     ) -> Optional[Tuple[str, str, int]]:
         """Return (digest, state hash, activity) cached for these exact file metadata."""
 
-        size, mtime_ns, ctime_ns, inode = _signature(stat_result)
-        row = self._connection.execute(
-            """
-            SELECT digest, state_hash, activity FROM file_hashes
-            WHERE path = ? AND size = ? AND mtime_ns = ? AND ctime_ns = ? AND inode = ?
-              AND session_id = ? AND normalisation = ?
-            """,
-            (str(path), size, mtime_ns, ctime_ns, inode, session_id, normalisation),
-        ).fetchone()
-        if row is None:
+        row = self._loaded().get(str(path))
+        if row is None or row[:3] != (_signature(stat_result), session_id, normalisation):
             return None
-        return str(row[0]), str(row[1]), int(row[2])
+        return str(row[3]), str(row[4]), int(row[5])
 
     def store_record(
         self,
@@ -119,6 +129,11 @@ class HashCache:
                 state_hash, activity, normalisation,
             ),
         )
+        if self._rows is not None:
+            self._rows[str(path)] = (
+                (size, mtime_ns, ctime_ns, inode), session_id, normalisation,
+                digest, state_hash, activity,
+            )
 
     def close(self) -> None:
         try:

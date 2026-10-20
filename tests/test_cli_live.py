@@ -1022,12 +1022,18 @@ class SwitchSidebarFirstTests(ChatCliFixture):
     def test_claude_reopening_during_the_chat_sync_no_longer_skips_the_sidebar_copy(self):
         self.write(self.a, X)
         launches = []
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
 
         code, out, _errors = self.cli(
             "switch", "Work", "--after-account-switch", "--json",
             planner_factory=self.reopening_planner,
             layout_factory=self.synchronizer,
             launcher=FakeLauncher(launches),
+            monotonic=lambda: clock[0],
+            sleeper=sleep,
         )
 
         payload = json.loads(out)

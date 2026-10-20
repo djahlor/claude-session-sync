@@ -38,6 +38,10 @@ RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
 SWITCH_WRITER_WAIT_SECONDS = 15.0
+# While this file exists the Sync helper quits a Claude opened mid-switch.
+SWITCH_GUARD_NAME = "switch-guard"
+SWITCH_REOPEN_WAIT_SECONDS = 45.0
+SWITCH_REOPEN_RETRIES = 2
 
 
 def _default_planner_factory(_config: Config) -> Any:
@@ -428,15 +432,40 @@ def _wait_for_managed_processes_to_exit(
 
 def _switch_chat_result(config: Config, dependencies: CliDependencies) -> dict:
     writer_deadline = dependencies.monotonic() + SWITCH_WRITER_WAIT_SECONDS
+    reopened = 0
     while True:
         try:
             return _chat_payload(None, config, dependencies)
         except Exception as error:
             remaining = writer_deadline - dependencies.monotonic()
-            if _busy_reason(error) == "busy" and remaining > 0:
+            reason = _busy_reason(error)
+            if reason == "busy" and remaining > 0:
                 dependencies.sleeper(min(PROCESS_EXIT_POLL_SECONDS, remaining))
                 continue
+            if reason == "claude-open" and reopened < SWITCH_REOPEN_RETRIES:
+                # Claude was opened during the sync. The Sync helper asks it
+                # to quit again; once it is gone the sync runs once more.
+                reopened += 1
+                if _wait_for_managed_processes_to_exit(
+                    config, dependencies, SWITCH_REOPEN_WAIT_SECONDS
+                ):
+                    continue
             return _chat_failure(error)
+
+
+def _set_switch_guard(config: Config, on: bool) -> None:
+    from .filesystem import atomic_write_bytes, ensure_private_directory
+
+    guard = config.state_dir / SWITCH_GUARD_NAME
+    try:
+        if on:
+            ensure_private_directory(config.state_dir)
+            atomic_write_bytes(guard, b"switch\n")
+            os.chmod(str(guard), 0o600)
+        elif os.path.lexists(str(guard)):
+            os.unlink(str(guard))
+    except OSError:
+        pass  # without the guard a reopened Claude only stops this sync, as before
 
 
 def _run_switch(
@@ -477,6 +506,7 @@ def _run_switch(
             )
             return 1
         record_progress(config, "syncing")
+        _set_switch_guard(config, True)
         # The account change just cleared the built-in browser. Its logins go
         # back first, in the second after Claude quits, because a jar is only
         # put back while Claude is closed and Claude can be opened again during
@@ -511,6 +541,7 @@ def _run_switch(
             # failed, so a failed sync never leaves Claude closed.
             if _browser_logins_busy(browser_logins):
                 browser_logins = _settle_browser_logins(config, dependencies, (profile,))
+            _set_switch_guard(config, False)
             launch_failed = not arguments.no_launch and not _launch(profile, dependencies)
         if launch_failed:
             _write(

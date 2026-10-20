@@ -6,6 +6,13 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-20
+
+### Fixed
+
+- A switch could end without syncing chats. When Claude was opened again during the switch, the chat sync stopped and waited for the next quit, which could be a day away. During a switch the background helper now asks a Claude that opens to quit again, and the switch syncs once it is closed. Claude reopens by itself when the sync is done.
+- Chat syncs were slow on a busy Mac: 92 seconds to check 29,000 chat files on 20-10-2026. The hash cache is now read in one query, and file details are read in parallel. The same check took 12 seconds on the same busy Mac.
+
 ## [0.6.2] - 2026-10-20
 
 ### Fixed

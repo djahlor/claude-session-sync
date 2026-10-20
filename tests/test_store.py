@@ -267,5 +267,63 @@ class HashCacheTests(unittest.TestCase):
             self.assertNotEqual("stale", replica.state_hash)
 
 
+class FastScanTests(unittest.TestCase):
+    """A loaded Mac made one query and one lstat per chat cost a millisecond each."""
+
+    def test_a_warm_cache_is_read_from_the_database_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_tests = StoreTests()
+            config = store_tests.config(root)
+            for name in ("one", "two", "three"):
+                written = store_tests.write_session(root / "standard", "account", "workspace", name)
+                os.utime(written, ns=(1_000_000_000, 1_000_000_000))
+            with HashCache(root / "state" / "hashes.sqlite3") as cache:
+                first = SessionStore(cache).discover(config)
+            cache = HashCache(root / "state" / "hashes.sqlite3")
+            queries = []
+            cache._connection.set_trace_callback(queries.append)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("cache miss")):
+                second = SessionStore(cache).discover(config)
+            cache.close()
+
+            self.assertEqual(first.replicas, second.replicas)
+            self.assertEqual(1, sum("SELECT" in query for query in queries))
+
+    def test_a_record_stored_in_this_pass_is_found_and_a_changed_file_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "local_a.json"
+            path.write_text("{}")
+            before = path.lstat()
+            with HashCache(root / "hashes.sqlite3") as cache:
+                self.assertIsNone(cache.lookup_record(path, before, "a", "n1"))
+                cache.store_record(path, before, "a", "digest", "state", 7, "n1")
+                self.assertEqual(("digest", "state", 7), cache.lookup_record(path, before, "a", "n1"))
+                self.assertIsNone(cache.lookup_record(path, before, "b", "n1"))
+                self.assertIsNone(cache.lookup_record(path, before, "a", "n2"))
+                path.write_text("{ }")
+                self.assertIsNone(cache.lookup_record(path, path.lstat(), "a", "n1"))
+
+    def test_parallel_lstat_keeps_order_and_errors(self) -> None:
+        from claude_session_sync.store import _lstat_all
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for index in range(40):
+                path = root / "f{}".format(index)
+                if index % 7:
+                    path.write_bytes(b"x" * index)
+                paths.append(path)
+            results = _lstat_all(paths)
+
+            for index, result in enumerate(results):
+                if index % 7:
+                    self.assertEqual(index, result.st_size)
+                else:
+                    self.assertIsInstance(result, FileNotFoundError)
+
+
 if __name__ == "__main__":
     unittest.main()

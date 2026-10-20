@@ -5,8 +5,9 @@ import os
 import re
 import stat
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from .config import Config
 from .fingerprint import fingerprint, normalisation
@@ -23,6 +24,24 @@ MARKER_NAME = re.compile(r"^deleted_(%s)$" % SESSION_ID)
 # is never trusted to match its cache entry.
 RACY_WINDOW_NS = 2_000_000_000
 MAX_MARKER_BYTES = 64
+# Metadata reads waiting on a busy disk overlap. On a loaded Mac one read took
+# about 1.5 ms, 45 seconds for 29,000 chat files one after another.
+STAT_WORKERS = 16
+
+
+def _lstat_all(paths: Sequence[Path]) -> List[Union[os.stat_result, OSError]]:
+    """Each path's lstat, or the error it raised, in order."""
+
+    def one(path: Path) -> Union[os.stat_result, OSError]:
+        try:
+            return path.lstat()
+        except OSError as error:
+            return error
+
+    if len(paths) < 2:
+        return [one(path) for path in paths]
+    with ThreadPoolExecutor(max_workers=min(STAT_WORKERS, len(paths))) as pool:
+        return list(pool.map(one, paths))
 
 
 def _stat_signature(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
@@ -175,6 +194,7 @@ class SessionStore:
             )
             return
         started_ns = self._clock_ns()
+        wanted = []
         for entry in entries:
             path = Path(entry.path)
             record = RECORD_NAME.match(entry.name)
@@ -185,12 +205,13 @@ class SessionStore:
             if entry.is_symlink():
                 invalid.append(InvalidReplica(path, "symlink is not allowed"))
                 continue
-            try:
-                before = path.lstat()
-            except FileNotFoundError:
+            wanted.append((path, record, tmp, marker))
+        inspected = _lstat_all([path for path, _record, _tmp, _marker in wanted])
+        for (path, record, tmp, marker), before in zip(wanted, inspected):
+            if isinstance(before, FileNotFoundError):
                 continue  # Claude renamed or removed it under the scan
-            except OSError as error:
-                invalid.append(InvalidReplica(path, "cannot inspect: {}".format(error)))
+            if isinstance(before, OSError):
+                invalid.append(InvalidReplica(path, "cannot inspect: {}".format(before)))
                 continue
             if not stat.S_ISREG(before.st_mode):
                 invalid.append(InvalidReplica(path, "replica is not a regular file"))

@@ -274,6 +274,11 @@ class SwitchRestoresBeforeLaunchTests(unittest.TestCase):
                 def running(self, **_kwargs):
                     return ("claude",) if claude_open else ()
 
+            clock = [0.0]
+
+            def sleep(seconds):
+                clock[0] += seconds
+
             out = io.StringIO()
             run(
                 ["--config", str(root / "config.json"), "switch", "Work", "--json"],
@@ -282,6 +287,8 @@ class SwitchRestoresBeforeLaunchTests(unittest.TestCase):
                     planner_factory=reopen_during_chat_sync,
                     process_probe=Probe(),
                     launcher=type("Launcher", (), {"launch": lambda self, command: None})(),
+                    monotonic=lambda: clock[0],
+                    sleeper=sleep,
                 ),
                 stdout=out,
                 stderr=io.StringIO(),

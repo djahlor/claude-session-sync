@@ -80,6 +80,8 @@ private final class SessionSyncWatcher: NSObject {
   private let profile: String?
   private let restartURL: URL
   private let restartRequestURL: URL
+  // The sync tool keeps this file while a switch syncs with Claude closed.
+  private let switchGuardURL: URL
   private var accountHash: String?
   private var candidateHash: String?
   private var candidateSince: Date?
@@ -114,6 +116,7 @@ private final class SessionSyncWatcher: NSObject {
     let directory = statusURL.deletingLastPathComponent()
     self.restartURL = directory.appendingPathComponent("account-restart.json")
     self.restartRequestURL = directory.appendingPathComponent("restart-request")
+    self.switchGuardURL = directory.appendingPathComponent("switch-guard")
     self.importsURL = accountURL?.deletingLastPathComponent().appendingPathComponent("chrome-import-sites.json")
     super.init()
     if accountURL != nil {
@@ -667,6 +670,40 @@ private final class SessionSyncWatcher: NSObject {
     } catch { NSLog("claude-session-sync watcher could not persist status") }
   }
 
+  // A switch syncs chats with Claude closed. Claude opened again during that
+  // sync, by a sign-in page handing back to Claude or a click, stopped it on
+  // 20-10-2026. It is asked to quit again and reopens when the sync is done.
+  @objc func applicationLaunched(_ notification: Notification) {
+    guard
+      let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+        as? NSRunningApplication,
+      application.executableURL?.standardizedFileURL.path == claudeExecutable
+        || application.bundleIdentifier == "com.anthropic.claudefordesktop"
+    else { return }
+    queue.async { [weak self] in
+      guard let self = self, self.switchSyncing() else { return }
+      self.notify("Finishing the sync first. Claude reopens by itself.")
+      self.quitDuringSwitch(application, attempt: 1)
+    }
+  }
+
+  private func switchSyncing() -> Bool {
+    restartRequested && restartPhase == "syncing"
+      && FileManager.default.fileExists(atPath: switchGuardURL.path)
+  }
+
+  // A Claude still starting up can refuse a quit, so it is asked again.
+  private func quitDuringSwitch(_ application: NSRunningApplication, attempt: Int) {
+    guard attempt <= 20, switchSyncing() else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard !application.isTerminated else { return }
+      _ = application.terminate()
+      self?.queue.asyncAfter(deadline: .now() + 1.5) {
+        self?.quitDuringSwitch(application, attempt: attempt + 1)
+      }
+    }
+  }
+
   @objc func applicationTerminated(_ notification: Notification) {
     guard
       let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
@@ -732,6 +769,10 @@ private let watcher = SessionSyncWatcher(
 NSWorkspace.shared.notificationCenter.addObserver(
   watcher, selector: #selector(SessionSyncWatcher.applicationTerminated(_:)),
   name: NSWorkspace.didTerminateApplicationNotification, object: nil
+)
+NSWorkspace.shared.notificationCenter.addObserver(
+  watcher, selector: #selector(SessionSyncWatcher.applicationLaunched(_:)),
+  name: NSWorkspace.didLaunchApplicationNotification, object: nil
 )
 watcher.requestAuto()
 application.run()
