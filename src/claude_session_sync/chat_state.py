@@ -3,13 +3,12 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Union
 
 from . import strict_json as json
 from .chat_model import SyncState
 from .filesystem import atomic_write_bytes, ensure_private_directory
 from .fingerprint import normalisation
-
 
 STATE_FILENAME = "chat-state.json"
 STATE_VERSION = 2
@@ -26,9 +25,9 @@ class StateUnusable(RuntimeError):
 class ChatState:
     sync: SyncState = field(default_factory=SyncState)
     # data root -> account -> its first login this Mac recorded, in epoch ms
-    logins: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    logins: dict[str, dict[str, int]] = field(default_factory=dict)
     # partition keys that joined because Claude wrote a chat there after a login
-    enrolled: List[str] = field(default_factory=list)
+    enrolled: list[str] = field(default_factory=list)
     last_success_ms: int = 0
 
 
@@ -49,15 +48,18 @@ def load_state(path: PathLike) -> ChatState:
     except StateUnusable:
         raise
     except (OSError, UnicodeError, ValueError) as error:
-        raise StateUnusable("chat state cannot be read: {}".format(error)) from error
+        raise StateUnusable(f"chat state cannot be read: {error}") from error
     try:
         return _decode(document)
     except (KeyError, TypeError, ValueError) as error:
-        raise StateUnusable("chat state has an unknown shape: {}".format(error)) from error
+        raise StateUnusable(f"chat state has an unknown shape: {error}") from error
 
 
 def _decode(document: Any) -> ChatState:
-    if not isinstance(document, dict) or document.get("version") not in (1, STATE_VERSION):
+    if not isinstance(document, dict) or document.get("version") not in (
+        1,
+        STATE_VERSION,
+    ):
         raise ValueError("unsupported version")
     # Version 1 kept one agreed version for all folders, which cannot say which
     # folders took part. Its hashes are dropped; what was seen is kept.
@@ -99,7 +101,7 @@ def _decode(document: Any) -> ChatState:
     )
 
 
-def encode_state(state: ChatState) -> Dict[str, Any]:
+def encode_state(state: ChatState) -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "normalisation": normalisation(),
@@ -129,13 +131,13 @@ def save_state(path: PathLike, state: ChatState) -> None:
     os.chmod(str(file_path), 0o600)
 
 
-def _mapping(value: Any) -> Dict[Any, Any]:
+def _mapping(value: Any) -> dict[Any, Any]:
     if not isinstance(value, dict):
         raise TypeError("expected an object")
     return value
 
 
-def _list(value: Any) -> List[Any]:
+def _list(value: Any) -> list[Any]:
     if not isinstance(value, list):
         raise TypeError("expected an array")
     return value
@@ -153,5 +155,5 @@ def _integer(value: Any) -> int:
     return value
 
 
-def _string_map(value: Any) -> Dict[str, str]:
+def _string_map(value: Any) -> dict[str, str]:
     return {_string(key): _string(item) for key, item in _mapping(value).items()}

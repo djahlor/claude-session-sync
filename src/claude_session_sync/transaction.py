@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Union
 
 from .filesystem import (
     UnsafePathError,
@@ -27,7 +28,6 @@ from .journal import (
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .model import RecoveryReceipt, RunReceipt
-
 
 PathLike = Union[str, os.PathLike]
 FaultInjector = Callable[[str, str], None]
@@ -64,9 +64,9 @@ class RecoveryError(TransactionError):
         self,
         message: str,
         *,
-        transaction_error: Optional[BaseException] = None,
-        recovery_error: Optional[BaseException] = None,
-        persistence_error: Optional[BaseException] = None,
+        transaction_error: BaseException | None = None,
+        recovery_error: BaseException | None = None,
+        persistence_error: BaseException | None = None,
     ) -> None:
         super().__init__(message)
         self.transaction_error = transaction_error
@@ -93,8 +93,8 @@ class TransactionEngine:
         *,
         lock_mode: str = "auto",
         lock_timeout: float = 5.0,
-        fault_injector: Optional[FaultInjector] = None,
-        retention: Optional[int] = None,
+        fault_injector: FaultInjector | None = None,
+        retention: int | None = None,
     ) -> None:
         if retention is not None and retention < 1:
             raise ValueError("retention must be at least one run")
@@ -113,7 +113,7 @@ class TransactionEngine:
         """
 
         if plan.invalid_replicas:
-            raise PlanBlockedError("plan {} has invalid replicas".format(plan.plan_id))
+            raise PlanBlockedError(f"plan {plan.plan_id} has invalid replicas")
         with self._writer_lock():
             try:
                 pending = pending_recovery_runs(self.state_root)
@@ -123,7 +123,7 @@ class TransactionEngine:
                 ) from error
             if pending:
                 raise RecoveryPendingError(
-                    "{} run(s) require recovery before apply".format(len(pending))
+                    f"{len(pending)} run(s) require recovery before apply"
                 )
             receipt = self._apply_locked(plan)
             if self.retention is not None and receipt.status == "committed":
@@ -164,7 +164,7 @@ class TransactionEngine:
             closed = self._finish_interrupted_runs(pending)
             if closed < len(pending):
                 raise RecoveryPendingError(
-                    "{} run(s) require recovery before apply".format(len(pending) - closed)
+                    f"{len(pending) - closed} run(s) require recovery before apply"
                 )
             return closed
 
@@ -192,9 +192,9 @@ class TransactionEngine:
             return self._noop_receipt(plan.plan_id)
 
         run_id = uuid.uuid4().hex
-        journal: Optional[RunJournal] = None
-        staged: Dict[int, Path] = {}
-        applied: List[Dict[str, Any]] = []
+        journal: RunJournal | None = None
+        staged: dict[int, Path] = {}
+        applied: list[dict[str, Any]] = []
         try:
             journal = RunJournal.create(
                 self.state_root, plan.plan_id, records, run_id=run_id
@@ -202,7 +202,7 @@ class TransactionEngine:
             self._inject("JOURNALING", run_id)
 
             self._transition(journal, "STAGING")
-            staged_identities = []  # type: List[Dict[str, int]]
+            staged_identities: list[dict[str, int]] = []
             for record in journal.records:
                 if record["kind"] == "retire":
                     continue
@@ -248,15 +248,13 @@ class TransactionEngine:
                 if record["kind"] == "retire":
                     if os.path.lexists(str(destination)):
                         raise RevalidationError(
-                            "retired file is still present: {}".format(destination)
+                            f"retired file is still present: {destination}"
                         )
                     continue
                 actual = self._digest_existing(destination)
                 if actual != record["source_digest"]:
                     raise RevalidationError(
-                        "committed destination failed verification: {}".format(
-                            destination
-                        )
+                        f"committed destination failed verification: {destination}"
                     )
             receipt = RunReceipt(
                 run_id=run_id,
@@ -264,9 +262,7 @@ class TransactionEngine:
                 plan_id=plan.plan_id,
                 operation_count=len(applied),
                 bytes_copied=sum(
-                    record["size"]
-                    for record in applied
-                    if record["kind"] != "retire"
+                    record["size"] for record in applied if record["kind"] != "retire"
                 ),
                 applied=tuple(
                     plan.operations[record["operation_index"]] for record in applied
@@ -291,22 +287,18 @@ class TransactionEngine:
             try:
                 self._rollback_locked(journal)
             except Exception as recovery_error:
-                persistence_error: Optional[BaseException] = None
+                persistence_error: BaseException | None = None
                 try:
                     journal.set_phase("RECOVERY_REQUIRED")
                 except Exception as phase_error:
                     persistence_error = phase_error
                 persistence_detail = (
-                    "; recovery state persistence also failed: {}".format(
-                        persistence_error
-                    )
+                    f"; recovery state persistence also failed: {persistence_error}"
                     if persistence_error is not None
                     else ""
                 )
                 raise RecoveryError(
-                    "transaction failed and rollback also failed: {}; {}{}".format(
-                        transaction_error, recovery_error, persistence_detail
-                    ),
+                    f"transaction failed and rollback also failed: {transaction_error}; {recovery_error}{persistence_detail}",
                     transaction_error=transaction_error,
                     recovery_error=recovery_error,
                     persistence_error=persistence_error,
@@ -319,21 +311,19 @@ class TransactionEngine:
                 except OSError:
                     pass
 
-    def _revalidate(self, operations: Iterable[Any]) -> List[Dict[str, Any]]:
-        records = []  # type: List[Dict[str, Any]]
+    def _revalidate(self, operations: Iterable[Any]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
         destinations = set()
         for operation_index, operation in enumerate(operations):
             kind = operation.kind
             if kind not in WRITE_KINDS + ("retire",):
-                raise RevalidationError(
-                    "unsupported operation kind: {}".format(kind)
-                )
+                raise RevalidationError(f"unsupported operation kind: {kind}")
             source = Path(operation.source)
             destination = Path(operation.destination)
             destination_key = os.path.abspath(str(destination))
             if destination_key in destinations:
                 raise RevalidationError(
-                    "plan contains duplicate destination: {}".format(destination)
+                    f"plan contains duplicate destination: {destination}"
                 )
             destinations.add(destination_key)
 
@@ -342,15 +332,13 @@ class TransactionEngine:
                 source_size = regular_file_size(source)
             except (OSError, UnsafePathError) as error:
                 raise RevalidationError(
-                    "cannot revalidate source {}: {}".format(source, error)
+                    f"cannot revalidate source {source}: {error}"
                 ) from error
             if (
                 source_digest != operation.source_digest
                 or source_size != operation.size
             ):
-                raise RevalidationError(
-                    "source no longer matches plan: {}".format(source)
-                )
+                raise RevalidationError(f"source no longer matches plan: {source}")
 
             destination_exists = os.path.lexists(str(destination))
             if destination_exists:
@@ -359,7 +347,7 @@ class TransactionEngine:
                     destination_size_before = regular_file_size(destination)
                 except (OSError, UnsafePathError) as error:
                     raise RevalidationError(
-                        "cannot size destination {}: {}".format(destination, error)
+                        f"cannot size destination {destination}: {error}"
                     ) from error
             else:
                 destination_digest = None
@@ -370,7 +358,7 @@ class TransactionEngine:
                 continue
             if destination_digest != planned_destination:
                 raise RevalidationError(
-                    "destination no longer matches plan: {}".format(destination)
+                    f"destination no longer matches plan: {destination}"
                 )
 
             records.append(
@@ -391,7 +379,7 @@ class TransactionEngine:
             )
         return records
 
-    def _finish_interrupted_runs(self, pending: List[str]) -> int:
+    def _finish_interrupted_runs(self, pending: list[str]) -> int:
         closed = 0
         for run_id in pending:
             try:
@@ -432,11 +420,11 @@ class TransactionEngine:
                 != record["destination_digest_before"]
             ):
                 raise RevalidationError(
-                    "destination changed before commit: {}".format(destination)
+                    f"destination changed before commit: {destination}"
                 )
         elif exists:
             raise RevalidationError(
-                "new destination appeared before commit: {}".format(destination)
+                f"new destination appeared before commit: {destination}"
             )
 
     def _rollback_locked(self, journal: RunJournal) -> RecoveryReceipt:
@@ -471,42 +459,41 @@ class TransactionEngine:
                         "preimage digest mismatch for {}".format(record["destination"])
                     )
 
-        actions: List[Tuple[str, Dict[str, Any]]] = []
+        actions: list[tuple[str, dict[str, Any]]] = []
         for record in records:
             destination = Path(record["destination"])
             exists = os.path.lexists(str(destination))
             # Journals from before steps had kinds hold only writes.
             if record.get("kind") == "retire":
                 if exists:
-                    if self._digest_existing(destination) != record["destination_digest_before"]:
+                    if (
+                        self._digest_existing(destination)
+                        != record["destination_digest_before"]
+                    ):
                         raise RecoveryError(
-                            "retired file came back changed: {}".format(destination)
+                            f"retired file came back changed: {destination}"
                         )
                     continue
                 if not (record["applied"] or record.get("retire_started")):
                     raise RecoveryError(
-                        "retired file was removed by someone else: {}".format(destination)
+                        f"retired file was removed by someone else: {destination}"
                     )
                 actions.append(("unretire", record))
             elif record["existed"]:
                 if not exists:
                     raise RecoveryError(
-                        "existing destination disappeared: {}".format(destination)
+                        f"existing destination disappeared: {destination}"
                     )
                 current_digest = self._digest_existing(destination)
                 if current_digest == record["destination_digest_before"]:
                     continue
                 if current_digest != record["source_digest"]:
                     raise RecoveryError(
-                        "destination changed after run; refusing restore: {}".format(
-                            destination
-                        )
+                        f"destination changed after run; refusing restore: {destination}"
                     )
                 if not self._record_was_applied(record, destination):
                     raise RecoveryError(
-                        "destination has planned bytes but was not applied by run: {}".format(
-                            destination
-                        )
+                        f"destination has planned bytes but was not applied by run: {destination}"
                     )
                 actions.append(("restore", record))
             else:
@@ -515,15 +502,11 @@ class TransactionEngine:
                 current_digest = self._digest_existing(destination)
                 if current_digest != record["source_digest"]:
                     raise RecoveryError(
-                        "new destination changed after run; refusing removal: {}".format(
-                            destination
-                        )
+                        f"new destination changed after run; refusing removal: {destination}"
                     )
                 if not self._record_was_applied(record, destination):
                     raise RecoveryError(
-                        "new destination was not applied by run; refusing removal: {}".format(
-                            destination
-                        )
+                        f"new destination was not applied by run; refusing removal: {destination}"
                     )
                 actions.append(("remove", record))
 
@@ -539,9 +522,7 @@ class TransactionEngine:
                 if action == "unretire":
                     if os.path.lexists(str(destination)):
                         raise RecoveryError(
-                            "retired file reappeared during rollback: {}".format(
-                                destination
-                            )
+                            f"retired file reappeared during rollback: {destination}"
                         )
                     atomic_copy(journal.preimage_path(record), destination)
                     restored += 1
@@ -551,7 +532,7 @@ class TransactionEngine:
                 current_digest = self._digest_existing(destination)
                 if current_digest != record["source_digest"]:
                     raise RecoveryError(
-                        "destination changed during rollback: {}".format(destination)
+                        f"destination changed during rollback: {destination}"
                     )
                 if action == "restore":
                     atomic_copy(journal.preimage_path(record), destination)
@@ -583,16 +564,14 @@ class TransactionEngine:
                 journal.set_phase("RECOVERY_REQUIRED")
             except Exception as persist_error:
                 raise RecoveryError(
-                    "rollback failed and recovery state could not be persisted: {}; {}".format(
-                        error, persist_error
-                    ),
+                    f"rollback failed and recovery state could not be persisted: {error}; {persist_error}",
                     recovery_error=error,
                     persistence_error=persist_error,
                 ) from error
             if isinstance(error, RecoveryError):
                 raise
             raise RecoveryError(
-                "rollback failed: {}".format(error), recovery_error=error
+                f"rollback failed: {error}", recovery_error=error
             ) from error
 
         return receipt
@@ -629,7 +608,7 @@ class TransactionEngine:
             return digest_file(path)
         except (OSError, UnsafePathError) as error:
             raise RevalidationError(
-                "cannot hash destination {}: {}".format(path, error)
+                f"cannot hash destination {path}: {error}"
             ) from error
 
     @staticmethod

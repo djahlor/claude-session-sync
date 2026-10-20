@@ -4,6 +4,7 @@ import fcntl
 import os
 import stat
 from datetime import datetime, timezone
+from typing import cast
 
 from .adapters import desktop_build, read_status, save_status
 
@@ -30,7 +31,8 @@ def finish_progress(config, payload: dict) -> str:
     adapters = [payload[key] for key in ("routines", "layout") if key in payload]
     outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
     attention = any(
-        value not in ("committed", "synced", "noop", "disabled", "deferred", "per-account")
+        value
+        not in ("committed", "synced", "noop", "disabled", "deferred", "per-account")
         for value in outcomes
     )
     attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
@@ -71,7 +73,9 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
     restart_phase = watcher.get("restart_phase")
     restart_active = False
     saved_timestamp = watcher.get("timestamp")
-    if restart_phase in ("checking", "quitting", "syncing") and isinstance(saved_timestamp, str):
+    if restart_phase in ("checking", "quitting", "syncing") and isinstance(
+        saved_timestamp, str
+    ):
         try:
             timestamp = datetime.fromisoformat(saved_timestamp.replace("Z", "+00:00"))
             age = (datetime.now(timezone.utc) - timestamp).total_seconds()
@@ -80,7 +84,11 @@ def current_progress(config, *, app_running: bool, failures: int = 0) -> dict:
             pass
     saved_state = payload.get("state")
     if restart_active and not failures:
-        state = {"checking": "checking-account", "quitting": "quitting-Claude", "syncing": "syncing"}[restart_phase]
+        state = {
+            "checking": "checking-account",
+            "quitting": "quitting-Claude",
+            "syncing": "syncing",
+        }[cast(str, restart_phase)]  # restart_active implies one of these
     elif saved_state == "syncing":
         try:
             state = "syncing" if _writer_active(config) else "needs-attention"

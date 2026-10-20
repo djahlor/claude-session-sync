@@ -4,9 +4,9 @@ import hashlib
 import json
 import tempfile
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable, Optional
 
 from claude_session_sync.transaction import RecoveryError, TransactionEngine
 
@@ -18,7 +18,7 @@ def digest(data: bytes) -> str:
 def operation(
     source: Path,
     destination: Path,
-    destination_before: Optional[bytes],
+    destination_before: bytes | None,
     session_id: str,
 ):
     source_bytes = source.read_bytes()

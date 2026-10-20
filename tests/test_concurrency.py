@@ -57,7 +57,7 @@ def _apply_worker(
     except TransactionBusyError:
         results.put("busy")
     except BaseException as error:
-        results.put("error:{}:{}".format(type(error).__name__, error))
+        results.put(f"error:{type(error).__name__}:{error}")
 
 
 class ConcurrencyTests(unittest.TestCase):

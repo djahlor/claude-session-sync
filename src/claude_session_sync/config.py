@@ -1,10 +1,11 @@
 """Strict configuration loading for explicitly selected Claude profiles."""
 
-from . import strict_json as json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Set, Tuple, Union
+from typing import Any, Union
 
+from . import strict_json as json
 from .model import Profile
 
 
@@ -21,13 +22,13 @@ class ApprovedTarget:
 
 @dataclass(frozen=True)
 class Config:
-    profiles: Tuple[Profile, ...]
+    profiles: tuple[Profile, ...]
     state_dir: Path
     retention: int
     acknowledge_cross_profile_copy: bool
     acknowledge_cross_account_copy: bool
     claude_executable: Path
-    approved_targets: Tuple[ApprovedTarget, ...] = ()
+    approved_targets: tuple[ApprovedTarget, ...] = ()
     target_policy: str = "approved-only"
     sync_sidebar_layout: bool = False
     sync_code_routines: bool = False
@@ -66,17 +67,17 @@ _TARGET_POLICIES = {"approved-only", "all-configured-profiles", "logins"}
 
 def _object(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
-        raise ConfigError("{} must be a JSON object".format(label))
+        raise ConfigError(f"{label} must be a JSON object")
     return value
 
 
-def _unknown_keys(value: Mapping[str, Any], allowed: Set[str], label: str) -> None:
+def _unknown_keys(value: Mapping[str, Any], allowed: set[str], label: str) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ConfigError("unknown {} keys: {}".format(label, ", ".join(unknown)))
 
 
-def _required(value: Mapping[str, Any], keys: Set[str], label: str) -> None:
+def _required(value: Mapping[str, Any], keys: set[str], label: str) -> None:
     missing = sorted(keys - set(value))
     if missing:
         raise ConfigError("missing {} keys: {}".format(label, ", ".join(missing)))
@@ -84,12 +85,12 @@ def _required(value: Mapping[str, Any], keys: Set[str], label: str) -> None:
 
 def _nonempty_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError("{} must be a non-empty string".format(label))
+        raise ConfigError(f"{label} must be a non-empty string")
     return value
 
 
-def _parse_profile(raw: Any, index: int) -> Tuple[Profile, bool]:
-    profile = _object(raw, "profile {}".format(index))
+def _parse_profile(raw: Any, index: int) -> tuple[Profile, bool]:
+    profile = _object(raw, f"profile {index}")
     _unknown_keys(profile, _PROFILE_KEYS, "profile")
     _required(
         profile,
@@ -119,7 +120,7 @@ def _parse_profile(raw: Any, index: int) -> Tuple[Profile, bool]:
 
 
 def _parse_approved_target(raw: Any, index: int) -> ApprovedTarget:
-    target = _object(raw, "approved target {}".format(index))
+    target = _object(raw, f"approved target {index}")
     _unknown_keys(target, _TARGET_KEYS, "approved target")
     _required(target, _TARGET_KEYS, "approved target")
     return ApprovedTarget(
@@ -134,9 +135,7 @@ def load_config(path: Union[str, Path]) -> Config:
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ConfigError(
-            "cannot load config {}: {}".format(config_path, error)
-        ) from error
+        raise ConfigError(f"cannot load config {config_path}: {error}") from error
 
     document = _object(raw, "config")
     _unknown_keys(document, _CONFIG_KEYS, "config")
@@ -207,10 +206,13 @@ def load_config(path: Union[str, Path]) -> Config:
                 ", ".join(sorted(_TARGET_POLICIES))
             )
         )
-    if target_policy in ("all-configured-profiles", "logins") and not account_acknowledgement:
+    if (
+        target_policy in ("all-configured-profiles", "logins")
+        and not account_acknowledgement
+    ):
         raise ConfigError(
             "acknowledge_cross_account_copy must be true when target_policy "
-            "is {}".format(target_policy)
+            f"is {target_policy}"
         )
 
     sync_sidebar_layout = document.get("sync_sidebar_layout", False)

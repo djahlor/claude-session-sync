@@ -1,7 +1,7 @@
 import subprocess
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
 from claude_session_sync.model import Profile
 from claude_session_sync.processes import (
@@ -75,11 +75,13 @@ class ProcessProbeTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])
             if command == ["ps", "-axo", "pid=,comm="]:
                 return subprocess.CompletedProcess(
-                    command, 0,
+                    command,
+                    0,
                     stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n",
                 )
             return subprocess.CompletedProcess(
-                command, 0,
+                command,
+                0,
                 stdout="301 /Applications/Claude.app/Contents/MacOS/Claude\n",
             )
 

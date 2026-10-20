@@ -4,11 +4,11 @@ import os
 import tempfile
 from pathlib import Path
 
-from .config import Config, load_config
 from . import strict_json as json
+from .config import Config, load_config
 
 
-def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) -> dict:
+def approve_current_targets(config_path: Path, config: Config, *, apply: bool) -> dict:
     from .filesystem import atomic_write_bytes, ensure_private_directory
     from .store import SessionStore
 
@@ -60,7 +60,7 @@ def _approve_current_targets(config_path: Path, config: Config, *, apply: bool) 
     }
 
 
-def _validate_config_data(encoded: bytes) -> Config:
+def validate_config_data(encoded: bytes) -> Config:
     descriptor, raw_path = tempfile.mkstemp(prefix="claude-session-sync-config-")
     path = Path(raw_path)
     try:
@@ -75,7 +75,7 @@ def _validate_config_data(encoded: bytes) -> Config:
             pass
 
 
-def _prepare_config_data(
+def prepare_config_data(
     source: bytes,
     *,
     automatic_targets: bool,
@@ -96,11 +96,11 @@ def _prepare_config_data(
         sync_browser_logins=sync_browser_logins,
     )
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    _validate_config_data(encoded)
+    validate_config_data(encoded)
     return encoded, _config_summary(document, changes)
 
 
-def _configure(
+def configure_file(
     config_path: Path,
     *,
     automatic_targets: bool,
@@ -112,7 +112,7 @@ def _configure(
     from .filesystem import atomic_write_bytes, ensure_private_directory
 
     load_config(config_path)
-    encoded, payload = _prepare_config_data(
+    encoded, payload = prepare_config_data(
         config_path.read_bytes(),
         automatic_targets=automatic_targets,
         sync_layout=sync_layout,
@@ -182,7 +182,9 @@ def _drop_personal_profile(document: dict) -> int:
     profiles = document.get("profiles")
     if not isinstance(profiles, list) or not any(personal(p, "name") for p in profiles):
         return 0
-    document["profiles"] = [profile for profile in profiles if not personal(profile, "name")]
+    document["profiles"] = [
+        profile for profile in profiles if not personal(profile, "name")
+    ]
     targets = document.get("approved_targets")
     if isinstance(targets, list):
         document["approved_targets"] = [

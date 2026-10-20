@@ -4,13 +4,16 @@ import os
 import shutil
 from pathlib import Path
 
-from .config import Config
 from .adapters import desktop_build, read_status, run_adapters
+from .config import Config
 
 
 def watcher_failure(state_dir: Path) -> int:
     status = read_status(state_dir, "watcher-status.json")
-    return int(status.get("state") not in ("ok", "unknown") or status.get("restart_phase") == "needs-attention")
+    return int(
+        status.get("state") not in ("ok", "unknown")
+        or status.get("restart_phase") == "needs-attention"
+    )
 
 
 def abandoned_preparation_count(state_dir: Path) -> int:
@@ -26,9 +29,11 @@ def _adapter_recovery_pending(config) -> int:
     count = 0
     # A per-account sidebar keeps its own journals, so old layout journals
     # stay on disk as history instead of blocking anything.
-    layout_active = config.sync_sidebar_layout and read_status(
-        config.state_dir, "sidebar-layout-status.json"
-    ).get("state") != "per-account"
+    layout_active = (
+        config.sync_sidebar_layout
+        and read_status(config.state_dir, "sidebar-layout-status.json").get("state")
+        != "per-account"
+    )
     for enabled, directory in (
         (config.sync_code_routines, "routine-runs"),
         (layout_active, "layout-runs"),
@@ -64,10 +69,15 @@ def doctor_summary(config: Config, dependencies, running) -> dict:
     # A record read whole that Claude would not accept. A save caught mid-read
     # (empty digest) is judged again next run and is not a fault.
     unreadable = sum(
-        1 for replica in discovery.replicas if replica.state_hash is None and replica.digest
+        1
+        for replica in discovery.replicas
+        if replica.state_hash is None and replica.digest
     )
     errors = (
-        len(found.invalid_replicas) + len(discovery.invalid_replicas) + unapproved + unreadable
+        len(found.invalid_replicas)
+        + len(discovery.invalid_replicas)
+        + unapproved
+        + unreadable
     )
     executable = config.claude_executable
     if not executable.is_file() or not os.access(str(executable), os.X_OK):

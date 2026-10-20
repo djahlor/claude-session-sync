@@ -6,7 +6,6 @@ import math
 from . import strict_json as json
 from .chat_model import Copy
 
-
 # Top-level keys Claude rewrites without any user action, or that describe the
 # account or machine that loaded the session rather than the chat itself:
 # - lastFocusedAt changes on every click.
@@ -48,7 +47,9 @@ def fingerprint(session_id: str, data: bytes) -> Copy:
     state = {key: value for key, value in record.items() if key not in VOLATILE_KEYS}
     # ASCII output: Claude cuts strings by UTF-16 code unit, so a record can hold
     # half a surrogate pair, which UTF-8 cannot encode.
-    canonical = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    canonical = json.dumps(
+        state, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return Copy(
         state_hash=hashlib.sha256(canonical.encode("ascii")).hexdigest(),
         last_activity_at=activity(record.get("lastActivityAt")),

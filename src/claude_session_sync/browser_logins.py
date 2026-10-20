@@ -20,16 +20,16 @@ import os
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable
 
 from . import strict_json as json
 from .config import Config
 from .filesystem import atomic_write_bytes, ensure_private_directory, read_bounded
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .model import Profile
-
 
 JAR_NAME = "launch-preview-cowork-shared"
 JAR_ID = "persist:" + JAR_NAME
@@ -50,8 +50,8 @@ def settle_import_prompt(path: Path) -> str:
     The file also holds MCP servers and other settings, so every other byte
     stays as Claude wrote it, and the edit is checked by parsing both versions.
     """
-    pending = '"{}": "pending"'.format(IMPORT_PROMPT).encode("utf-8")
-    done = '"{}": "done"'.format(IMPORT_PROMPT).encode("utf-8")
+    pending = f'"{IMPORT_PROMPT}": "pending"'.encode()
+    done = f'"{IMPORT_PROMPT}": "done"'.encode()
     try:
         raw = read_bounded(path, MAX_JSON_BYTES)
         document = json.loads(raw)
@@ -84,7 +84,9 @@ def _read_json(path: Path, limit: int = MAX_JSON_BYTES):
 
 
 def _write_json(path: Path, document) -> None:
-    atomic_write_bytes(path, (json.dumps(document, sort_keys=True) + "\n").encode("utf-8"))
+    atomic_write_bytes(
+        path, (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+    )
     os.chmod(path, 0o600)
 
 
@@ -93,7 +95,9 @@ def _cookie_count(path: Path) -> int:
     if path.is_symlink() or not path.is_file():
         return 0
     try:
-        with contextlib.closing(sqlite3.connect("file:{}?mode=ro".format(path), uri=True, timeout=3)) as db:
+        with contextlib.closing(
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+        ) as db:
             return int(db.execute("select count(*) from cookies").fetchone()[0])
     except sqlite3.Error:
         return 0
@@ -101,13 +105,15 @@ def _cookie_count(path: Path) -> int:
 
 def _integrity_ok(path: Path) -> bool:
     try:
-        with contextlib.closing(sqlite3.connect("file:{}?mode=ro".format(path), uri=True)) as db:
+        with contextlib.closing(
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        ) as db:
             return db.execute("pragma integrity_check").fetchone()[0] == "ok"
     except sqlite3.Error:
         return False
 
 
-def _newest_mtime(paths: List[Path]) -> float:
+def _newest_mtime(paths: list[Path]) -> float:
     newest = 0.0
     for root in paths:
         if root.is_file():
@@ -116,20 +122,26 @@ def _newest_mtime(paths: List[Path]) -> float:
             for directory, _folders, files in os.walk(root):
                 for name in files:
                     try:
-                        newest = max(newest, os.stat(os.path.join(directory, name)).st_mtime)
+                        newest = max(
+                            newest, os.stat(os.path.join(directory, name)).st_mtime
+                        )
                     except OSError:
                         pass
     return newest
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
-    shutil.copytree(str(source), str(destination), ignore=shutil.ignore_patterns("LOCK"))
+    shutil.copytree(
+        str(source), str(destination), ignore=shutil.ignore_patterns("LOCK")
+    )
 
 
 class BrowserLogins:
     """One profile's built-in browser jar and its saved copy."""
 
-    def __init__(self, profile: Profile, state_dir: Path, running: Callable[[], bool]) -> None:
+    def __init__(
+        self, profile: Profile, state_dir: Path, running: Callable[[], bool]
+    ) -> None:
         self.claude = Path(profile.data_root)
         self.partition = self.claude / "Partitions" / JAR_NAME
         self.records_path = self.claude / RECORDS_NAME
@@ -137,35 +149,39 @@ class BrowserLogins:
         self.saved = self.home / "snapshot"
         self.running = running
 
-    def account(self) -> Optional[str]:
+    def account(self) -> str | None:
         document = _read_json(self.claude / ACCOUNT_FILE)
-        value = document.get("lastKnownAccountUuid") if isinstance(document, dict) else None
+        value = (
+            document.get("lastKnownAccountUuid") if isinstance(document, dict) else None
+        )
         if not isinstance(value, str) or not value:
             return None
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    def _records(self, path: Path) -> List[dict]:
+    def _records(self, path: Path) -> list[dict]:
         entries = _read_json(path)
         if not isinstance(entries, list):
             return []
         return [e for e in entries if isinstance(e, dict) and e.get("jar") == JAR_ID]
 
-    def health(self) -> Tuple[int, int]:
+    def health(self) -> tuple[int, int]:
         """Imported sites and cookies in the live jar."""
-        return len(self._records(self.records_path)), _cookie_count(self.partition / "Cookies")
+        return len(self._records(self.records_path)), _cookie_count(
+            self.partition / "Cookies"
+        )
 
-    def _meta(self) -> Dict:
+    def _meta(self) -> dict:
         document = _read_json(self.saved / "meta.json", limit=64 * 1024)
         return document if isinstance(document, dict) else {}
 
-    def _save_meta(self, meta: Dict) -> None:
+    def _save_meta(self, meta: dict) -> None:
         _write_json(self.saved / "meta.json", meta)
 
-    def snapshot(self) -> Dict:
+    def snapshot(self) -> dict:
         with self._lock():
             return self._snapshot()
 
-    def restore(self) -> Dict:
+    def restore(self) -> dict:
         """Put the saved jar back. Only with Claude closed, only after a switch."""
         with self._lock():
             if self.running():
@@ -174,8 +190,12 @@ class BrowserLogins:
             sites, cookies = self.health()
             if sites and cookies:
                 saved = self._snapshot()
-                return {"state": "not-needed", "sites": sites, "cookies": cookies,
-                        "snapshot": saved["state"]}
+                return {
+                    "state": "not-needed",
+                    "sites": sites,
+                    "cookies": cookies,
+                    "snapshot": saved["state"],
+                }
             meta = self._meta()
             if not meta or _cookie_count(self.saved / "Cookies") == 0:
                 return {"state": "skipped", "reason": "no-snapshot"}
@@ -201,10 +221,21 @@ class BrowserLogins:
             self._save_meta(meta)
             prompt = settle_import_prompt(self.claude / DESKTOP_CONFIG)
             # A later snapshot replaces the copy and its meta; this outlives it.
-            _write_json(self.home / LAST_RESTORE, {
-                "at": meta["restored"], "sites": sites, "cookies": cookies, "import_prompt": prompt,
-            })
-            return {"state": "restored", "sites": sites, "cookies": cookies, "import_prompt": prompt}
+            _write_json(
+                self.home / LAST_RESTORE,
+                {
+                    "at": meta["restored"],
+                    "sites": sites,
+                    "cookies": cookies,
+                    "import_prompt": prompt,
+                },
+            )
+            return {
+                "state": "restored",
+                "sites": sites,
+                "cookies": cookies,
+                "import_prompt": prompt,
+            }
 
     def _note_pending_restore(self) -> None:
         """Remember a switch that emptied the jar while Claude was open.
@@ -217,60 +248,89 @@ class BrowserLogins:
         sites, cookies = self.health()
         meta = self._meta()
         account = self.account()
-        if (sites and cookies) or not meta or meta.get("cleared") or meta.get("restore_pending") \
-                or account is None or meta.get("account") == account:
+        if (
+            (sites and cookies)
+            or not meta
+            or meta.get("cleared")
+            or meta.get("restore_pending")
+            or account is None
+            or meta.get("account") == account
+        ):
             return
         meta["restore_pending"] = True
         self._save_meta(meta)
 
-    def settle(self) -> Dict:
+    def settle(self) -> dict:
         """After Claude quits: restore when a switch emptied the jar, else save it."""
         if self.running():
             return self.snapshot()
         return self.restore()
 
-    def status(self) -> Dict:
+    def status(self) -> dict:
         sites, cookies = self.health()
         meta = self._meta()
         saved = None
         if meta:
-            saved = {key: meta.get(key) for key in ("taken", "sites", "cookies", "restored")}
+            saved = {
+                key: meta.get(key) for key in ("taken", "sites", "cookies", "restored")
+            }
             saved["cleared"] = bool(meta.get("cleared"))
             saved["restore_pending"] = bool(meta.get("restore_pending"))
             saved["same_account"] = meta.get("account") == self.account()
             last = _read_json(self.home / LAST_RESTORE, limit=64 * 1024)
             if isinstance(last, dict):
                 saved["last_restore"] = {
-                    key: last.get(key) for key in ("at", "sites", "cookies", "import_prompt")
+                    key: last.get(key)
+                    for key in ("at", "sites", "cookies", "import_prompt")
                 }
         return {"state": "ok", "sites": sites, "cookies": cookies, "snapshot": saved}
 
     def _lock(self) -> ExclusiveFileLock:
         ensure_private_directory(self.home)
-        return ExclusiveFileLock(self.home / "browser-logins.lock", mode="auto", timeout=10)
+        return ExclusiveFileLock(
+            self.home / "browser-logins.lock", mode="auto", timeout=10
+        )
 
-    def _snapshot(self) -> Dict:
+    def _snapshot(self) -> dict:
         sites, cookies = self.health()
         meta = self._meta()
         account = self.account()
-        same_account = bool(meta) and meta.get("account") == account and account is not None
+        same_account = (
+            bool(meta) and meta.get("account") == account and account is not None
+        )
         if not (sites and cookies):
-            if same_account and not meta.get("cleared") and not meta.get("restore_pending"):
+            if (
+                same_account
+                and not meta.get("cleared")
+                and not meta.get("restore_pending")
+            ):
                 meta["cleared"] = True
                 self._save_meta(meta)
                 return {"state": "cleared", "reason": "emptied-without-switch"}
             self._note_pending_restore()
             return {"state": "skipped", "reason": "jar-empty"}
-        if same_account and not meta.get("cleared") and cookies * 2 < int(meta.get("cookies", 0)):
+        if (
+            same_account
+            and not meta.get("cleared")
+            and cookies * 2 < int(meta.get("cookies", 0))
+        ):
             # A half-finished clear can look like a smaller jar. Accept a big
             # drop only when the next run still sees it.
             if not meta.get("drop_seen"):
                 meta["drop_seen"] = True
                 self._save_meta(meta)
                 return {"state": "skipped", "reason": "large-drop"}
-        sources = [self.partition / "Cookies", self.partition / "Local Storage", self.records_path]
-        if same_account and not meta.get("cleared") and not meta.get("drop_seen") \
-                and float(meta.get("taken_epoch", 0)) >= _newest_mtime(sources):
+        sources = [
+            self.partition / "Cookies",
+            self.partition / "Local Storage",
+            self.records_path,
+        ]
+        if (
+            same_account
+            and not meta.get("cleared")
+            and not meta.get("drop_seen")
+            and float(meta.get("taken_epoch", 0)) >= _newest_mtime(sources)
+        ):
             return {"state": "skipped", "reason": "unchanged"}
 
         ensure_private_directory(self.home)
@@ -281,7 +341,9 @@ class BrowserLogins:
         # The backup API takes a consistent copy while Claude has the jar open.
         live = "file:{}?mode=ro".format(self.partition / "Cookies")
         with contextlib.closing(sqlite3.connect(live, uri=True, timeout=5)) as source:
-            with contextlib.closing(sqlite3.connect(str(staging / "Cookies"))) as target:
+            with contextlib.closing(
+                sqlite3.connect(str(staging / "Cookies"))
+            ) as target:
                 source.backup(target)
         os.chmod(staging / "Cookies", 0o600)
         copied = _cookie_count(staging / "Cookies")
@@ -346,14 +408,16 @@ class BrowserLogins:
         current = _read_json(self.records_path)
         if not isinstance(current, list):
             current = []
-        others = [e for e in current if not (isinstance(e, dict) and e.get("jar") == JAR_ID)]
+        others = [
+            e for e in current if not (isinstance(e, dict) and e.get("jar") == JAR_ID)
+        ]
         saved_records = _read_json(self.saved / "records.json")
         if not isinstance(saved_records, list):
             saved_records = []
         _write_json(self.records_path, others + saved_records)
 
 
-ACTIONS: Dict[str, Callable[[BrowserLogins], Dict]] = {
+ACTIONS: dict[str, Callable[[BrowserLogins], dict]] = {
     "snapshot": BrowserLogins.snapshot,
     "restore": BrowserLogins.restore,
     "settle": BrowserLogins.settle,
@@ -365,8 +429,8 @@ def run_browser_logins(
     config: Config,
     running: Callable[[], bool],
     action: str,
-    profiles: Optional[Iterable[Profile]] = None,
-) -> Dict:
+    profiles: Iterable[Profile] | None = None,
+) -> dict:
     """Run one action for each profile. A failure never stops a sync or a relaunch."""
     if not config.sync_browser_logins:
         return {"state": "disabled"}
@@ -377,6 +441,8 @@ def run_browser_logins(
             results[profile.name] = ACTIONS[action](logins)
         except LockUnavailableError:
             results[profile.name] = {"state": "skipped", "reason": "busy"}
-        except Exception as error:  # a jar problem must never block chats or the relaunch
+        except (
+            Exception
+        ) as error:  # a jar problem must never block chats or the relaunch
             results[profile.name] = {"state": "failed", "reason": type(error).__name__}
     return {"state": "done", "profiles": results}

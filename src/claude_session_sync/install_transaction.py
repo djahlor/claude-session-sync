@@ -1,12 +1,14 @@
 """Explicit filesystem and service transaction for installer mutations."""
 
-import os
 import hashlib
+import os
 import shutil
 import stat
+import subprocess
 import uuid
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable
 
 from . import strict_json as json
 from .filesystem import atomic_write_bytes, ensure_private_directory, fsync_directory
@@ -20,20 +22,31 @@ class InstallRecoveryError(RuntimeError):
 class InstallTransaction:
     """Hold writer locks, snapshot owned paths, and restore them on failure."""
 
-    def __init__(self, *, targets: Sequence[Path], state_roots: Iterable[Path],
-                 launch_agent: Path, recovery_root: Path,
-                 runner: Callable[..., object]):
-        self.targets = tuple(self._normalize_system_temp(Path(path)) for path in targets)
-        self.state_roots = tuple(sorted({
-            self._normalize_system_temp(Path(path)) for path in state_roots
-        }, key=str))
+    def __init__(
+        self,
+        *,
+        targets: Sequence[Path],
+        state_roots: Iterable[Path],
+        launch_agent: Path,
+        recovery_root: Path,
+        runner: Callable[..., subprocess.CompletedProcess],
+    ):
+        self.targets = tuple(
+            self._normalize_system_temp(Path(path)) for path in targets
+        )
+        self.state_roots = tuple(
+            sorted(
+                {self._normalize_system_temp(Path(path)) for path in state_roots},
+                key=str,
+            )
+        )
         self.launch_agent = self._normalize_system_temp(Path(launch_agent))
         self.runner = runner
-        self.domain = "gui/{}".format(os.getuid())
+        self.domain = f"gui/{os.getuid()}"
         self.label = "com.claude-session-sync.watcher"
         self.root = self._normalize_system_temp(Path(recovery_root))
         self.snapshot = self.root / "snapshot"
-        self.locks = []
+        self.locks: list[ExclusiveFileLock] = []
         self.was_loaded = False
         self.preparation = None
 
@@ -63,11 +76,12 @@ class InstallTransaction:
             if stat.S_ISLNK(metadata.st_mode) or not (
                 stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
             ):
-                raise ValueError("installer snapshot contains unsupported path: {}".format(item))
+                raise ValueError(
+                    f"installer snapshot contains unsupported path: {item}"
+                )
             kind = "file" if stat.S_ISREG(metadata.st_mode) else "directory"
             digest.update(
-                "{}\0{}\0{:o}\0".format(relative, kind, stat.S_IMODE(metadata.st_mode))
-                .encode("utf-8")
+                f"{relative}\0{kind}\0{stat.S_IMODE(metadata.st_mode):o}\0".encode()
             )
             if stat.S_ISREG(metadata.st_mode):
                 digest.update(item.read_bytes())
@@ -78,22 +92,23 @@ class InstallTransaction:
         candidate = path
         while candidate != candidate.parent:
             if candidate.is_symlink():
-                raise ValueError("installer path has symlink ancestor: {}".format(candidate))
+                raise ValueError(f"installer path has symlink ancestor: {candidate}")
             candidate = candidate.parent
 
     def _loaded(self) -> bool:
         result = self.runner(
             ["/bin/launchctl", "print", self.domain + "/" + self.label],
-            check=False, text=True, capture_output=True, timeout=10,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
         )
         if result.returncode == 0:
             return True
         if result.returncode == 113:
             return False
         raise RuntimeError(
-            "could not verify launch service {} (launchctl exit {})".format(
-                self.label, result.returncode
-            )
+            f"could not verify launch service {self.label} (launchctl exit {result.returncode})"
         )
 
     def _fsync_snapshot(self) -> None:
@@ -117,7 +132,11 @@ class InstallTransaction:
             self._reject_symlink_ancestors(self.root)
             for root in self.state_roots:
                 self._reject_symlink_ancestors(root)
-            for name in ("installation.lock", "switch-handoff.lock", "transaction.lock"):
+            for name in (
+                "installation.lock",
+                "switch-handoff.lock",
+                "transaction.lock",
+            ):
                 for root in self.state_roots:
                     lock = ExclusiveFileLock(root / name, mode="auto", timeout=5.0)
                     lock.acquire()
@@ -171,7 +190,7 @@ class InstallTransaction:
         manifest_path = self.root / "manifest.json"
         if not manifest_path.exists():
             raise InstallRecoveryError(
-                "published recovery has no manifest; evidence retained at {}".format(self.root)
+                f"published recovery has no manifest; evidence retained at {self.root}"
             )
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -200,8 +219,7 @@ class InstallTransaction:
             self._write_phase("rolled_back")
         except BaseException as error:
             raise InstallRecoveryError(
-                "pending installer recovery failed; evidence retained at {}: {}"
-                .format(self.root, error)
+                f"pending installer recovery failed; evidence retained at {self.root}: {error}"
             ) from error
         self._retire()
 
@@ -215,9 +233,7 @@ class InstallTransaction:
         )
 
     def _retire(self) -> None:
-        retired = self.root.parent / (
-            ".install-state.retired-" + uuid.uuid4().hex
-        )
+        retired = self.root.parent / (".install-state.retired-" + uuid.uuid4().hex)
         os.replace(self.root, retired)
         fsync_directory(retired.parent)
         shutil.rmtree(retired)
@@ -225,7 +241,9 @@ class InstallTransaction:
     def stop_watcher(self) -> None:
         self.runner(
             ["/bin/launchctl", "bootout", self.domain, str(self.launch_agent)],
-            check=False, text=True, capture_output=True,
+            check=False,
+            text=True,
+            capture_output=True,
         )
         if self._loaded():
             raise RuntimeError("watcher service could not be stopped before setup")
@@ -253,7 +271,7 @@ class InstallTransaction:
         }
         if actual != expected:
             raise InstallRecoveryError(
-                "restored installer targets do not match snapshot at {}".format(self.root)
+                f"restored installer targets do not match snapshot at {self.root}"
             )
         self.sync_targets()
 
@@ -280,7 +298,9 @@ class InstallTransaction:
                     finally:
                         os.close(descriptor)
             directories.add(target.parent)
-        for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        for directory in sorted(
+            directories, key=lambda item: len(item.parts), reverse=True
+        ):
             if directory.is_dir():
                 fsync_directory(directory)
 
@@ -289,20 +309,24 @@ class InstallTransaction:
         if self.was_loaded and not loaded:
             result = self.runner(
                 ["/bin/launchctl", "bootstrap", self.domain, str(self.launch_agent)],
-                check=False, text=True, capture_output=True,
+                check=False,
+                text=True,
+                capture_output=True,
             )
             if result.returncode != 0 or not self._loaded():
                 raise InstallRecoveryError(
-                    "watcher restore failed; recovery snapshot retained at {}".format(self.root)
+                    f"watcher restore failed; recovery snapshot retained at {self.root}"
                 )
         elif not self.was_loaded and loaded:
             self.runner(
                 ["/bin/launchctl", "bootout", self.domain, str(self.launch_agent)],
-                check=False, text=True, capture_output=True,
+                check=False,
+                text=True,
+                capture_output=True,
             )
             if self._loaded():
                 raise InstallRecoveryError(
-                    "watcher stop failed; recovery snapshot retained at {}".format(self.root)
+                    f"watcher stop failed; recovery snapshot retained at {self.root}"
                 )
 
     def _release(self) -> None:
@@ -321,8 +345,7 @@ class InstallTransaction:
                     self._retire()
                 except BaseException as recovery_error:
                     raise InstallRecoveryError(
-                        "setup failed and recovery was incomplete; snapshot retained at {}: {}"
-                        .format(self.root, recovery_error)
+                        f"setup failed and recovery was incomplete; snapshot retained at {self.root}: {recovery_error}"
                     ) from error
             else:
                 self.sync_targets()

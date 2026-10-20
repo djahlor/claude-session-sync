@@ -10,7 +10,7 @@ from pathlib import Path
 
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.config import load_config
-from claude_session_sync.installer import InstallLayout, Installer
+from claude_session_sync.installer import Installer, InstallLayout
 
 
 class FakeCommandRunner:
@@ -38,18 +38,29 @@ class InstallerTests(unittest.TestCase):
         import plistlib
 
         with tempfile.TemporaryDirectory() as directory:
-            installer = Installer(self.layout(Path(directory)), runner=FakeCommandRunner())
+            installer = Installer(
+                self.layout(Path(directory)), runner=FakeCommandRunner()
+            )
             document = json.loads(installer.default_config_data())
-            safe = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            safe = plistlib.loads(
+                installer._launch_agent(json.dumps(document).encode())
+            )["ProgramArguments"]
             self.assertNotIn("--account-file", safe)
             document["target_policy"] = "all-configured-profiles"
             document["acknowledge_cross_account_copy"] = True
-            automatic = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
-            self.assertEqual(str(Path(document["profiles"][0]["data_root"]) / "config.json"), automatic[automatic.index("--account-file") + 1])
+            automatic = plistlib.loads(
+                installer._launch_agent(json.dumps(document).encode())
+            )["ProgramArguments"]
+            self.assertEqual(
+                str(Path(document["profiles"][0]["data_root"]) / "config.json"),
+                automatic[automatic.index("--account-file") + 1],
+            )
             self.assertEqual("Work", automatic[automatic.index("--profile") + 1])
             self.assertLess(automatic.index("--profile"), automatic.index("--"))
             document["sync_sidebar_layout"] = True
-            with_layout = plistlib.loads(installer._launch_agent(json.dumps(document).encode()))["ProgramArguments"]
+            with_layout = plistlib.loads(
+                installer._launch_agent(json.dumps(document).encode())
+            )["ProgramArguments"]
             self.assertEqual(
                 automatic[: automatic.index("--")],
                 with_layout[: with_layout.index("--")],
@@ -90,8 +101,14 @@ class InstallerTests(unittest.TestCase):
                 [
                     {
                         "name": "Work",
-                        "data_root": str(home / "Library" / "Application Support" / "Claude"),
-                        "launch_command": ["/usr/bin/open", "-a", "/Applications/Claude.app"],
+                        "data_root": str(
+                            home / "Library" / "Application Support" / "Claude"
+                        ),
+                        "launch_command": [
+                            "/usr/bin/open",
+                            "-a",
+                            "/Applications/Claude.app",
+                        ],
                         "is_default": True,
                     }
                 ],
@@ -180,8 +197,11 @@ class InstallerTests(unittest.TestCase):
             installer = Installer(layout, runner=runner, backup_id=lambda: "removed")
             installer.install(dry_run=False)
             generated = (
-                layout.launch_agent, layout.watcher_binary, layout.layout_helper,
-                layout.runtime_cli, layout.runtime_package,
+                layout.launch_agent,
+                layout.watcher_binary,
+                layout.layout_helper,
+                layout.runtime_cli,
+                layout.runtime_package,
             )
 
             dry_uninstall = installer.uninstall(dry_run=True)
@@ -192,10 +212,14 @@ class InstallerTests(unittest.TestCase):
             removed = installer.uninstall(dry_run=False)
 
             self.assertEqual("uninstalled", removed.state)
-            self.assertEqual([False] * len(generated), [path.exists() for path in generated])
+            self.assertEqual(
+                [False] * len(generated), [path.exists() for path in generated]
+            )
             self.assertEqual(
                 sorted(path.name for path in generated),
-                sorted(path.name for path in (layout.backups_dir / "removed").iterdir()),
+                sorted(
+                    path.name for path in (layout.backups_dir / "removed").iterdir()
+                ),
             )
             self.assertTrue(layout.config_path.exists())
             self.assertTrue(
@@ -214,7 +238,11 @@ class InstallerTests(unittest.TestCase):
             "version": 1,
             "approved_targets": [
                 {"profile": "Work", "account": "account-a", "workspace": "workspace-a"},
-                {"profile": "Personal", "account": "account-p", "workspace": "workspace-p"},
+                {
+                    "profile": "Personal",
+                    "account": "account-p",
+                    "workspace": "workspace-p",
+                },
             ],
             "acknowledge_cross_account_copy": True,
             "acknowledge_cross_profile_copy": False,
@@ -225,7 +253,11 @@ class InstallerTests(unittest.TestCase):
             "profiles": [
                 {
                     "data_root": str(support / "Claude"),
-                    "launch_command": ["/usr/bin/open", "-a", "/Applications/Claude.app"],
+                    "launch_command": [
+                        "/usr/bin/open",
+                        "-a",
+                        "/Applications/Claude.app",
+                    ],
                     "name": "Work",
                     "is_default": True,
                 },
@@ -244,22 +276,33 @@ class InstallerTests(unittest.TestCase):
             "state_dir": str(layout.support_dir / "state"),
         }
         layout.config_path.parent.mkdir(parents=True)
-        layout.config_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+        layout.config_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n"
+        )
         os.chmod(layout.config_path, 0o600)
         for app in layout.retired_apps:
             launcher = app / "Contents" / "MacOS" / "launcher"
             launcher.parent.mkdir(parents=True)
-            launcher.write_text("#!/bin/sh\nexec old-switch {}\n".format(app.stem))
+            launcher.write_text(f"#!/bin/sh\nexec old-switch {app.stem}\n")
         return layout
 
-    def test_setup_over_a_september_install_leaves_one_profile_and_backs_up_the_old_apps(self):
+    def test_setup_over_a_september_install_leaves_one_profile_and_backs_up_the_old_apps(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             layout = self.september_install(Path(directory))
             out = io.StringIO()
 
             code = run(
-                ["--config", str(layout.config_path), "setup", "--automatic-targets",
-                 "--sync-layout", "--sync-routines", "--apply"],
+                [
+                    "--config",
+                    str(layout.config_path),
+                    "setup",
+                    "--automatic-targets",
+                    "--sync-layout",
+                    "--sync-routines",
+                    "--apply",
+                ],
                 dependencies=CliDependencies(
                     installer_factory=lambda path: Installer(
                         replace(layout, config_path=path),
@@ -273,31 +316,62 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(0, code, out.getvalue())
             document = json.loads(layout.config_path.read_text(encoding="utf-8"))
-            self.assertEqual(["Work"], [profile["name"] for profile in document["profiles"]])
             self.assertEqual(
-                [{"profile": "Work", "account": "account-a", "workspace": "workspace-a"}],
+                ["Work"], [profile["name"] for profile in document["profiles"]]
+            )
+            self.assertEqual(
+                [
+                    {
+                        "profile": "Work",
+                        "account": "account-a",
+                        "workspace": "workspace-a",
+                    }
+                ],
                 document["approved_targets"],
             )
-            self.assertEqual(["Work"], [profile.name for profile in load_config(layout.config_path).profiles])
+            self.assertEqual(
+                ["Work"],
+                [profile.name for profile in load_config(layout.config_path).profiles],
+            )
             for app in layout.retired_apps:
                 self.assertFalse(app.exists())
-                kept = layout.backups_dir / "upgrade" / app.name / "Contents" / "MacOS" / "launcher"
-                self.assertEqual("#!/bin/sh\nexec old-switch {}\n".format(app.stem), kept.read_text())
+                kept = (
+                    layout.backups_dir
+                    / "upgrade"
+                    / app.name
+                    / "Contents"
+                    / "MacOS"
+                    / "launcher"
+                )
+                self.assertEqual(
+                    f"#!/bin/sh\nexec old-switch {app.stem}\n", kept.read_text()
+                )
 
     def test_uninstall_still_backs_up_old_launcher_apps(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = self.september_install(Path(directory))
 
-            removed = Installer(layout, runner=FakeCommandRunner(), backup_id=lambda: "removed").uninstall(
-                dry_run=False
-            )
+            removed = Installer(
+                layout, runner=FakeCommandRunner(), backup_id=lambda: "removed"
+            ).uninstall(dry_run=False)
 
             self.assertEqual("uninstalled", removed.state)
             for app in layout.retired_apps:
                 self.assertFalse(app.exists())
-                self.assertTrue((layout.backups_dir / "removed" / app.name / "Contents" / "MacOS" / "launcher").is_file())
+                self.assertTrue(
+                    (
+                        layout.backups_dir
+                        / "removed"
+                        / app.name
+                        / "Contents"
+                        / "MacOS"
+                        / "launcher"
+                    ).is_file()
+                )
 
-    def test_a_dry_run_over_a_september_install_lists_the_old_apps_and_changes_nothing(self):
+    def test_a_dry_run_over_a_september_install_lists_the_old_apps_and_changes_nothing(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             layout = self.september_install(Path(directory))
             before = layout.config_path.read_bytes()
@@ -306,7 +380,11 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(
                 [("remove-retired", app) for app in layout.retired_apps],
-                [(action.kind, action.path) for action in report.actions if action.kind == "remove-retired"],
+                [
+                    (action.kind, action.path)
+                    for action in report.actions
+                    if action.kind == "remove-retired"
+                ],
             )
             self.assertEqual(before, layout.config_path.read_bytes())
             self.assertTrue(all(app.exists() for app in layout.retired_apps))
@@ -398,17 +476,35 @@ class InstallerTests(unittest.TestCase):
             seen = []
 
             def ask(helper):
-                launchctl = [call[0][1] for call in runner.calls if call[0][0] == "/bin/launchctl"]
+                launchctl = [
+                    call[0][1]
+                    for call in runner.calls
+                    if call[0][0] == "/bin/launchctl"
+                ]
                 seen.append((helper.read_bytes(), launchctl))
 
-            installer.setup(dry_run=False, config_data=installer.default_config_data(), before_activation=ask)
+            installer.setup(
+                dry_run=False,
+                config_data=installer.default_config_data(),
+                before_activation=ask,
+            )
 
-            (helper_bytes, before), = seen
-            after = [call[0][1] for call in runner.calls if call[0][0] == "/bin/launchctl"]
-            self.assertEqual(b"compiled-layout-helper", helper_bytes, "the staged helper reads the sidebar")
+            ((helper_bytes, before),) = seen
+            after = [
+                call[0][1] for call in runner.calls if call[0][0] == "/bin/launchctl"
+            ]
+            self.assertEqual(
+                b"compiled-layout-helper",
+                helper_bytes,
+                "the staged helper reads the sidebar",
+            )
             self.assertIn("bootout", before, "the old watcher was stopped first")
             self.assertNotIn("bootstrap", before, "the new watcher had not started")
-            self.assertIn("bootstrap", after[len(before):], "the new watcher starts after the answer")
+            self.assertIn(
+                "bootstrap",
+                after[len(before) :],
+                "the new watcher starts after the answer",
+            )
 
     def test_setup_applies_supplied_config_in_the_same_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -457,7 +553,9 @@ class InstallerTests(unittest.TestCase):
             installer.setup(
                 dry_run=False,
                 config_data=changed,
-                before_activation=lambda helper: request_adoption(state_dir, "acct/space"),
+                before_activation=lambda helper: request_adoption(
+                    state_dir, "acct/space"
+                ),
             )
         return pending
 
@@ -465,12 +563,16 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             pending = self.run_failed_setup_that_records_a_choice(Path(directory), None)
 
-            self.assertFalse(pending.exists(), "the answer to a failed setup is not kept")
+            self.assertFalse(
+                pending.exists(), "the answer to a failed setup is not kept"
+            )
 
     def test_a_failed_setup_keeps_the_choice_made_before_it(self):
         earlier = b'{"version": 1, "source_scope": "earlier/space"}\n'
         with tempfile.TemporaryDirectory() as directory:
-            pending = self.run_failed_setup_that_records_a_choice(Path(directory), earlier)
+            pending = self.run_failed_setup_that_records_a_choice(
+                Path(directory), earlier
+            )
 
             self.assertEqual(earlier, pending.read_bytes())
 

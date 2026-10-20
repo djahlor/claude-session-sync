@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-from . import strict_json as json
 import os
 import shutil
 import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable
 
+from . import strict_json as json
 from .config import load_config
 from .filesystem import fsync_directory
 from .install_transaction import InstallTransaction
@@ -30,25 +31,23 @@ def _xml(value: object) -> str:
     )
 
 
-def _plist(entries: Sequence[Tuple[str, str]]) -> bytes:
-    body = "\n".join(
-        "  <key>{}</key>\n  {}".format(_xml(key), value) for key, value in entries
-    )
+def _plist(entries: Sequence[tuple[str, str]]) -> bytes:
+    body = "\n".join(f"  <key>{_xml(key)}</key>\n  {value}" for key, value in entries)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n<dict>\n{}\n</dict>\n</plist>\n'.format(body)
-    ).encode("utf-8")
+        f'<plist version="1.0">\n<dict>\n{body}\n</dict>\n</plist>\n'
+    ).encode()
 
 
 def _string(value: object) -> str:
-    return "<string>{}</string>".format(_xml(value))
+    return f"<string>{_xml(value)}</string>"
 
 
 def _array(values: Iterable[object]) -> str:
-    items = "\n".join("    {}".format(_string(value)) for value in values)
-    return "<array>\n{}\n  </array>".format(items)
+    items = "\n".join(f"    {_string(value)}" for value in values)
+    return f"<array>\n{items}\n  </array>"
 
 
 @dataclass(frozen=True)
@@ -59,16 +58,16 @@ class InstallLayout:
     launch_agents_dir: Path
     support_dir: Path
     source_watcher: Path
-    cli_command: Tuple[str, ...]
+    cli_command: tuple[str, ...]
 
     @classmethod
     def for_home(
         cls,
         home: Path,
         *,
-        cli_command: Optional[Sequence[str]] = None,
-        source_watcher: Optional[Path] = None,
-    ) -> "InstallLayout":
+        cli_command: Sequence[str] | None = None,
+        source_watcher: Path | None = None,
+    ) -> InstallLayout:
         home = Path(home)
         adjacent_watcher = Path(__file__).with_name("SessionSyncWatcher.swift")
         support_dir = home / "Library" / "Application Support" / "ClaudeSessionSync"
@@ -84,7 +83,7 @@ class InstallLayout:
         )
 
     @property
-    def retired_apps(self) -> Tuple[Path, ...]:
+    def retired_apps(self) -> tuple[Path, ...]:
         """Profile launcher apps older versions installed. Setup backs them up."""
 
         return (
@@ -138,8 +137,8 @@ class InstallAction:
 @dataclass(frozen=True)
 class InstallReport:
     state: str
-    actions: Tuple[InstallAction, ...]
-    backups: Tuple[Path, ...] = ()
+    actions: tuple[InstallAction, ...]
+    backups: tuple[Path, ...] = ()
 
     @property
     def change_count(self) -> int:
@@ -161,7 +160,7 @@ class Installer:
         self.layout = layout
         self._runner = runner
         self._backup_id = backup_id
-        self._backups: List[Path] = []
+        self._backups: list[Path] = []
 
     def _config_template(self) -> bytes:
         claude_app = Path("/Applications/Claude.app")
@@ -196,7 +195,7 @@ class Installer:
         self._load_config_bytes(data)
         return data
 
-    def _launch_agent(self, config_data: Optional[bytes] = None) -> bytes:
+    def _launch_agent(self, config_data: bytes | None = None) -> bytes:
         configured = None
         if config_data is not None:
             configured = self._load_config_bytes(config_data)
@@ -210,16 +209,20 @@ class Installer:
             template = json.loads(self._config_template().decode("utf-8"))
             claude_executable = Path(template["claude_executable"])
             watcher_status = Path(template["state_dir"]) / "watcher-status.json"
-        account_arguments = ()
+        account_arguments: tuple[str, ...] = ()
         if configured is not None and configured.target_policy in (
             "all-configured-profiles",
             "logins",
         ):
-            defaults = [profile for profile in configured.profiles if profile.is_default]
+            defaults = [
+                profile for profile in configured.profiles if profile.is_default
+            ]
             if len(defaults) == 1:
                 account_arguments = (
-                    "--account-file", str(defaults[0].data_root / "config.json"),
-                    "--profile", defaults[0].name,
+                    "--account-file",
+                    str(defaults[0].data_root / "config.json"),
+                    "--profile",
+                    defaults[0].name,
                 )
         arguments = (
             (
@@ -243,7 +246,7 @@ class Installer:
             )
         )
 
-    def _runtime_files(self) -> Dict[Path, Tuple[bytes, int]]:
+    def _runtime_files(self) -> dict[Path, tuple[bytes, int]]:
         source_package = Path(__file__).resolve().parent
         files = {}
         allowed_names = {"LICENSE", "COPYING"}
@@ -252,17 +255,15 @@ class Installer:
             if (
                 source.is_file()
                 and "__pycache__" not in source.parts
-                and (
-                    source.name in allowed_names
-                    or source.suffix in allowed_suffixes
-                )
+                and (source.name in allowed_names or source.suffix in allowed_suffixes)
             ):
                 files[source.relative_to(source_package)] = (
                     source.read_bytes(),
                     0o644,
                 )
         files[Path("SessionSyncWatcher.swift")] = (
-            self.layout.source_watcher.read_bytes(), 0o644
+            self.layout.source_watcher.read_bytes(),
+            0o644,
         )
         return files
 
@@ -272,10 +273,10 @@ class Installer:
             "#!/usr/bin/python3\n"
             "import sys\n"
             "sys.dont_write_bytecode = True\n"
-            "sys.path.insert(0, {!r})\n"
+            f"sys.path.insert(0, {runtime_root!r})\n"
             "from claude_session_sync.cli import main\n"
-            "raise SystemExit(main())\n".format(runtime_root)
-        ).encode("utf-8")
+            "raise SystemExit(main())\n"
+        ).encode()
 
     @staticmethod
     def _same_file(path: Path, data: bytes, mode: int) -> bool:
@@ -286,7 +287,7 @@ class Installer:
         except OSError:
             return False
 
-    def _same_bundle(self, target: Path, files: Dict[Path, Tuple[bytes, int]]) -> bool:
+    def _same_bundle(self, target: Path, files: dict[Path, tuple[bytes, int]]) -> bool:
         if not target.is_dir():
             return False
         expected = {target / relative for relative in files}
@@ -310,7 +311,7 @@ class Installer:
         except OSError:
             return False
 
-    def _layout_sources(self) -> Tuple[Path, ...]:
+    def _layout_sources(self) -> tuple[Path, ...]:
         package = Path(__file__).resolve().parent
         sources = [package / "layoutdb.cc"]
         sources.extend(sorted((package / "vendor" / "leveldb").rglob("*.cc")))
@@ -350,14 +351,16 @@ class Installer:
         finally:
             path.unlink(missing_ok=True)
 
-    def _planned_actions(self, config_data: Optional[bytes] = None) -> List[InstallAction]:
+    def _planned_actions(self, config_data: bytes | None = None) -> list[InstallAction]:
         actions = []
         if config_data is not None:
             if not self._same_file(self.layout.config_path, config_data, 0o600):
-                actions.append(InstallAction(
-                    "replace" if self.layout.config_path.exists() else "create",
-                    self.layout.config_path,
-                ))
+                actions.append(
+                    InstallAction(
+                        "replace" if self.layout.config_path.exists() else "create",
+                        self.layout.config_path,
+                    )
+                )
         elif not self.layout.config_path.exists():
             actions.append(InstallAction("create", self.layout.config_path))
         elif stat.S_IMODE(self.layout.config_path.stat().st_mode) != 0o600:
@@ -400,7 +403,7 @@ class Installer:
         destination = root / target.name
         index = 1
         while destination.exists():
-            destination = root / "{}.{}".format(target.name, index)
+            destination = root / f"{target.name}.{index}"
             index += 1
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(target, destination)
@@ -439,7 +442,7 @@ class Installer:
                 temporary.unlink()
 
     def _install_bundle(
-        self, target: Path, files: Dict[Path, Tuple[bytes, int]]
+        self, target: Path, files: dict[Path, tuple[bytes, int]]
     ) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
@@ -465,7 +468,8 @@ class Installer:
                     os.close(descriptor)
             for directory in sorted(
                 (path for path in staging.rglob("*") if path.is_dir()),
-                key=lambda path: len(path.parts), reverse=True,
+                key=lambda path: len(path.parts),
+                reverse=True,
             ):
                 fsync_directory(directory)
             fsync_directory(staging)
@@ -480,10 +484,17 @@ class Installer:
     def _stage_watcher(self, target: Path) -> None:
         self._runner(
             [
-                "/usr/bin/xcrun", "swiftc", str(self.layout.source_watcher),
-                "-o", str(target), "-framework", "AppKit",
+                "/usr/bin/xcrun",
+                "swiftc",
+                str(self.layout.source_watcher),
+                "-o",
+                str(target),
+                "-framework",
+                "AppKit",
             ],
-            check=True, text=True, capture_output=True,
+            check=True,
+            text=True,
+            capture_output=True,
         )
         if not target.is_file():
             raise RuntimeError("swiftc did not create the watcher binary")
@@ -494,11 +505,20 @@ class Installer:
         leveldb = package / "vendor" / "leveldb"
         snappy = package / "vendor" / "snappy"
         command = [
-            "/usr/bin/xcrun", "clang++", "-std=c++11", "-O2", "-DNDEBUG",
-            "-DSNAPPY", "-DOS_MACOSX", "-DLEVELDB_PLATFORM_POSIX",
-            "-DLEVELDB_ATOMIC_PRESENT", "-Wno-deprecated-declarations",
-            "-I{}".format(leveldb), "-I{}".format(leveldb / "include"),
-            "-I{}".format(snappy / "snappy"), "-I{}".format(snappy / "mac"),
+            "/usr/bin/xcrun",
+            "clang++",
+            "-std=c++11",
+            "-O2",
+            "-DNDEBUG",
+            "-DSNAPPY",
+            "-DOS_MACOSX",
+            "-DLEVELDB_PLATFORM_POSIX",
+            "-DLEVELDB_ATOMIC_PRESENT",
+            "-Wno-deprecated-declarations",
+            f"-I{leveldb}",
+            "-I{}".format(leveldb / "include"),
+            "-I{}".format(snappy / "snappy"),
+            "-I{}".format(snappy / "mac"),
         ]
         command.extend(str(source) for source in self._layout_sources())
         command.extend(("-o", str(target)))
@@ -508,13 +528,13 @@ class Installer:
             lines = (error.stderr or "").strip().splitlines()
             detail = " | ".join(lines[-8:]) if lines else "compiler returned a failure"
             raise RuntimeError(
-                "could not compile the sidebar helper: {}".format(detail)
+                f"could not compile the sidebar helper: {detail}"
             ) from error
         if not target.is_file():
             raise RuntimeError("clang++ did not create the sidebar helper")
         os.chmod(target, 0o755)
 
-    def _transaction_targets(self) -> Tuple[Path, ...]:
+    def _transaction_targets(self) -> tuple[Path, ...]:
         return (
             self.layout.config_path,
             *self.layout.retired_apps,
@@ -529,7 +549,7 @@ class Installer:
         )
 
     def _install_transaction(
-        self, config_data: Optional[bytes] = None
+        self, config_data: bytes | None = None
     ) -> InstallTransaction:
         state_roots = {self.layout.support_dir / "state"}
         if self.layout.config_path.exists():
@@ -541,7 +561,8 @@ class Installer:
         if config_data is not None:
             state_roots.add(self._load_config_bytes(config_data).state_dir)
         return InstallTransaction(
-            targets=self._transaction_targets(), state_roots=state_roots,
+            targets=self._transaction_targets(),
+            state_roots=state_roots,
             launch_agent=self.layout.launch_agent,
             recovery_root=self.layout.support_dir / "install-state",
             runner=self._runner,
@@ -551,8 +572,8 @@ class Installer:
         self,
         *,
         dry_run: bool,
-        config_data: Optional[bytes] = None,
-        before_activation: Optional[Callable[[Path], None]] = None,
+        config_data: bytes | None = None,
+        before_activation: Callable[[Path], None] | None = None,
     ) -> InstallReport:
         """Validate and stage a complete setup, then apply it transactionally.
 
@@ -584,7 +605,9 @@ class Installer:
                 pending_choice = self._pending_choice(config_data)
                 pending_before = _read_optional(pending_choice)
                 if before_activation is not None:
-                    before_activation(helper if helper.exists() else self.layout.layout_helper)
+                    before_activation(
+                        helper if helper.exists() else self.layout.layout_helper
+                    )
                 try:
                     report = self._apply_setup(actions, config_data, watcher, helper)
                     remaining = self._planned_actions(config_data)
@@ -604,33 +627,35 @@ class Installer:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    def _state_dir(self, config_data: Optional[bytes]) -> Optional[Path]:
+    def _state_dir(self, config_data: bytes | None) -> Path | None:
         if config_data is not None:
             return self._load_config_bytes(config_data).state_dir
         if self.layout.config_path.exists():
             return load_config(self.layout.config_path).state_dir
         return None
 
-    def _remove_retired_launch_guard(self, config_data: Optional[bytes]) -> None:
+    def _remove_retired_launch_guard(self, config_data: bytes | None) -> None:
         """Older versions left this file after a slow launch. Nothing reads it now."""
 
         state_dir = self._state_dir(config_data)
         if state_dir is not None:
             (state_dir / "launch-pending.json").unlink(missing_ok=True)
 
-    def _pending_choice(self, config_data: Optional[bytes]) -> Optional[Path]:
+    def _pending_choice(self, config_data: bytes | None) -> Path | None:
         from .layout import ADOPT_PENDING_FILENAME
 
         state_dir = self._state_dir(config_data)
         return None if state_dir is None else state_dir / ADOPT_PENDING_FILENAME
 
-    def _validate_staged_plists(
-        self, staging: Path, config_data: Optional[bytes]
-    ) -> None:
+    def _validate_staged_plists(self, staging: Path, config_data: bytes | None) -> None:
         candidate = staging / "validate-launch-agent.plist"
         candidate.write_bytes(self._launch_agent(config_data))
-        self._runner(["/usr/bin/plutil", "-lint", str(candidate)], check=True,
-                     text=True, capture_output=True)
+        self._runner(
+            ["/usr/bin/plutil", "-lint", str(candidate)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
     def _apply_setup(self, actions, config_data, watcher, helper) -> InstallReport:
         self._backups = []
@@ -650,18 +675,26 @@ class Installer:
                 self._backup(action.path)
             elif action.path == self.layout.watcher_binary:
                 self._atomic_file(action.path, watcher.read_bytes(), 0o755)
-                self._atomic_file(self.layout.watcher_stamp,
-                    (self._watcher_digest() + "\n").encode("ascii"), 0o644)
+                self._atomic_file(
+                    self.layout.watcher_stamp,
+                    (self._watcher_digest() + "\n").encode("ascii"),
+                    0o644,
+                )
             elif action.path == self.layout.layout_helper:
                 self._atomic_file(action.path, helper.read_bytes(), 0o755)
-                self._atomic_file(self.layout.layout_helper_stamp,
-                    (self._layout_helper_digest() + "\n").encode("ascii"), 0o644)
+                self._atomic_file(
+                    self.layout.layout_helper_stamp,
+                    (self._layout_helper_digest() + "\n").encode("ascii"),
+                    0o644,
+                )
             elif action.path == self.layout.launch_agent:
-                self._atomic_file(action.path, self._launch_agent(config_data),
-                                  0o644, lint=True)
+                self._atomic_file(
+                    action.path, self._launch_agent(config_data), 0o644, lint=True
+                )
         self.load_launch_agent()
-        return InstallReport("installed" if actions else "noop", tuple(actions),
-                             tuple(self._backups))
+        return InstallReport(
+            "installed" if actions else "noop", tuple(actions), tuple(self._backups)
+        )
 
     def install(self, *, dry_run: bool) -> InstallReport:
         """Compatibility wrapper for callers that do not update configuration."""
@@ -671,7 +704,7 @@ class Installer:
     def load_launch_agent(self) -> None:
         """Bootstrap or replace the per-user watcher in the current GUI domain."""
 
-        domain = "gui/{}".format(os.getuid())
+        domain = f"gui/{os.getuid()}"
         self._runner(
             ["/bin/launchctl", "bootout", domain, str(self.layout.launch_agent)],
             check=False,
@@ -716,21 +749,19 @@ class Installer:
                     stamp.unlink()
             remaining = [target for target in targets if target.exists()]
             if remaining:
-                raise RuntimeError(
-                    "uninstall target still exists: {}".format(remaining[0])
-                )
+                raise RuntimeError(f"uninstall target still exists: {remaining[0]}")
             transaction.sync_targets()
             state = "uninstalled" if actions else "noop"
             return InstallReport(state, tuple(actions), tuple(self._backups))
 
 
-def _read_optional(path: Optional[Path]) -> Optional[bytes]:
+def _read_optional(path: Path | None) -> bytes | None:
     if path is None or not path.is_file():
         return None
     return path.read_bytes()
 
 
-def _restore_optional(path: Optional[Path], content: Optional[bytes]) -> None:
+def _restore_optional(path: Path | None, content: bytes | None) -> None:
     """Put a small state file back as it was: absent, or with these exact bytes."""
 
     if path is None:

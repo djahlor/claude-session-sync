@@ -3,31 +3,34 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import os
 import re
-import stat
-import dataclasses
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable
 
-from .config import Config
 from . import strict_json as json
+from .config import Config
 from .filesystem import (
+    FileChangedError,
+    FileTooLargeError,
+    UnsafePathError,
     atomic_write_bytes,
     durable_unlink,
     ensure_private_directory,
+    read_bounded_with_stat,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
+from .processes import managed_processes
 from .record_journal import (
     RecordJournal,
     RecordJournalError,
     RecordRecoveryError,
 )
-from .processes import managed_processes
 from .store import SessionStore
-
 
 SNAPSHOT_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -35,7 +38,7 @@ MAX_TASKS = 10_000
 MAX_DELETED = 10_000
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 MISSING = object()
-TargetKey = Tuple[str, str, str]
+TargetKey = tuple[str, str, str]
 # Observed in Claude Desktop's CCDScheduledTasks schema. All other fields,
 # including run history and future fields, belong to the destination account
 # and never travel.
@@ -79,8 +82,8 @@ class RoutineSample:
     target: TargetKey
     path: Path
     mtime_ns: int
-    document: Optional[Mapping[str, Any]]
-    content: Optional[bytes] = None
+    document: Mapping[str, Any] | None
+    content: bytes | None = None
 
     @property
     def exists(self) -> bool:
@@ -89,18 +92,18 @@ class RoutineSample:
 
 @dataclass(frozen=True)
 class RoutineSnapshot:
-    targets: Tuple[TargetKey, ...]
+    targets: tuple[TargetKey, ...]
     manifest: Mapping[str, Any]
     # Task ID -> epoch milliseconds of the sync that first saw it deleted.
     # A folder that joins later can hold an old copy; it must not bring it back.
     deleted: Mapping[str, int] = dataclasses.field(default_factory=dict)
 
-    def as_dict(self) -> Dict[str, Any]:
-        document = {
+    def as_dict(self) -> dict[str, Any]:
+        document: dict[str, Any] = {
             "version": SNAPSHOT_VERSION,
             "targets": [list(target) for target in self.targets],
             "manifest": copy.deepcopy(dict(self.manifest)),
-        }  # type: Dict[str, Any]
+        }
         if self.deleted:
             document["deleted"] = dict(sorted(self.deleted.items()))
         return document
@@ -141,11 +144,11 @@ def _clone(value: Any) -> Any:
     return MISSING if value is MISSING else copy.deepcopy(value)
 
 
-def _task_map(document: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+def _task_map(document: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return {task["id"]: task for task in document["scheduledTasks"]}
 
 
-def _definitions(document: Mapping[str, Any]) -> Dict[str, Any]:
+def _definitions(document: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "scheduledTasks": [
             {
@@ -159,8 +162,8 @@ def _definitions(document: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _destination_manifest(
-    definitions: Mapping[str, Any], original: Optional[Mapping[str, Any]]
-) -> Dict[str, Any]:
+    definitions: Mapping[str, Any], original: Mapping[str, Any] | None
+) -> dict[str, Any]:
     document = copy.deepcopy(dict(original or {"scheduledTasks": []}))
     originals = _task_map(document)
     tasks = []
@@ -188,62 +191,62 @@ def _valid_approval(rule: Any) -> bool:
     )
 
 
-def _validate_manifest(value: Any, label: str) -> Dict[str, Any]:
+def _validate_manifest(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise RoutineError("{} is not a JSON object".format(label))
+        raise RoutineError(f"{label} is not a JSON object")
     tasks = value.get("scheduledTasks")
     if not isinstance(tasks, list) or len(tasks) > MAX_TASKS:
-        raise RoutineError("{} has an unknown task list".format(label))
-    seen: Set[str] = set()
+        raise RoutineError(f"{label} has an unknown task list")
+    seen: set[str] = set()
     for task in tasks:
         if not isinstance(task, dict):
-            raise RoutineError("{} contains an invalid task".format(label))
+            raise RoutineError(f"{label} contains an invalid task")
         task_id = task.get("id")
         if (
             not isinstance(task_id, str)
             or not TASK_ID.fullmatch(task_id)
             or task_id in (".", "..")
         ):
-            raise RoutineError("{} contains an unsafe task id".format(label))
+            raise RoutineError(f"{label} contains an unsafe task id")
         if task_id in seen:
-            raise RoutineError("{} contains duplicate task ids".format(label))
+            raise RoutineError(f"{label} contains duplicate task ids")
         seen.add(task_id)
         if not isinstance(task.get("enabled"), bool):
-            raise RoutineError("{} contains an invalid enabled value".format(label))
+            raise RoutineError(f"{label} contains an invalid enabled value")
         file_path = task.get("filePath")
         if not isinstance(file_path, str) or not file_path:
-            raise RoutineError("{} contains an invalid task file path".format(label))
+            raise RoutineError(f"{label} contains an invalid task file path")
         created_at = task.get("createdAt")
         if isinstance(created_at, bool) or not isinstance(created_at, int):
-            raise RoutineError("{} contains an invalid creation time".format(label))
+            raise RoutineError(f"{label} contains an invalid creation time")
         for key in ("displayName", "model", "cwd", "sourceBranch", "permissionMode"):
             if key in task and not isinstance(task[key], str):
-                raise RoutineError("{} contains an invalid {}".format(label, key))
+                raise RoutineError(f"{label} contains an invalid {key}")
         for key in ("useWorktree", "disableJitter"):
             if key in task and not isinstance(task[key], bool):
-                raise RoutineError("{} contains an invalid {}".format(label, key))
+                raise RoutineError(f"{label} contains an invalid {key}")
         approved = task.get("approvedPermissions", [])
         if not isinstance(approved, list) or not all(
             _valid_approval(rule) for rule in approved
         ):
-            raise RoutineError("{} contains invalid approvedPermissions".format(label))
+            raise RoutineError(f"{label} contains invalid approvedPermissions")
         cron = task.get("cronExpression")
         fire_at = task.get("fireAt")
         if not (
             (isinstance(cron, str) and bool(cron))
             or (not isinstance(fire_at, bool) and isinstance(fire_at, (int, float)))
         ):
-            raise RoutineError("{} contains an invalid schedule".format(label))
+            raise RoutineError(f"{label} contains an invalid schedule")
     for key in ("recordedSkips", "runRetries"):
         if key in value and not isinstance(value[key], dict):
-            raise RoutineError("{} contains invalid {}".format(label, key))
+            raise RoutineError(f"{label} contains invalid {key}")
     for key in ("sundayAliasBoundaryStamped", "dayFieldsOrBoundaryStamped"):
         if key in value and not isinstance(value[key], bool):
-            raise RoutineError("{} contains invalid {}".format(label, key))
+            raise RoutineError(f"{label} contains invalid {key}")
     return copy.deepcopy(value)
 
 
-def _select_change(label: str, candidates: Sequence[Tuple[int, TargetKey, Any]]) -> Any:
+def _select_change(label: str, candidates: Sequence[tuple[int, TargetKey, Any]]) -> Any:
     variants = {_value_key(value) for _mtime, _target, value in candidates}
     if len(variants) == 1:
         return _clone(candidates[0][2])
@@ -253,7 +256,7 @@ def _select_change(label: str, candidates: Sequence[Tuple[int, TargetKey, Any]])
         _value_key(value) for _mtime, _target, value in newest_candidates
     }
     if len(newest_variants) != 1:
-        raise RoutineError("{} has equally recent conflicting edits".format(label))
+        raise RoutineError(f"{label} has equally recent conflicting edits")
     selected = min(newest_candidates, key=lambda item: item[1])
     return _clone(selected[2])
 
@@ -261,8 +264,8 @@ def _select_change(label: str, candidates: Sequence[Tuple[int, TargetKey, Any]])
 def _merge_value(
     label: str,
     baseline: Any,
-    values: Sequence[Tuple[int, TargetKey, Any]],
-    known_targets: Set[TargetKey],
+    values: Sequence[tuple[int, TargetKey, Any]],
+    known_targets: set[TargetKey],
 ) -> Any:
     baseline_key = _value_key(baseline)
     candidates = [
@@ -299,7 +302,7 @@ def _merge_task(
     key: str,
     baseline: Any,
     samples: Sequence[RoutineSample],
-    known_targets: Set[TargetKey],
+    known_targets: set[TargetKey],
     task_maps: Mapping[TargetKey, Mapping[str, Mapping[str, Any]]],
 ) -> Any:
     tasks = [
@@ -317,7 +320,7 @@ def _merge_task(
         return MISSING
     for field in PERMISSION_FIELDS:
         value = _merge_value(
-            "routine {}".format(field),
+            f"routine {field}",
             _field(baseline, field),
             [
                 (mtime, target, _field(task, field))
@@ -334,8 +337,8 @@ def _merge_task(
 def transform_routine_manifests(
     samples: Sequence[RoutineSample],
     *,
-    snapshot: Optional[RoutineSnapshot] = None,
-    now_ms: Optional[int] = None,
+    snapshot: RoutineSnapshot | None = None,
+    now_ms: int | None = None,
 ) -> RoutineTransform:
     """Three-way merge task records so additions, edits, and deletions propagate."""
 
@@ -406,10 +409,12 @@ def transform_routine_manifests(
         if selected is not MISSING:
             merged_tasks.append(selected)
 
-    merged: Dict[str, Any] = {"scheduledTasks": merged_tasks}
+    merged: dict[str, Any] = {"scheduledTasks": merged_tasks}
     merged = _validate_manifest(merged, "merged routine manifest")
     merged_ids = {task["id"] for task in merged_tasks}
-    deleted = {task_id: at for task_id, at in deleted.items() if task_id not in merged_ids}
+    deleted = {
+        task_id: at for task_id, at in deleted.items() if task_id not in merged_ids
+    }
     stamp = int(time.time() * 1000) if now_ms is None else now_ms
     for task_id in baseline_tasks:
         if task_id not in merged_ids:
@@ -429,45 +434,29 @@ def transform_routine_manifests(
     )
 
 
-def _read_regular(path: Path) -> Tuple[bytes, int]:
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def _read_regular(path: Path) -> tuple[bytes, int]:
     try:
-        descriptor = os.open(str(path), flags)
+        content, metadata = read_bounded_with_stat(
+            path, MAX_MANIFEST_BYTES, stable=True
+        )
+    except FileTooLargeError as error:
+        raise RoutineError("routine manifest is too large") from error
+    except FileChangedError as error:
+        raise RoutineError("routine manifest changed while being read") from error
+    except UnsafePathError as error:
+        raise RoutineError("routine manifest is not a regular file") from error
     except OSError as error:
         raise RoutineError("routine manifest is not a readable regular file") from error
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RoutineError("routine manifest is not a regular file")
-        if metadata.st_size > MAX_MANIFEST_BYTES:
-            raise RoutineError("routine manifest is too large")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            content = stream.read(MAX_MANIFEST_BYTES + 1)
-            after = os.fstat(stream.fileno())
-        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise RoutineError("routine manifest changed while being read")
-        if len(content) > MAX_MANIFEST_BYTES:
-            raise RoutineError("routine manifest is too large")
-        return content, metadata.st_mtime_ns
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    return content, metadata.st_mtime_ns
 
 
-def _read_optional(path: Path) -> Optional[bytes]:
+def _read_optional(path: Path) -> bytes | None:
     if not os.path.lexists(str(path)):
         return None
     return _read_regular(path)[0]
 
 
-def _decode_manifest(content: bytes) -> Dict[str, Any]:
+def _decode_manifest(content: bytes) -> dict[str, Any]:
     try:
         value = json.loads(content.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
@@ -479,11 +468,11 @@ def _encode_manifest(document: Mapping[str, Any]) -> bytes:
     return _canonical(document) + b"\n"
 
 
-def load_routine_snapshot(path: Path) -> Optional[RoutineSnapshot]:
+def load_routine_snapshot(path: Path) -> RoutineSnapshot | None:
     return _decode_snapshot(_read_optional(path))
 
 
-def _decode_snapshot(content: Optional[bytes]) -> Optional[RoutineSnapshot]:
+def _decode_snapshot(content: bytes | None) -> RoutineSnapshot | None:
     if content is None:
         return None
     try:
@@ -531,14 +520,14 @@ class RoutineSynchronizer:
         self,
         config: Config,
         *,
-        task_root: Optional[Path] = None,
+        task_root: Path | None = None,
         process_probe: Callable[..., Any] = managed_processes,
     ) -> None:
         self.config = config
         self.task_root = task_root or Path.home() / ".claude" / "scheduled-tasks"
         self.process_probe = process_probe
 
-    def probe(self) -> Dict[str, Any]:
+    def probe(self) -> dict[str, Any]:
         """Validate current source data without creating state or restoring files."""
 
         if not self.config.sync_code_routines:
@@ -623,7 +612,7 @@ class RoutineSynchronizer:
         finally:
             lock.release()
 
-    def _targets(self) -> Tuple[Any, ...]:
+    def _targets(self) -> tuple[Any, ...]:
         if (
             len(self.config.profiles) > 1
             and not self.config.acknowledge_cross_profile_copy
@@ -674,7 +663,7 @@ class RoutineSynchronizer:
     def _journal_root(self) -> Path:
         return self.config.state_dir / "routine-runs"
 
-    def _allowed_paths(self, targets: Sequence[Any]) -> Set[str]:
+    def _allowed_paths(self, targets: Sequence[Any]) -> set[str]:
         return {str(target.path / "scheduled-tasks.json") for target in targets} | {
             str(self._snapshot_path())
         }
@@ -726,7 +715,7 @@ class RoutineSynchronizer:
 
     def _commit(
         self,
-        current: Mapping[Path, Optional[bytes]],
+        current: Mapping[Path, bytes | None],
         replacements: Mapping[Path, bytes],
         targets: Sequence[Any],
     ) -> None:

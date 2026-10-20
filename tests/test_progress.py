@@ -4,42 +4,57 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
+
+from test_cli import (
+    FakeLayout,
+    FakeProcessProbe,
+    FakeRoutine,
+    SequencedProcessProbe,
+    config,
+)
+from test_cli_live import ChatCliFixture, X, Y
 
 from claude_session_sync import strict_json
 from claude_session_sync.adapters import read_status, save_status
 from claude_session_sync.cli import CliDependencies, run
 from claude_session_sync.locking import ExclusiveFileLock
 from claude_session_sync.progress import current_progress, record_progress
-from test_cli import (
-    config,
-    FakeLayout,
-    FakeProcessProbe,
-    FakeRoutine,
-    SequencedProcessProbe,
-)
-from test_cli_live import ChatCliFixture, X, Y
 
 
 class ProgressTests(unittest.TestCase):
     def test_active_recovery_overrides_the_previous_restart_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             loaded = config(Path(directory))
-            save_status(loaded.state_dir, "watcher-status.json", {"restart_phase": "needs-attention"})
+            save_status(
+                loaded.state_dir,
+                "watcher-status.json",
+                {"restart_phase": "needs-attention"},
+            )
             record_progress(loaded, "syncing")
             with ExclusiveFileLock(loaded.state_dir / "switch-handoff.lock"):
-                self.assertEqual("syncing", current_progress(loaded, app_running=False, failures=1)["progress"])
-            self.assertEqual("needs-attention", current_progress(loaded, app_running=False)["progress"])
+                self.assertEqual(
+                    "syncing",
+                    current_progress(loaded, app_running=False, failures=1)["progress"],
+                )
+            self.assertEqual(
+                "needs-attention",
+                current_progress(loaded, app_running=False)["progress"],
+            )
 
     def test_retrying_account_check_is_visible_without_claiming_a_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             loaded = config(Path(directory))
-            save_status(loaded.state_dir, "watcher-status.json", {
-                "automatic_restart": True,
-                "restart_phase": "checking",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            save_status(
+                loaded.state_dir,
+                "watcher-status.json",
+                {
+                    "automatic_restart": True,
+                    "restart_phase": "checking",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             result = current_progress(loaded, app_running=True)
             self.assertEqual("checking-account", result["progress"])
             self.assertEqual("wait-for-automatic-restart", result["next_action"])
@@ -49,24 +64,43 @@ class ProgressTests(unittest.TestCase):
             loaded = config(Path(directory))
             for timestamp in (None, 123, [], {}, "not-a-date"):
                 with self.subTest(timestamp=timestamp):
-                    save_status(loaded.state_dir, "watcher-status.json", {"restart_phase": "quitting", "timestamp": timestamp})
-                    self.assertEqual("waiting-for-Claude", current_progress(loaded, app_running=True)["progress"])
+                    save_status(
+                        loaded.state_dir,
+                        "watcher-status.json",
+                        {"restart_phase": "quitting", "timestamp": timestamp},
+                    )
+                    self.assertEqual(
+                        "waiting-for-Claude",
+                        current_progress(loaded, app_running=True)["progress"],
+                    )
 
-    def test_account_restart_progress_is_visible_and_stale_receipts_do_not_look_active(self):
+    def test_account_restart_progress_is_visible_and_stale_receipts_do_not_look_active(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             loaded = config(Path(directory))
             record_progress(loaded, "finished")
-            watcher = {"automatic_restart": True, "restart_phase": "quitting", "timestamp": datetime.now(timezone.utc).isoformat()}
+            watcher = {
+                "automatic_restart": True,
+                "restart_phase": "quitting",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
             save_status(loaded.state_dir, "watcher-status.json", watcher)
             status = current_progress(loaded, app_running=True)
             self.assertEqual("quitting-Claude", status["progress"])
             self.assertEqual("wait-for-automatic-restart", status["next_action"])
             watcher["timestamp"] = "2000-01-01T00:00:00Z"
             save_status(loaded.state_dir, "watcher-status.json", watcher)
-            self.assertEqual("waiting-for-Claude", current_progress(loaded, app_running=True)["progress"])
+            self.assertEqual(
+                "waiting-for-Claude",
+                current_progress(loaded, app_running=True)["progress"],
+            )
             watcher["restart_phase"] = "needs-attention"
             save_status(loaded.state_dir, "watcher-status.json", watcher)
-            self.assertEqual("needs-attention", current_progress(loaded, app_running=True)["progress"])
+            self.assertEqual(
+                "needs-attention",
+                current_progress(loaded, app_running=True)["progress"],
+            )
 
     def test_missing_finished_waiting_and_interrupted_are_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,10 +222,16 @@ class ProgressTests(unittest.TestCase):
 
 class ChatProgressTests(ChatCliFixture):
     def test_an_unsafe_chat_file_does_not_stop_other_adapters_in_any_sync_command(self):
-        self.config = replace(self.config, sync_code_routines=True, sync_sidebar_layout=True)
+        self.config = replace(
+            self.config, sync_code_routines=True, sync_sidebar_layout=True
+        )
         self.write(self.a, X)
-        (self.a / "local_{}.json".format(Y)).symlink_to(self.root / "elsewhere.json")
-        for command in (("sync", "--json"), ("auto", "--json"), ("switch", "Work", "--no-launch")):
+        (self.a / f"local_{Y}.json").symlink_to(self.root / "elsewhere.json")
+        for command in (
+            ("sync", "--json"),
+            ("auto", "--json"),
+            ("switch", "Work", "--no-launch"),
+        ):
             with self.subTest(command=command):
                 code, _out, errors = self.cli(
                     *command,
@@ -218,8 +258,11 @@ class ChatProgressTests(ChatCliFixture):
             with self.subTest(command=command):
                 self.write(self.a, chat)
                 code, out, _errors = self.cli(
-                    command, "--json",
-                    layout_factory=lambda _: self.fail("pins and groups must wait for Claude"),
+                    command,
+                    "--json",
+                    layout_factory=lambda _: self.fail(
+                        "pins and groups must wait for Claude"
+                    ),
                     # Closed for the chat phase, open again before pins and groups.
                     process_probe=SequencedProcessProbe(((), (object(),))),
                 )
@@ -231,7 +274,10 @@ class ChatProgressTests(ChatCliFixture):
                     (payload["state"], payload["layout"]["state"], payload["progress"]),
                 )
                 saved = read_status(self.config.state_dir, "sync-progress.json")
-                self.assertEqual(("waiting-for-Claude", None), (saved["state"], saved["last_success_at"]))
+                self.assertEqual(
+                    ("waiting-for-Claude", None),
+                    (saved["state"], saved["last_success_at"]),
+                )
 
 
 class StrictJsonTests(unittest.TestCase):

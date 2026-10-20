@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .config import Config
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 class Profile:
     name: str
     data_root: Path
-    launch_command: Tuple[str, ...]
+    launch_command: tuple[str, ...]
     is_default: bool = False
 
 
@@ -87,23 +87,23 @@ class InvalidReplica:
 
 @dataclass(frozen=True)
 class Discovery:
-    targets: Tuple[Target, ...]
-    replicas: Tuple[Replica, ...]
-    invalid_replicas: Tuple[InvalidReplica, ...]
-    markers: Tuple[Marker, ...] = ()
-    tmps: Tuple[TmpFile, ...] = ()
-    ignored_targets: Tuple[Target, ...] = ()
+    targets: tuple[Target, ...]
+    replicas: tuple[Replica, ...]
+    invalid_replicas: tuple[InvalidReplica, ...]
+    markers: tuple[Marker, ...] = ()
+    tmps: tuple[TmpFile, ...] = ()
+    ignored_targets: tuple[Target, ...] = ()
 
 
 @dataclass(frozen=True)
 class Plan:
-    operations: Tuple[Operation, ...]
-    invalid_replicas: Tuple[InvalidReplica, ...]
+    operations: tuple[Operation, ...]
+    invalid_replicas: tuple[InvalidReplica, ...]
     plan_id: str
     total_bytes: int
     # Sessions left alone on purpose (tied, lost, unreadable, future).
     # They never block the rest of the plan.
-    problems: Tuple[Any, ...] = ()
+    problems: tuple[Any, ...] = ()
     ignored_targets: int = 0
     context: Any = field(default=None, compare=False, repr=False)
 
@@ -120,7 +120,7 @@ class RunReceipt:
     plan_id: str
     operation_count: int
     bytes_copied: int
-    applied: Tuple[Operation, ...] = ()
+    applied: tuple[Operation, ...] = ()
 
 
 @dataclass(frozen=True)

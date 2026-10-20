@@ -39,8 +39,12 @@ class InstallTransactionTests(unittest.TestCase):
                 " target.write_bytes(b'partial')\n"
                 " os._exit(23)\n"
             )
-            result = subprocess.run([sys.executable, "-c", program, str(root)],
-                                    capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                [sys.executable, "-c", program, str(root)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertEqual(target.read_bytes(), b"partial")
             with self.transaction(root, target):
@@ -183,9 +187,11 @@ class InstallTransactionTests(unittest.TestCase):
             root = Path(directory)
             target = root / "installed"
             transaction = InstallTransaction(
-                targets=(target,), state_roots=(root / "state",),
+                targets=(target,),
+                state_roots=(root / "state",),
                 launch_agent=root / "watcher.plist",
-                recovery_root=root / "install-state", runner=DeniedRunner(),
+                recovery_root=root / "install-state",
+                runner=DeniedRunner(),
             )
             with self.assertRaisesRegex(RuntimeError, "could not verify"):
                 transaction.__enter__()

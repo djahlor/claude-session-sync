@@ -1,25 +1,27 @@
 """Discovery and validation of Claude Code session replicas."""
 
+from __future__ import annotations
+
 import hashlib
 import os
 import re
 import stat
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, cast
 
 from .config import Config
 from .fingerprint import fingerprint, normalisation
 from .hash_cache import HashCache
 from .model import Discovery, InvalidReplica, Marker, Replica, Target, TmpFile
 
-
 # Claude's own filters: local_<id>.json records, their .tmp saves, deleted_<id> markers.
 SESSION_ID = r"[A-Za-z0-9_-]+"
-RECORD_NAME = re.compile(r"^local_(%s)\.json$" % SESSION_ID)
-TMP_NAME = re.compile(r"^local_(%s)\.json\.tmp$" % SESSION_ID)
-MARKER_NAME = re.compile(r"^deleted_(%s)$" % SESSION_ID)
+RECORD_NAME = re.compile(rf"^local_({SESSION_ID})\.json$")
+TMP_NAME = re.compile(rf"^local_({SESSION_ID})\.json\.tmp$")
+MARKER_NAME = re.compile(rf"^deleted_({SESSION_ID})$")
 # Two saves inside one timestamp tick can share metadata, so a file this fresh
 # is never trusted to match its cache entry.
 RACY_WINDOW_NS = 2_000_000_000
@@ -29,10 +31,10 @@ MAX_MARKER_BYTES = 64
 STAT_WORKERS = 16
 
 
-def _lstat_all(paths: Sequence[Path]) -> List[Union[os.stat_result, OSError]]:
+def _lstat_all(paths: Sequence[Path]) -> list[os.stat_result | OSError]:
     """Each path's lstat, or the error it raised, in order."""
 
-    def one(path: Path) -> Union[os.stat_result, OSError]:
+    def one(path: Path) -> os.stat_result | OSError:
         try:
             return path.lstat()
         except OSError as error:
@@ -44,7 +46,7 @@ def _lstat_all(paths: Sequence[Path]) -> List[Union[os.stat_result, OSError]]:
         return list(pool.map(one, paths))
 
 
-def _stat_signature(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
+def _stat_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
     return (
         stat_result.st_size,
         stat_result.st_mtime_ns,
@@ -56,7 +58,7 @@ def _stat_signature(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
 class SessionStore:
     def __init__(
         self,
-        hash_cache: Optional[HashCache] = None,
+        hash_cache: HashCache | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         self._hash_cache = hash_cache
@@ -81,10 +83,10 @@ class SessionStore:
     def scan_targets(self, targets: Sequence[Target]) -> Discovery:
         """Read records, delete markers and temp saves in the given folders only."""
 
-        replicas: List[Replica] = []
-        markers: List[Marker] = []
-        tmps: List[TmpFile] = []
-        invalid: List[InvalidReplica] = []
+        replicas: list[Replica] = []
+        markers: list[Marker] = []
+        tmps: list[TmpFile] = []
+        invalid: list[InvalidReplica] = []
         for target in targets:
             self._discover_target(target, replicas, markers, tmps, invalid)
         return Discovery(
@@ -97,8 +99,8 @@ class SessionStore:
 
     def discover_targets(self, config: Config) -> Discovery:
         """Validate target directories without reading another adapter's records."""
-        targets: List[Target] = []
-        invalid: List[InvalidReplica] = []
+        targets: list[Target] = []
+        invalid: list[InvalidReplica] = []
 
         for profile in sorted(config.profiles, key=lambda item: item.name):
             sessions_root = profile.data_root / "claude-code-sessions"
@@ -120,9 +122,7 @@ class SessionStore:
                 )
             except OSError as error:
                 invalid.append(
-                    InvalidReplica(
-                        sessions_root, "cannot scan sessions root: {}".format(error)
-                    )
+                    InvalidReplica(sessions_root, f"cannot scan sessions root: {error}")
                 )
                 continue
             profile_target_count = 0
@@ -143,7 +143,7 @@ class SessionStore:
                     invalid.append(
                         InvalidReplica(
                             account_path,
-                            "cannot scan account directory: {}".format(error),
+                            f"cannot scan account directory: {error}",
                         )
                     )
                     continue
@@ -181,17 +181,15 @@ class SessionStore:
     def _discover_target(
         self,
         target: Target,
-        replicas: List[Replica],
-        markers: List[Marker],
-        tmps: List[TmpFile],
-        invalid: List[InvalidReplica],
+        replicas: list[Replica],
+        markers: list[Marker],
+        tmps: list[TmpFile],
+        invalid: list[InvalidReplica],
     ) -> None:
         try:
             entries = sorted(os.scandir(str(target.path)), key=lambda item: item.name)
         except OSError as error:
-            invalid.append(
-                InvalidReplica(target.path, "cannot scan target: {}".format(error))
-            )
+            invalid.append(InvalidReplica(target.path, f"cannot scan target: {error}"))
             return
         started_ns = self._clock_ns()
         wanted = []
@@ -211,7 +209,7 @@ class SessionStore:
             if isinstance(before, FileNotFoundError):
                 continue  # Claude renamed or removed it under the scan
             if isinstance(before, OSError):
-                invalid.append(InvalidReplica(path, "cannot inspect: {}".format(before)))
+                invalid.append(InvalidReplica(path, f"cannot inspect: {before}"))
                 continue
             if not stat.S_ISREG(before.st_mode):
                 invalid.append(InvalidReplica(path, "replica is not a regular file"))
@@ -236,7 +234,7 @@ class SessionStore:
                             hashlib.sha256(raw).hexdigest(),
                         )
                     )
-            else:
+            elif marker:
                 read = _read_small(path, before, limit=MAX_MARKER_BYTES)
                 if read is None:
                     continue
@@ -273,7 +271,7 @@ class SessionStore:
         session_id: str,
         before: os.stat_result,
         started_ns: int,
-    ) -> Optional[Replica]:
+    ) -> Replica | None:
         """None means the file is gone. A file that cannot be read is unreadable, never absent."""
 
         name = normalisation()
@@ -291,25 +289,45 @@ class SessionStore:
         except FileNotFoundError:
             return None
         except OSError:
-            return Replica(session_id, target, path, before.st_size, before.st_mtime_ns, "")
-        if _stat_signature(before) != _stat_signature(after) or len(raw) != after.st_size:
+            return Replica(
+                session_id, target, path, before.st_size, before.st_mtime_ns, ""
+            )
+        if (
+            _stat_signature(before) != _stat_signature(after)
+            or len(raw) != after.st_size
+        ):
             # Claude saved it while it was read. Judge it next run, not now.
-            return Replica(session_id, target, path, after.st_size, after.st_mtime_ns, "")
+            return Replica(
+                session_id, target, path, after.st_size, after.st_mtime_ns, ""
+            )
         copy = fingerprint(session_id, raw)
         digest = hashlib.sha256(raw).hexdigest()
         if copy.readable and self._hash_cache is not None:
             try:
                 self._hash_cache.store_record(
-                    path, after, session_id, digest, copy.state_hash,
-                    copy.last_activity_at, name,
+                    path,
+                    after,
+                    session_id,
+                    digest,
+                    cast(str, copy.state_hash),  # readable copies have one
+                    copy.last_activity_at,
+                    name,
                 )
             except OSError:
                 pass  # the cache is disposable; the verdict above still stands
         return self._replica(
-            session_id, target, path, after, digest, copy.state_hash, copy.last_activity_at
+            session_id,
+            target,
+            path,
+            after,
+            digest,
+            copy.state_hash,
+            copy.last_activity_at,
         )
 
-    def _replica(self, session_id, target, path, metadata, digest, state_hash, activity):
+    def _replica(
+        self, session_id, target, path, metadata, digest, state_hash, activity
+    ):
         # Read the clock after the file: Claude stamps a busy session with the
         # current time, so a save during the scan must not look like the future.
         future = state_hash is not None and activity > self._clock_ns() // 1_000_000
@@ -326,7 +344,7 @@ class SessionStore:
         )
 
 
-def _read_small(path: Path, before: os.stat_result, limit: Optional[int]):
+def _read_small(path: Path, before: os.stat_result, limit: int | None):
     if limit is not None and before.st_size > limit:
         return None
     try:
@@ -339,11 +357,11 @@ def _read_small(path: Path, before: os.stat_result, limit: Optional[int]):
     return raw, after
 
 
-def _target_key(target: Target) -> Tuple[str, str, str]:
+def _target_key(target: Target) -> tuple[str, str, str]:
     return target.profile_name, target.account_id, target.workspace_id
 
 
-def _replica_key(replica: Replica) -> Tuple[str, str, str, str]:
+def _replica_key(replica: Replica | Marker | TmpFile) -> tuple[str, str, str, str]:
     return (
         replica.target.profile_name,
         replica.target.account_id,

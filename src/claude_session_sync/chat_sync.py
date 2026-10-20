@@ -11,7 +11,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
 from .filesystem import sweep_stale_stages
@@ -26,7 +26,7 @@ class ChatStateError(RuntimeError):
 class ChatRun:
     plan: Plan
     receipt: Optional[RunReceipt] = None
-    problems: Dict[str, int] = field(default_factory=dict)
+    problems: dict[str, int] = field(default_factory=dict)
     newly_enrolled: int = 0
     # Runs a killed process left open, closed before this run applied.
     recovered_runs: int = 0
@@ -78,7 +78,9 @@ def run_chat_sync(
         save_state(path, state)
         on_disk = encode_state(state)
 
-    sweep_stale_stages((target.path for target in context.targets.values()), time.time())
+    sweep_stale_stages(
+        (target.path for target in context.targets.values()), time.time()
+    )
     receipt = engine.apply(plan)
     _remember_placements(state, context, receipt)
 
@@ -148,13 +150,18 @@ def _summary(plan: Plan) -> ChatRun:
 def _remember_placements(state, context, receipt: RunReceipt) -> None:
     folders = {str(target.path): key for key, target in context.targets.items()}
     for operation in receipt.applied:
-        if operation.artifact != "record" or operation.kind not in ("create", "replace"):
+        if operation.artifact != "record" or operation.kind not in (
+            "create",
+            "replace",
+        ):
             continue
         key = folders.get(str(Path(operation.destination).parent))
         if key is None:
             continue
         if operation.source_state_hash is not None:
             # What sync placed is this folder's version in step with the others.
-            state.sync.synced.setdefault(key, {})[operation.session_id] = operation.source_state_hash
+            state.sync.synced.setdefault(key, {})[operation.session_id] = (
+                operation.source_state_hash
+            )
         if operation.kind == "create":
             state.sync.seen.setdefault(key, set()).add(operation.session_id)

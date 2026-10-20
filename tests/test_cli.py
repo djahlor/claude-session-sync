@@ -138,10 +138,14 @@ class CliSyncTests(unittest.TestCase):
             self.assertEqual("process-permission-error", payload["error_type"])
             self.assertNotIn("private", out.getvalue())
 
+
 class CliAutomaticTests(unittest.TestCase):
     def test_a_sync_waits_without_writing_while_claude_is_open(self):
         for command, expected_exit in (("auto", 0), ("sync", 1)):
-            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 out = io.StringIO()
                 dependencies = CliDependencies(
@@ -163,6 +167,7 @@ class CliAutomaticTests(unittest.TestCase):
                     out.getvalue(),
                 )
 
+
 class CliSwitchTests(unittest.TestCase):
     def test_restart_check_reports_retryable_timeout_without_process_details(self):
         class SlowProbe:
@@ -170,46 +175,114 @@ class CliSwitchTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired(["ps", "private-command-argument"], 5)
 
         with tempfile.TemporaryDirectory() as directory:
-            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
-            deps = CliDependencies(config_loader=lambda _: loaded, process_probe=SlowProbe())
+            loaded = replace(
+                config(Path(directory)), target_policy="all-configured-profiles"
+            )
+            deps = CliDependencies(
+                config_loader=lambda _: loaded, process_probe=SlowProbe()
+            )
             out, errors = io.StringIO(), io.StringIO()
-            self.assertEqual(1, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=errors))
-            self.assertEqual("process-inspection-timeout", json.loads(out.getvalue())["reason"])
-            self.assertNotIn("private-command-argument", out.getvalue() + errors.getvalue())
+            self.assertEqual(
+                1,
+                run(
+                    ("restart-check", "Work"),
+                    dependencies=deps,
+                    stdout=out,
+                    stderr=errors,
+                ),
+            )
+            self.assertEqual(
+                "process-inspection-timeout", json.loads(out.getvalue())["reason"]
+            )
+            self.assertNotIn(
+                "private-command-argument", out.getvalue() + errors.getvalue()
+            )
 
     def test_restart_check_normalizes_default_profile_paths(self):
         from claude_session_sync.processes import ManagedProcess
 
         with tempfile.TemporaryDirectory() as directory:
-            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
+            loaded = replace(
+                config(Path(directory)), target_policy="all-configured-profiles"
+            )
             primary = loaded.profiles[0]
             process = ManagedProcess(1234, ("/usr/bin/true",), primary.data_root)
-            for data_root in (primary.data_root / ".." / primary.data_root.name, Path(os.path.relpath(primary.data_root))):
+            for data_root in (
+                primary.data_root / ".." / primary.data_root.name,
+                Path(os.path.relpath(primary.data_root)),
+            ):
                 with self.subTest(data_root=data_root):
-                    variant = replace(loaded, profiles=(replace(primary, data_root=data_root),))
-                    deps = CliDependencies(config_loader=lambda _: variant, process_probe=FakeProcessProbe((process,)))
+                    variant = replace(
+                        loaded, profiles=(replace(primary, data_root=data_root),)
+                    )
+                    deps = CliDependencies(
+                        config_loader=lambda _: variant,
+                        process_probe=FakeProcessProbe((process,)),
+                    )
                     out = io.StringIO()
-                    self.assertEqual(0, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=io.StringIO()))
+                    self.assertEqual(
+                        0,
+                        run(
+                            ("restart-check", "Work"),
+                            dependencies=deps,
+                            stdout=out,
+                            stderr=io.StringIO(),
+                        ),
+                    )
                     self.assertEqual([1234], json.loads(out.getvalue())["pids"])
 
     def test_restart_check_returns_only_default_profile_pids(self):
         from claude_session_sync.processes import ManagedProcess
 
         with tempfile.TemporaryDirectory() as directory:
-            loaded = replace(config(Path(directory)), target_policy="all-configured-profiles")
-            primary = ManagedProcess(1234, ("/usr/bin/true",), loaded.profiles[0].data_root)
-            other = ManagedProcess(5678, ("/usr/bin/true",), loaded.profiles[1].data_root)
-            for processes, expected in (((primary,), 0), ((primary, other), 1), ((), 0)):
+            loaded = replace(
+                config(Path(directory)), target_policy="all-configured-profiles"
+            )
+            primary = ManagedProcess(
+                1234, ("/usr/bin/true",), loaded.profiles[0].data_root
+            )
+            other = ManagedProcess(
+                5678, ("/usr/bin/true",), loaded.profiles[1].data_root
+            )
+            for processes, expected in (
+                ((primary,), 0),
+                ((primary, other), 1),
+                ((), 0),
+            ):
                 out = io.StringIO()
-                deps = CliDependencies(config_loader=lambda _: loaded, process_probe=FakeProcessProbe(processes))
-                self.assertEqual(expected, run(("restart-check", "Work"), dependencies=deps, stdout=out, stderr=io.StringIO()))
+                deps = CliDependencies(
+                    config_loader=lambda _: loaded,
+                    process_probe=FakeProcessProbe(processes),
+                )
+                self.assertEqual(
+                    expected,
+                    run(
+                        ("restart-check", "Work"),
+                        dependencies=deps,
+                        stdout=out,
+                        stderr=io.StringIO(),
+                    ),
+                )
                 if expected == 0:
-                    self.assertEqual([p.pid for p in processes], json.loads(out.getvalue())["pids"])
+                    self.assertEqual(
+                        [p.pid for p in processes], json.loads(out.getvalue())["pids"]
+                    )
                 else:
                     self.assertEqual("", out.getvalue())
             for target in ("Work", "Personal"):
-                deps = CliDependencies(config_loader=lambda _: config(Path(directory)), process_probe=FakeProcessProbe((primary,)))
-                self.assertEqual(1, run(("restart-check", target), dependencies=deps, stdout=io.StringIO(), stderr=io.StringIO()))
+                deps = CliDependencies(
+                    config_loader=lambda _: config(Path(directory)),
+                    process_probe=FakeProcessProbe((primary,)),
+                )
+                self.assertEqual(
+                    1,
+                    run(
+                        ("restart-check", target),
+                        dependencies=deps,
+                        stdout=io.StringIO(),
+                        stderr=io.StringIO(),
+                    ),
+                )
 
     def test_switch_rejects_an_unbounded_wait_value(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -556,9 +629,13 @@ class CliConfigureTests(unittest.TestCase):
 
             exit_code = run(
                 [
-                    "--config", str(config_path), "setup",
+                    "--config",
+                    str(config_path),
+                    "setup",
                     "--automatic-targets",
-                    "--sync-layout", "--sync-routines", "--dry-run",
+                    "--sync-layout",
+                    "--sync-routines",
+                    "--dry-run",
                 ],
                 dependencies=CliDependencies(installer_factory=lambda path: fake),
                 stdout=output,
@@ -618,7 +695,9 @@ class CliConfigureTests(unittest.TestCase):
             "claude_executable": "/usr/bin/true",
         }
 
-    def test_configure_enables_automatic_targets_and_drops_the_old_personal_profile(self):
+    def test_configure_enables_automatic_targets_and_drops_the_old_personal_profile(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
@@ -629,7 +708,13 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(
                 0,
                 run(
-                    ["--config", str(config_path), "configure", "--automatic-targets", "--dry-run"],
+                    [
+                        "--config",
+                        str(config_path),
+                        "configure",
+                        "--automatic-targets",
+                        "--dry-run",
+                    ],
                     stdout=io.StringIO(),
                     stderr=io.StringIO(),
                 ),
@@ -640,7 +725,13 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(
                 0,
                 run(
-                    ["--config", str(config_path), "configure", "--automatic-targets", "--apply"],
+                    [
+                        "--config",
+                        str(config_path),
+                        "configure",
+                        "--automatic-targets",
+                        "--apply",
+                    ],
                     stdout=output,
                     stderr=io.StringIO(),
                 ),
@@ -665,7 +756,14 @@ class CliConfigureTests(unittest.TestCase):
             config_path.write_text(json.dumps(document), encoding="utf-8")
 
             exit_code = run(
-                ["--config", str(config_path), "configure", "--sync-layout", "--sync-routines", "--apply"],
+                [
+                    "--config",
+                    str(config_path),
+                    "configure",
+                    "--sync-layout",
+                    "--sync-routines",
+                    "--apply",
+                ],
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
             )
@@ -705,7 +803,11 @@ class CliConfigureTests(unittest.TestCase):
 
             self.assertEqual((0, ""), (exit_code, errors.getvalue()))
             self.assertEqual(
-                dict(document, approved_targets=[], profiles=[document["profiles"][0], other]),
+                dict(
+                    document,
+                    approved_targets=[],
+                    profiles=[document["profiles"][0], other],
+                ),
                 json.loads(config_path.read_text(encoding="utf-8")),
             )
 
@@ -722,7 +824,9 @@ class CliConfigureTests(unittest.TestCase):
                 ["--config", str(config_path), "setup", "--dry-run"],
                 dependencies=CliDependencies(
                     installer_factory=lambda _path: SimpleNamespace(
-                        setup=lambda **_options: self.fail("an invalid config must not install")
+                        setup=lambda **_options: self.fail(
+                            "an invalid config must not install"
+                        )
                     )
                 ),
                 stdout=io.StringIO(),
@@ -752,7 +856,9 @@ class CliLayoutTests(unittest.TestCase):
                     one_profile,
                 ),
                 (
-                    replace(loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False),
+                    replace(
+                        loaded, profiles=loaded.profiles[:1], sync_sidebar_layout=False
+                    ),
                     "pins and groups do not sync",
                 ),
             )
@@ -775,6 +881,7 @@ class CliLayoutTests(unittest.TestCase):
                     )
                     self.assertEqual([], planner_calls)
                     self.assertIn(reason, errors.getvalue())
+
 
 class CliInstallTests(unittest.TestCase):
     def test_install_modes_do_not_require_an_existing_config(self):

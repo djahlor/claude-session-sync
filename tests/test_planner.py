@@ -176,7 +176,7 @@ class PlannerTests(unittest.TestCase):
         mtime_ns: int,
         activity: int = 100,
     ) -> Path:
-        path = self.target(data_root) / "local_{}.json".format(session_id)
+        path = self.target(data_root) / f"local_{session_id}.json"
         path.write_text(
             json.dumps(
                 {
@@ -193,7 +193,9 @@ class PlannerTests(unittest.TestCase):
     def plan(self, config: Config) -> Plan:
         return Planner(SessionStore()).plan(SyncRequest(config))
 
-    def test_equal_activity_divergent_revisions_are_left_alone_without_blocking(self) -> None:
+    def test_equal_activity_divergent_revisions_are_left_alone_without_blocking(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
@@ -204,7 +206,9 @@ class PlannerTests(unittest.TestCase):
             plan = self.plan(config)
 
             self.assertEqual({"tied"}, {problem.kind for problem in plan.problems})
-            self.assertEqual({"tied"}, {problem.session_id for problem in plan.problems})
+            self.assertEqual(
+                {"tied"}, {problem.session_id for problem in plan.problems}
+            )
             self.assertEqual(["other"], [op.session_id for op in plan.operations])
 
     def test_multiple_account_namespaces_require_explicit_acknowledgement(self) -> None:
@@ -327,7 +331,10 @@ class PlannerTests(unittest.TestCase):
 
             self.assertEqual((), plan.invalid_replicas)
             self.assertTrue(
-                any(operation.destination.parent == new_target for operation in plan.operations)
+                any(
+                    operation.destination.parent == new_target
+                    for operation in plan.operations
+                )
             )
 
 

@@ -9,12 +9,19 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO, Union
 
-
 PathLike = Union[str, os.PathLike]
 
 
 class UnsafePathError(OSError):
     """Raised when transaction data is not a regular, non-symlink file."""
+
+
+class FileTooLargeError(UnsafePathError):
+    """The file is bigger than the caller allows."""
+
+
+class FileChangedError(OSError):
+    """The file changed while it was read or hashed."""
 
 
 def normalized_path(path: PathLike) -> Path:
@@ -34,9 +41,7 @@ def ensure_private_directory(path: PathLike) -> Path:
         candidate = candidate.parent
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if directory.is_symlink() or not directory.is_dir():
-        raise UnsafePathError(
-            "state directory is not a real directory: {}".format(directory)
-        )
+        raise UnsafePathError(f"state directory is not a real directory: {directory}")
     os.chmod(str(directory), 0o700)
     for created in reversed(missing):
         os.chmod(str(created), 0o700)
@@ -49,7 +54,7 @@ def ensure_private_file(path: PathLike) -> None:
     os.chmod(os.fspath(path), 0o600)
 
 
-def _open_regular_read(path: PathLike) -> BinaryIO:
+def open_regular_read(path: PathLike) -> BinaryIO:
     file_path = Path(path)
     # Reject FIFOs after opening without waiting for a writer indefinitely.
     flags = os.O_RDONLY | os.O_NONBLOCK
@@ -59,25 +64,44 @@ def _open_regular_read(path: PathLike) -> BinaryIO:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise UnsafePathError("not a regular file: {}".format(file_path))
+            raise UnsafePathError(f"not a regular file: {file_path}")
         return os.fdopen(descriptor, "rb")
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def read_bounded(path: PathLike, limit: int) -> bytes:
-    """Read a regular file that is not a symlink, refusing anything over limit bytes."""
-    with _open_regular_read(path) as source:
+def read_bounded_with_stat(
+    path: PathLike, limit: int, *, stable: bool = False
+) -> tuple[bytes, os.stat_result]:
+    """Read a regular, non-symlinked file of at most limit bytes.
+
+    With stable, the file must not change while it is read.
+    """
+    with open_regular_read(path) as source:
+        before = os.fstat(source.fileno())
+        if before.st_size > limit:
+            raise FileTooLargeError(f"file is larger than {limit} bytes: {path}")
         content = source.read(limit + 1)
+        after = os.fstat(source.fileno())
     if len(content) > limit:
-        raise UnsafePathError("file is larger than {} bytes: {}".format(limit, path))
-    return content
+        raise FileTooLargeError(f"file is larger than {limit} bytes: {path}")
+    if stable and (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise FileChangedError(f"file changed while being read: {path}")
+    return content, before
+
+
+def read_bounded(path: PathLike, limit: int, *, stable: bool = False) -> bytes:
+    return read_bounded_with_stat(path, limit, stable=stable)[0]
 
 
 def digest_file(path: PathLike) -> str:
     digest = hashlib.sha256()
-    with _open_regular_read(path) as source:
+    with open_regular_read(path) as source:
         while True:
             chunk = source.read(1024 * 1024)
             if not chunk:
@@ -87,7 +111,7 @@ def digest_file(path: PathLike) -> str:
 
 
 def regular_file_size(path: PathLike) -> int:
-    with _open_regular_read(path) as source:
+    with open_regular_read(path) as source:
         return os.fstat(source.fileno()).st_size
 
 
@@ -103,9 +127,7 @@ def fsync_directory(path: PathLike) -> None:
 
 
 def _temporary_path(destination: Path, suffix: str) -> Path:
-    return destination.parent / ".{}.{}.{}".format(
-        destination.name, uuid.uuid4().hex, suffix
-    )
+    return destination.parent / f".{destination.name}.{uuid.uuid4().hex}.{suffix}"
 
 
 def stage_copy(source: PathLike, destination: PathLike) -> Path:
@@ -114,15 +136,13 @@ def stage_copy(source: PathLike, destination: PathLike) -> Path:
     destination_path = Path(destination)
     if destination_path.parent.is_symlink() or not destination_path.parent.is_dir():
         raise UnsafePathError(
-            "destination parent is not a real directory: {}".format(
-                destination_path.parent
-            )
+            f"destination parent is not a real directory: {destination_path.parent}"
         )
     temporary = _temporary_path(destination_path, "stage")
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with (
-            _open_regular_read(source) as input_file,
+            open_regular_read(source) as input_file,
             os.fdopen(descriptor, "wb") as output_file,
         ):
             descriptor = -1
@@ -178,9 +198,7 @@ def atomic_write_bytes(destination: PathLike, content: bytes) -> None:
     destination_path = Path(destination)
     if destination_path.parent.is_symlink() or not destination_path.parent.is_dir():
         raise UnsafePathError(
-            "destination parent is not a real directory: {}".format(
-                destination_path.parent
-            )
+            f"destination parent is not a real directory: {destination_path.parent}"
         )
     temporary = _temporary_path(destination_path, "write")
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -220,7 +238,10 @@ def sweep_stale_stages(folders, now: float, max_age_seconds: int = 600) -> int:
                 continue
             try:
                 metadata = entry.stat(follow_symlinks=False)
-                if not stat.S_ISREG(metadata.st_mode) or now - metadata.st_mtime <= max_age_seconds:
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or now - metadata.st_mtime <= max_age_seconds
+                ):
                     continue
                 os.unlink(entry.path)
                 removed += 1

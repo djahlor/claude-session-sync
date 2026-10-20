@@ -62,7 +62,13 @@ class SwitchReopenTests(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(cli, "_chat_payload", side_effect=chat):
             code = run(
-                ["--config", str(self.root / "config.json"), "switch", "Work", "--json"],
+                [
+                    "--config",
+                    str(self.root / "config.json"),
+                    "switch",
+                    "Work",
+                    "--json",
+                ],
                 dependencies=CliDependencies(
                     config_loader=lambda _path: self.config,
                     process_probe=self.claude,
@@ -86,8 +92,9 @@ class SwitchReopenTests(unittest.TestCase):
             self.claude.open = False
             return original(config, dependencies, timeout)
 
-        with mock.patch.object(cli, "_wait_for_managed_processes_to_exit",
-                               side_effect=helper_quits_claude):
+        with mock.patch.object(
+            cli, "_wait_for_managed_processes_to_exit", side_effect=helper_quits_claude
+        ):
             code, payload, guard_seen = self.switch([reopened, dict(SYNCED)])
 
         self.assertEqual(0, code)
@@ -100,8 +107,9 @@ class SwitchReopenTests(unittest.TestCase):
     def test_a_claude_that_stays_open_ends_the_switch_as_before(self):
         self.claude.open = True
         error = AppRunningError("a managed Claude process is running")
-        with mock.patch.object(cli, "_wait_for_managed_processes_to_exit",
-                               side_effect=[True, False]):
+        with mock.patch.object(
+            cli, "_wait_for_managed_processes_to_exit", side_effect=[True, False]
+        ):
             code, payload, guard_seen = self.switch([error])
 
         self.assertEqual(1, code)

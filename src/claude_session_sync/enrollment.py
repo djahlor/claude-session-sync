@@ -9,12 +9,11 @@ matter.
 """
 
 import os
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, List, Sequence, Set, Tuple
 
 from .filesystem import normalized_path
 from .logins import Logins
-
 
 # A chat Claude saved this long after the login began was written by Claude,
 # not copied in during the switch.
@@ -22,17 +21,17 @@ LOGIN_SETTLE_MS = 5_000
 
 
 def target_key(target) -> str:
-    return "{}/{}/{}".format(target.profile_name, target.account_id, target.workspace_id)
+    return f"{target.profile_name}/{target.account_id}/{target.workspace_id}"
 
 
-def approved_keys(config) -> Set[str]:
+def approved_keys(config) -> set[str]:
     return {
-        "{}/{}/{}".format(target.profile_name, target.account_id, target.workspace_id)
+        f"{target.profile_name}/{target.account_id}/{target.workspace_id}"
         for target in config.approved_targets
     }
 
 
-def auto_enrolled(config) -> List[str]:
+def auto_enrolled(config) -> list[str]:
     """Folders that joined after a login. An unreadable state adds none."""
 
     from .chat_state import StateUnusable, load_state, state_path
@@ -47,7 +46,9 @@ def selected_targets(config, targets: Sequence) -> tuple:
     return select_targets(config, targets, auto_enrolled(config))[0]
 
 
-def select_targets(config, targets: Sequence, auto_enrolled: Iterable[str]) -> Tuple[tuple, tuple]:
+def select_targets(
+    config, targets: Sequence, auto_enrolled: Iterable[str]
+) -> tuple[tuple, tuple]:
     """Return (selected, ignored) for the configured policy."""
 
     if config.target_policy == "all-configured-profiles":
@@ -63,14 +64,16 @@ def select_targets(config, targets: Sequence, auto_enrolled: Iterable[str]) -> T
 def new_login_targets(
     config,
     targets: Sequence,
-    selected_keys: Set[str],
+    selected_keys: set[str],
     logins: Logins,
-) -> List[str]:
+) -> list[str]:
     """Folders outside sync that Claude wrote for their account after its first login here."""
 
     if config.target_policy != "logins":
         return []
-    roots = {profile.name: normalized_path(profile.data_root) for profile in config.profiles}
+    roots = {
+        profile.name: normalized_path(profile.data_root) for profile in config.profiles
+    }
     found = []
     for target in targets:
         key = target_key(target)
@@ -82,7 +85,9 @@ def new_login_targets(
             continue
         since_ms = first_login + LOGIN_SETTLE_MS
         folder = Path(target.path)
-        if _written_since(folder, since_ms) or _created_since(folder, since_ms, first_login):
+        if _written_since(folder, since_ms) or _created_since(
+            folder, since_ms, first_login
+        ):
             found.append(key)
     return sorted(found)
 
@@ -124,7 +129,10 @@ def _created_since(folder: Path, since_ms: int, first_login_ms: int) -> bool:
         if not (entry.name.startswith("local_") and entry.name.endswith(".json")):
             continue
         try:
-            if entry.stat(follow_symlinks=False).st_mtime_ns // 1_000_000 <= first_login_ms:
+            if (
+                entry.stat(follow_symlinks=False).st_mtime_ns // 1_000_000
+                <= first_login_ms
+            ):
                 return False
         except OSError:
             return False

@@ -4,8 +4,9 @@ The decision rules follow vinlim/claude-desktop-sync (0BSD). A partition key
 names one account/workspace sidebar folder; nothing here touches the disk.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Union
+from typing import Optional, Union
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class Snapshot:
     key: str
     records: Mapping[str, Copy]
     tombstones: Mapping[str, int]  # session id -> delete time in epoch ms
-    orphan_tmps: FrozenSet[str] = frozenset()
+    orphan_tmps: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -45,8 +46,8 @@ class SyncState:
     never win just by looking changed.
     """
 
-    synced: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    seen: Dict[str, Set[str]] = field(default_factory=dict)
+    synced: dict[str, dict[str, str]] = field(default_factory=dict)
+    seen: dict[str, set[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -109,5 +110,5 @@ class Problem:
 
 @dataclass
 class RulePlan:
-    actions: List[Action] = field(default_factory=list)
-    problems: List[Problem] = field(default_factory=list)
+    actions: list[Action] = field(default_factory=list)
+    problems: list[Problem] = field(default_factory=list)

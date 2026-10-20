@@ -8,7 +8,8 @@ here, because every sync runs with Claude closed.
 Actions for one session are emitted in the order they must happen.
 """
 
-from typing import List, Mapping, Optional
+from collections.abc import Mapping
+from typing import Optional, cast
 
 from .chat_model import (
     CreateRecord,
@@ -25,7 +26,7 @@ from .chat_model import (
 
 
 def plan(
-    snapshots: List[Snapshot],
+    snapshots: list[Snapshot],
     state: SyncState,
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
@@ -38,7 +39,7 @@ def plan(
     """
 
     result = RulePlan()
-    session_ids = set()
+    session_ids: set[str] = set()
     for snapshot in snapshots:
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
@@ -75,14 +76,20 @@ def _plan_session(session_id, snapshots, state, prefer, result) -> None:
         # Only a folder holding the marker has an explained absence. A folder
         # that lost the chat without one is still reported as lost.
         chosen = _plan_record(
-            session_id, snapshots, holders, state, prefer, result,
+            session_id,
+            snapshots,
+            holders,
+            state,
+            prefer,
+            result,
             explained={s.key for s in entombed},
         )
         # With the copies tied nothing can be put back, so the tombstone stays.
         # Without it, the deleting partition would read as having lost the record.
         if chosen:
             result.actions.extend(
-                RetireTombstone(session_id, target=snapshot.key) for snapshot in entombed
+                RetireTombstone(session_id, target=snapshot.key)
+                for snapshot in entombed
             )
         return
 
@@ -104,42 +111,53 @@ def _plan_delete(session_id, snapshots, tombstone_source, result) -> None:
             result.actions.append(RetireTmp(session_id, target=snapshot.key))
         if session_id not in snapshot.tombstones:
             result.actions.append(
-                CreateTombstone(session_id, source=tombstone_source.key, target=snapshot.key)
+                CreateTombstone(
+                    session_id, source=tombstone_source.key, target=snapshot.key
+                )
             )
 
 
-def _plan_record(session_id, snapshots, holders, state, prefer, result, explained) -> bool:
+def _plan_record(
+    session_id, snapshots, holders, state, prefer, result, explained
+) -> bool:
     """Return whether a version was chosen."""
 
     untouched = [s for s in holders if _still_as_synced(s, session_id, state)]
     if len({s.records[session_id].state_hash for s in holders}) == 1:
         winner = holders[0]
     elif all(_known(s, session_id, state) for s in holders):
-        winner = _one_sided_winner(session_id, holders, untouched) or _latest_activity_winner(
-            session_id, holders, prefer
-        )
+        winner = _one_sided_winner(
+            session_id, holders, untouched
+        ) or _latest_activity_winner(session_id, holders, prefer)
     else:
         # A copy with no remembered version cannot be told apart from a stale
         # one, so only activity decides, and a tie is left alone.
         winner = _latest_activity_winner(session_id, holders, prefer)
     if winner is None:  # R4: a tie nobody settled
         result.problems.extend(
-            Problem("tied", session_id, s.key) for s in _most_active(session_id, holders)
+            Problem("tied", session_id, s.key)
+            for s in _most_active(session_id, holders)
         )
         return False
 
     winning = winner.records[session_id]
     for target in holders:
         if target.records[session_id].state_hash != winning.state_hash:
-            result.actions.append(ReplaceRecord(session_id, source=winner.key, target=target.key))
+            result.actions.append(
+                ReplaceRecord(session_id, source=winner.key, target=target.key)
+            )
 
     for target in snapshots:
         if session_id in target.records:
             continue
-        if target.key not in explained and session_id in state.seen.get(target.key, ()):  # R7
+        if target.key not in explained and session_id in state.seen.get(
+            target.key, ()
+        ):  # R7
             result.problems.append(Problem("lost", session_id, target.key))
             continue
-        result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
+        result.actions.append(
+            CreateRecord(session_id, source=winner.key, target=target.key)
+        )  # R5
     return True
 
 
@@ -147,7 +165,9 @@ def _still_as_synced(snapshot, session_id, state) -> bool:
     """The copy is still the version this folder last held in step with the others."""
 
     remembered = state.synced.get(snapshot.key, {}).get(session_id)
-    return remembered is not None and snapshot.records[session_id].state_hash == remembered
+    return (
+        remembered is not None and snapshot.records[session_id].state_hash == remembered
+    )
 
 
 def _known(snapshot, session_id, state) -> bool:
@@ -167,13 +187,14 @@ def _one_sided_winner(session_id, holders, untouched) -> Optional[Snapshot]:
         return None
     candidate = changed[0]
     behind = any(
-        candidate.records[session_id].last_activity_at < s.records[session_id].last_activity_at
+        candidate.records[session_id].last_activity_at
+        < s.records[session_id].last_activity_at
         for s in untouched
     )
     return None if behind else candidate
 
 
-def _most_active(session_id, holders) -> List[Snapshot]:
+def _most_active(session_id, holders) -> list[Snapshot]:
     latest = max(s.records[session_id].last_activity_at for s in holders)
     return [s for s in holders if s.records[session_id].last_activity_at == latest]
 
@@ -187,7 +208,7 @@ def _latest_activity_winner(session_id, holders, prefer) -> Optional[Snapshot]:
     return next((s for s in leaders if s.key == prefer), None)
 
 
-def settle(state: SyncState, snapshots: List[Snapshot]) -> SyncState:
+def settle(state: SyncState, snapshots: list[Snapshot]) -> SyncState:
     """Work out what to remember from what the given folders hold now.
 
     Folders outside this run keep what they had. An id leaves ``seen`` only when
@@ -202,9 +223,11 @@ def settle(state: SyncState, snapshots: List[Snapshot]) -> SyncState:
     for snapshot in snapshots:
         seen.setdefault(snapshot.key, set()).update(snapshot.records)
 
-    known_ids = set()
+    known_ids: set[str] = set()
     for snapshot in snapshots:
-        known_ids.update(snapshot.records, seen[snapshot.key], synced.get(snapshot.key, {}))
+        known_ids.update(
+            snapshot.records, seen[snapshot.key], synced.get(snapshot.key, {})
+        )
 
     for session_id in known_ids:
         holders = [s for s in snapshots if session_id in s.records]
@@ -217,7 +240,7 @@ def settle(state: SyncState, snapshots: List[Snapshot]) -> SyncState:
             # Agreement is about content alone, so a copy with an untrustworthy time still counts.
             hashes = {s.records[session_id].state_hash for s in holders}
             if len(hashes) == 1 and None not in hashes:
-                agreed = hashes.pop()
+                agreed = cast(str, hashes.pop())  # None was ruled out above
                 for key in keys:
                     synced.setdefault(key, {})[session_id] = agreed
 

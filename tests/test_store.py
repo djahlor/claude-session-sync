@@ -36,7 +36,7 @@ class StoreTests(unittest.TestCase):
     ) -> Path:
         directory = data_root / "claude-code-sessions" / account / workspace
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "local_{}.json".format(session_id)
+        path = directory / f"local_{session_id}.json"
         payload = {"sessionId": "local_" + session_id}
         if isinstance(extra, dict):
             payload.update(extra)
@@ -252,8 +252,18 @@ class HashCacheTests(unittest.TestCase):
 
             old.execute(
                 "INSERT INTO file_hashes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(written), metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
-                 metadata.st_ino, "cached", "0" * 64, "stale", 7, normalisation()),
+                (
+                    str(written),
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                    metadata.st_ino,
+                    "cached",
+                    "0" * 64,
+                    "stale",
+                    7,
+                    normalisation(),
+                ),
             )
             old.execute("PRAGMA user_version = 1")
             old.commit()
@@ -276,21 +286,27 @@ class FastScanTests(unittest.TestCase):
             store_tests = StoreTests()
             config = store_tests.config(root)
             for name in ("one", "two", "three"):
-                written = store_tests.write_session(root / "standard", "account", "workspace", name)
+                written = store_tests.write_session(
+                    root / "standard", "account", "workspace", name
+                )
                 os.utime(written, ns=(1_000_000_000, 1_000_000_000))
             with HashCache(root / "state" / "hashes.sqlite3") as cache:
                 first = SessionStore(cache).discover(config)
             cache = HashCache(root / "state" / "hashes.sqlite3")
             queries = []
             cache._connection.set_trace_callback(queries.append)
-            with patch.object(Path, "read_bytes", side_effect=AssertionError("cache miss")):
+            with patch.object(
+                Path, "read_bytes", side_effect=AssertionError("cache miss")
+            ):
                 second = SessionStore(cache).discover(config)
             cache.close()
 
             self.assertEqual(first.replicas, second.replicas)
             self.assertEqual(1, sum("SELECT" in query for query in queries))
 
-    def test_a_record_stored_in_this_pass_is_found_and_a_changed_file_is_not(self) -> None:
+    def test_a_record_stored_in_this_pass_is_found_and_a_changed_file_is_not(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "local_a.json"
@@ -299,7 +315,9 @@ class FastScanTests(unittest.TestCase):
             with HashCache(root / "hashes.sqlite3") as cache:
                 self.assertIsNone(cache.lookup_record(path, before, "a", "n1"))
                 cache.store_record(path, before, "a", "digest", "state", 7, "n1")
-                self.assertEqual(("digest", "state", 7), cache.lookup_record(path, before, "a", "n1"))
+                self.assertEqual(
+                    ("digest", "state", 7), cache.lookup_record(path, before, "a", "n1")
+                )
                 self.assertIsNone(cache.lookup_record(path, before, "b", "n1"))
                 self.assertIsNone(cache.lookup_record(path, before, "a", "n2"))
                 path.write_text("{ }")
@@ -312,7 +330,7 @@ class FastScanTests(unittest.TestCase):
             root = Path(directory)
             paths = []
             for index in range(40):
-                path = root / "f{}".format(index)
+                path = root / f"f{index}"
                 if index % 7:
                     path.write_bytes(b"x" * index)
                 paths.append(path)
