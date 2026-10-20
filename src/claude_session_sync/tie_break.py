@@ -11,7 +11,7 @@ state, the latest title, every trusted git folder and every published page.
 Anything else that differs keeps the tie, so a tie-break never drops data.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from .fingerprint import VOLATILE_KEYS
@@ -134,7 +134,7 @@ def _covers_title(winner: Mapping[str, Any], other: Mapping[str, Any]) -> bool:
     return other.get("title") in _strings(winner.get("previousTitles"))
 
 
-def _strings(values: Any) -> Iterable[str]:
+def _strings(values: Any) -> list[str]:
     return (
         [value for value in values if isinstance(value, str)]
         if isinstance(values, list)
