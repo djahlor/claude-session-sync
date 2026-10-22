@@ -931,6 +931,11 @@ def _problem_counts(run: Any) -> dict:
         counts["ignored_folders"] = run.plan.ignored_targets
     if run.newly_enrolled:
         counts["new_folders"] = run.newly_enrolled
+    archive = getattr(run, "archive", None)
+    if archive is not None and archive.archived:
+        counts["archived_copies"] = archive.archived
+    if archive is not None and archive.opened:
+        counts["unarchived_copies"] = archive.opened
     return counts
 
 

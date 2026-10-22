@@ -4,7 +4,11 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
-## [Unreleased]
+## [0.6.6] - 2026-10-22
+
+### Fixed
+
+- A chat archived under one account showed again in Recents after a switch. Claude archives without moving the chat's activity time, so the copies tied, and the tie-break needs one copy that holds everything. When the archived copy was behind on a title, pull request or published page, the archive never spread: 24 chats on 22-10-2026. The archive state now syncs on its own, before the chats: the newest archive or unarchive wins, and using a chat counts as opening it. Only the archive fields change, through the journaled engine. On by default; `sync_archive_state: false` in the config turns it off.
 
 ### Changed
 
