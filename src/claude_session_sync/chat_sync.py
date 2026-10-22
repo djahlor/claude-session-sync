@@ -13,6 +13,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .archive import (
+    ArchiveReport,
+    preview_archive_state,
+    remember_archive_state,
+    spread_archive_state,
+)
 from .chat_state import StateUnusable, encode_state, load_state, save_state, state_path
 from .filesystem import sweep_stale_stages
 from .model import Plan, RunReceipt, SyncRequest
@@ -30,6 +36,8 @@ class ChatRun:
     newly_enrolled: int = 0
     # Runs a killed process left open, closed before this run applied.
     recovered_runs: int = 0
+    # Copies whose archive state changed to match the newest archive or unarchive.
+    archive: Optional[ArchiveReport] = None
 
 
 def plan_chat_sync(
@@ -45,7 +53,12 @@ def plan_chat_sync(
     plan = planner.plan(
         SyncRequest(config), state=state, prefer=prefer, prefer_session=prefer_session
     )
-    return _summary(plan)
+    run = _summary(plan)
+    if getattr(config, "sync_archive_state", False) and not plan.invalid_replicas:
+        run.archive = preview_archive_state(
+            config.state_dir, plan.context.targets, skip=_archive_skips(plan)
+        )
+    return run
 
 
 def run_chat_sync(
@@ -78,6 +91,29 @@ def run_chat_sync(
         save_state(path, state)
         on_disk = encode_state(state)
 
+    archive = None
+    if getattr(config, "sync_archive_state", False):
+        archive, applied = spread_archive_state(
+            config.state_dir, context.targets, engine, skip=_archive_skips(plan)
+        )
+        if applied:
+            _remember_archive_writes(state, context, applied)
+            if encode_state(state) != on_disk:
+                save_state(path, state)
+                on_disk = encode_state(state)
+            # The plan was made from the files before; plan again from what is there now.
+            plan = planner.plan(
+                SyncRequest(config),
+                state=state,
+                prefer=prefer,
+                prefer_session=prefer_session,
+            )
+            context = plan.context
+            if plan.invalid_replicas:
+                run = _summary(plan)
+                run.archive = archive
+                return run
+
     sweep_stale_stages(
         (target.path for target in context.targets.values()), time.time()
     )
@@ -89,9 +125,12 @@ def run_chat_sync(
         state.last_success_ms = clock_ms()
     if encode_state(state) != on_disk:
         save_state(path, state)
+    if archive is not None:
+        remember_archive_state(config.state_dir, context.targets)
     run = _summary(plan)
     run.receipt = receipt
     run.recovered_runs = recovered_runs
+    run.archive = archive
     return run
 
 
@@ -145,6 +184,36 @@ def _summary(plan: Plan) -> ChatRun:
     run.problems = dict(Counter(problem.kind for problem in plan.problems))
     run.newly_enrolled = len(plan.context.newly_enrolled)
     return run
+
+
+def _archive_skips(plan: Plan) -> set[str]:
+    """Chats the archive pass leaves alone: deleted somewhere, or a copy it cannot judge."""
+
+    skips = {
+        problem.session_id
+        for problem in plan.problems
+        if problem.kind in ("unreadable", "future")
+    }
+    for snapshot in plan.context.snapshots:
+        skips.update(snapshot.tombstones)
+    return skips
+
+
+def _remember_archive_writes(state, context, applied) -> None:
+    """A copy still as last synced stays so, with only its archive state changed.
+
+    The chat sync then decides as it would have without the archive difference:
+    the copy that really changed still wins on its own.
+    """
+    folders = {str(target.path): key for key, target in context.targets.items()}
+    before = {snapshot.key: snapshot.records for snapshot in context.snapshots}
+    for operation in applied:
+        key = folders.get(str(Path(operation.destination).parent))
+        copy = before.get(key, {}).get(operation.session_id)
+        synced = state.sync.synced.get(key, {})
+        if copy is not None and copy.state_hash is not None:
+            if synced.get(operation.session_id) == copy.state_hash:
+                synced[operation.session_id] = operation.source_state_hash
 
 
 def _remember_placements(state, context, receipt: RunReceipt) -> None:

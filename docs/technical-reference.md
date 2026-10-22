@@ -684,6 +684,50 @@ fields (Remote Control ids, interruption and error marks, pending reminders)
 are ignored for this. Any other difference keeps the tie. `--prefer` still
 comes first.
 
+## Archived chats
+
+Archiving or unarchiving a chat changes only the copy in the folder of the
+account signed in at the time, and it does not move `lastActivityAt`. When
+that copy is also behind on a title, a pull request or a published page, the
+chat is a tie the tie-break cannot settle, so before 0.6.6 the archive never
+reached the other accounts. On 22 October 2026 that left 24 chats tied, and 16
+of them showed again in Recents after a switch.
+
+So the archive state is settled on its own, before the chat sync plans
+(`archive.py`):
+
+- **Remembered flags.** `chat-archive-state.json` in the state folder keeps
+  each copy's `isArchived`, with the file's size and save time. A file with
+  the same size and save time is not read again. Only the first 64 KB of a
+  changed file is read, where Claude writes `isArchived`.
+- **Fresh action.** A copy whose flag differs from the remembered one was
+  archived or unarchived since the last sync, at the time its file was saved.
+- **Use counts as opening.** Claude unarchives a chat that gets a message, so
+  an open copy's `lastActivityAt` or `resumedAt` counts as an unarchive.
+- **Newest wins.** Next to a fresh change, a copy that was already archived is
+  old news. With nothing remembered (the first sync), archived wins unless the
+  chat was used after the archived copy was saved.
+- **Only archive fields.** The other copies get the winner's `isArchived`, its
+  `autoArchiveExempt` from an unarchive (so Claude does not archive the chat
+  again by itself), and its `keptDirtyWorktree` and `keptDirtyAt` from an
+  archive (so no account forgets a kept worktree). Nothing is removed and no
+  other field changes.
+
+The writes go through the same journaled engine as the chat sync, so they can
+be rolled back. A copy that was still as last synced is remembered as still in
+step, with only its archive state changed, so the chat sync then decides as it
+would have without the archive difference. Chats with a delete marker or an
+unreadable copy are left to the chat sync. `plan` shows the counts as
+`archived_copies` and `unarchived_copies`; a sync report shows them when it
+changed a copy.
+
+Claude also keeps `archived-sessions.idx` in each folder: a list of archived
+chats it loads after the open ones. Sync leaves it alone. Claude reads each
+listed record's own `isArchived`, loads a listed chat that is open right after
+the open ones, and rewrites the list. Seen in Claude Desktop 3.1623.0.
+
+Set `"sync_archive_state": false` in the config to turn it off.
+
 ## Failure handling
 
 `auto` and `sync` report chats left alone in `counts` (`tied`, `lost`,

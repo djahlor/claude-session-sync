@@ -19,6 +19,7 @@ For people with more than one Claude account on one Mac, for example a work acco
 | What | When | Standard install |
 |---|---|---|
 | Claude Code chats | Each switch and each quit | On |
+| Whether a chat is archived | Each switch and each quit | On |
 | Custom groups, which Claude now calls sections | Each switch | On |
 | Claude Code routines, with their permission mode and saved approvals | Each switch and each quit | On |
 | Site logins in Claude's built-in browser | Each switch | Off, [turn it on](#browser-logins) |
@@ -66,6 +67,7 @@ A new account joins the next time Claude closes after you sign in and open the C
 - The copy that changed since the last sync wins. A click never counts.
 - If both changed, the one with the latest real activity wins.
 - If that is a tie, the chat is left alone and the status says so.
+- Archiving or unarchiving a chat reaches every account, even in a tie. The newest one wins, and using a chat counts as opening it ([how](docs/technical-reference.md#archived-chats)).
 - Deleted chats and routines stay deleted.
 - Only folders of accounts you really use take part. Leftover folders from an old Mac are ignored.
 
