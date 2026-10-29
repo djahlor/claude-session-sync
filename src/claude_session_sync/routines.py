@@ -58,11 +58,17 @@ DEFINITION_FIELDS = frozenset(
         "disableJitter",
     )
 )
-# A routine without a permissionMode falls back to its folder's default, which
-# is usually manual. These fields travel too, but each merges on its own, so a
-# copy that never chose a mode cannot erase another account's choice.
+# A routine without a permissionMode runs in the folder's Claude Code default
+# mode, which is manual unless settings.json says otherwise. These fields travel
+# too, but each merges on its own, so a copy that never chose a mode cannot
+# erase another account's choice.
 PERMISSION_FIELDS = ("permissionMode", "approvedPermissions")
-SYNCED_FIELDS = DEFINITION_FIELDS.union(PERMISSION_FIELDS)
+# Claude marks a mode copied from the chat that made the routine. While a
+# server flag is on, or before the flags load at start, a marked mode runs in
+# manual; choosing the mode clears the mark. The mark travels with the mode,
+# and one copy holding the same mode unmarked means it was chosen there.
+CARRIED_FIELD = "permissionModeCarried"
+SYNCED_FIELDS = DEFINITION_FIELDS.union(PERMISSION_FIELDS, (CARRIED_FIELD,))
 
 
 class RoutineError(RuntimeError):
@@ -222,7 +228,7 @@ def _validate_manifest(value: Any, label: str) -> dict[str, Any]:
         for key in ("displayName", "model", "cwd", "sourceBranch", "permissionMode"):
             if key in task and not isinstance(task[key], str):
                 raise RoutineError(f"{label} contains an invalid {key}")
-        for key in ("useWorktree", "disableJitter"):
+        for key in ("useWorktree", "disableJitter", CARRIED_FIELD):
             if key in task and not isinstance(task[key], bool):
                 raise RoutineError(f"{label} contains an invalid {key}")
         approved = task.get("approvedPermissions", [])
@@ -295,7 +301,23 @@ def _created_after(task: Any, deleted_at: int) -> bool:
 def _without_permissions(task: Any) -> Any:
     if task is MISSING:
         return MISSING
-    return {key: value for key, value in task.items() if key not in PERMISSION_FIELDS}
+    return {
+        key: value
+        for key, value in task.items()
+        if key not in PERMISSION_FIELDS and key != CARRIED_FIELD
+    }
+
+
+def _carried(mode: Any, baseline: Any, tasks: Sequence[Any]) -> bool:
+    def holds(task: Any) -> bool:
+        return task is not MISSING and _value_key(
+            _field(task, "permissionMode")
+        ) == _value_key(mode)
+
+    holders = [task for task in tasks if holds(task)]
+    if not holders and holds(baseline):
+        holders = [baseline]
+    return bool(holders) and all(task.get(CARRIED_FIELD) is True for task in holders)
 
 
 def _merge_task(
@@ -304,6 +326,7 @@ def _merge_task(
     samples: Sequence[RoutineSample],
     known_targets: set[TargetKey],
     task_maps: Mapping[TargetKey, Mapping[str, Mapping[str, Any]]],
+    mode_when_unset: str | None = None,
 ) -> Any:
     tasks = [
         (sample.mtime_ns, sample.target, task_maps[sample.target].get(key, MISSING))
@@ -331,6 +354,13 @@ def _merge_task(
         )
         if value is not MISSING:
             merged[field] = value
+    present = [task for _mtime, _target, task in tasks if task is not MISSING]
+    if "permissionMode" in merged and _carried(
+        merged["permissionMode"], baseline, present
+    ):
+        merged[CARRIED_FIELD] = True
+    if mode_when_unset is not None and "permissionMode" not in merged:
+        merged["permissionMode"] = mode_when_unset
     return merged
 
 
@@ -339,8 +369,12 @@ def transform_routine_manifests(
     *,
     snapshot: RoutineSnapshot | None = None,
     now_ms: int | None = None,
+    mode_when_unset: str | None = None,
 ) -> RoutineTransform:
-    """Three-way merge task records so additions, edits, and deletions propagate."""
+    """Three-way merge task records so additions, edits, and deletions propagate.
+
+    With mode_when_unset, a routine that no copy gives a mode gets that one.
+    """
 
     validated = tuple(
         RoutineSample(
@@ -405,6 +439,7 @@ def transform_routine_manifests(
             task_samples,
             known_targets,
             task_maps,
+            mode_when_unset,
         )
         if selected is not MISSING:
             merged_tasks.append(selected)
@@ -541,7 +576,9 @@ class RoutineSynchronizer:
         targets = self._targets()
         samples = tuple(self._sample(target) for target in targets)
         transform = transform_routine_manifests(
-            samples, snapshot=load_routine_snapshot(self._snapshot_path())
+            samples,
+            snapshot=load_routine_snapshot(self._snapshot_path()),
+            mode_when_unset=self.config.routine_mode_when_unset,
         )
         self._validate_task_files(transform.manifest)
         return {
@@ -579,6 +616,7 @@ class RoutineSynchronizer:
             transform = transform_routine_manifests(
                 samples,
                 snapshot=_decode_snapshot(snapshot_before),
+                mode_when_unset=self.config.routine_mode_when_unset,
             )
             self._validate_task_files(transform.manifest)
             current = {sample.path: sample.content for sample in samples}

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -233,6 +234,88 @@ class RoutineTransformTests(unittest.TestCase):
 
         self.assertNotIn("permissionMode", result.manifest["scheduledTasks"][0])
 
+    def test_carried_mark_travels_with_the_mode(self):
+        carried = dict(task("daily"), permissionMode="auto", permissionModeCarried=True)
+
+        result = transform_routine_manifests(
+            (sample("a", 10, manifest(carried)), sample("new", 0, None))
+        )
+
+        for document in result.documents.values():
+            self.assertEqual(carried, document["scheduledTasks"][0])
+
+    def test_choosing_the_mode_on_one_account_clears_the_mark_everywhere(self):
+        carried = dict(task("daily"), permissionMode="auto", permissionModeCarried=True)
+        chosen = dict(task("daily"), permissionMode="auto")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(carried)
+        )
+
+        result = transform_routine_manifests(
+            (sample("a", 30, manifest(carried)), sample("b", 10, manifest(chosen))),
+            snapshot=snapshot,
+        )
+
+        for document in result.documents.values():
+            self.assertEqual(chosen, document["scheduledTasks"][0])
+
+    def test_an_old_copy_without_the_mark_counts_as_chosen(self):
+        # Before 0.6.7 the mark stayed on the account that made the routine.
+        carried = dict(task("daily"), permissionMode="auto", permissionModeCarried=True)
+        copied = dict(task("daily"), permissionMode="auto")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(copied)
+        )
+
+        result = transform_routine_manifests(
+            (sample("a", 10, manifest(carried)), sample("b", 10, manifest(copied))),
+            snapshot=snapshot,
+        )
+
+        for document in result.documents.values():
+            self.assertEqual(copied, document["scheduledTasks"][0])
+
+    def test_a_new_mode_drops_the_old_mark(self):
+        carried = dict(task("daily"), permissionMode="auto", permissionModeCarried=True)
+        chosen = dict(task("daily"), permissionMode="bypassPermissions")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"), ("Work", "b", "org")), manifest(carried)
+        )
+
+        result = transform_routine_manifests(
+            (sample("a", 30, manifest(carried)), sample("b", 10, manifest(chosen))),
+            snapshot=snapshot,
+        )
+
+        for document in result.documents.values():
+            self.assertEqual(chosen, document["scheduledTasks"][0])
+
+    def test_mode_when_unset_fills_only_routines_without_a_mode(self):
+        manual = dict(task("manual"), permissionMode="default")
+        auto = dict(task("auto"), permissionMode="auto")
+        snapshot = RoutineSnapshot(
+            (("Work", "a", "org"),), manifest(task("unset"), manual, auto)
+        )
+
+        result = transform_routine_manifests(
+            (
+                sample("a", 10, manifest(task("unset"), manual, auto)),
+                sample("new", 0, None),
+            ),
+            snapshot=snapshot,
+            mode_when_unset="auto",
+        )
+
+        for document in result.documents.values():
+            modes = {
+                item["id"]: item["permissionMode"]
+                for item in document["scheduledTasks"]
+            }
+            self.assertEqual(
+                {"unset": "auto", "manual": "default", "auto": "auto"}, modes
+            )
+        self.assertNotIn("permissionModeCarried", result.manifest["scheduledTasks"][2])
+
     def test_malformed_permission_settings_are_rejected(self):
         for field, value in (
             ("permissionMode", 1),
@@ -240,6 +323,7 @@ class RoutineTransformTests(unittest.TestCase):
             ("approvedPermissions", [{"ruleContent": "git status"}]),
             ("approvedPermissions", [{"toolName": "Bash", "ruleContent": 5}]),
             ("approvedPermissions", [{"toolName": "Bash", "expired": "no"}]),
+            ("permissionModeCarried", "yes"),
         ):
             with self.subTest(field=field, value=value):
                 with self.assertRaisesRegex(RoutineError, "invalid"):
@@ -704,6 +788,20 @@ class RoutineSynchronizerTests(unittest.TestCase):
         self.assertEqual("bypassPermissions", copied["permissionMode"])
         self.assertEqual(approved, copied["approvedPermissions"])
         self.assertNotIn("lastRunAt", copied)
+        self.assertEqual("noop", self.synchronizer().sync().state)
+
+    def test_real_sync_saves_the_configured_mode_on_routines_without_one(self):
+        first = self.target("a")
+        second = self.target("b")
+        first_path = self.write_manifest(first, manifest(self.daily()), 10)
+        second_path = self.write_manifest(second, manifest(self.daily()), 20)
+        self.config = replace(self.config, routine_mode_when_unset="auto")
+
+        self.assertEqual("synced", self.synchronizer().sync().state)
+
+        for path in (first_path, second_path):
+            copied = json.loads(path.read_text())["scheduledTasks"][0]
+            self.assertEqual("auto", copied["permissionMode"])
         self.assertEqual("noop", self.synchronizer().sync().state)
 
     def test_post_commit_edit_is_detected_against_atomic_snapshot(self):
