@@ -4,6 +4,16 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.6.7] - 2026-10-29
+
+### Fixed
+
+- Routines ran in manual after a switch. Claude marks a mode it copied from the chat that made a routine, and while a server flag is on, or before the flags load right after Claude starts, a marked mode runs in manual. The mark stayed on the account that made the routine: after choosing the mode on another account and switching back, the routine still ran in manual there. The mark now travels with the mode, and a copy that holds the same mode without it clears it everywhere. 15 routines held a mark on one account on 29-10-2026.
+
+### Added
+
+- `routine_mode_when_unset` in the config. A routine made by a chat can be saved with no mode, and then every run starts in manual on every account: 8 of 25 routines on 29-10-2026. With this set, the sync saves that mode on each routine no copy gives a mode. A mode chosen on the routine's page, manual included, never changes. Off by default.
+
 ## [0.6.6] - 2026-10-22
 
 ### Fixed

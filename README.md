@@ -25,7 +25,7 @@ For people with more than one Claude account on one Mac, for example a work acco
 | Site logins in Claude's built-in browser | Each switch | Off, [turn it on](#browser-logins) |
 | Pictures sent in a chat, shown from your Mac in every account ([how](docs/technical-reference.md#pictures-sent-in-a-chat)) | Each switch | On |
 
-It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account.
+It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account. A routine saved with no mode runs in manual on every account; `routine_mode_when_unset` in the config gives such routines a mode ([how](docs/technical-reference.md#claude-code-routines)).
 
 ## Requirements
 

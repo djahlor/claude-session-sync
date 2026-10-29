@@ -144,6 +144,35 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "cross_account_copy"):
                 load_config(path)
 
+    def test_routine_mode_when_unset_is_off_by_default_and_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = {
+                "version": 1,
+                "approved_targets": [],
+                "profiles": [self.profile("Claude", root)],
+                "state_dir": str(root / "state"),
+                "retention": 10,
+                "acknowledge_cross_profile_copy": False,
+                "acknowledge_cross_account_copy": False,
+                "claude_executable": "/Applications/Claude.app/Contents/MacOS/Claude",
+            }
+            path = self.write_config(root, document)
+            self.assertIsNone(load_config(path).routine_mode_when_unset)
+
+            path = self.write_config(
+                root, {**document, "routine_mode_when_unset": "auto"}
+            )
+            self.assertEqual("auto", load_config(path).routine_mode_when_unset)
+
+            for value in ("yolo", "dontAsk", True):
+                with self.subTest(value=value):
+                    path = self.write_config(
+                        root, {**document, "routine_mode_when_unset": value}
+                    )
+                    with self.assertRaisesRegex(ConfigError, "routine_mode_when_unset"):
+                        load_config(path)
+
 
 class PlannerTests(unittest.TestCase):
     def config(self, root: Path) -> Config:

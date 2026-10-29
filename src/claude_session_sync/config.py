@@ -37,6 +37,9 @@ class Config:
     fix_chat_pictures: bool = True
     # Archive or unarchive a chat in every account, the newest action winning.
     sync_archive_state: bool = True
+    # Save this permission mode on a routine that has none, so it stops running
+    # in manual. Off when None.
+    routine_mode_when_unset: Union[str, None] = None
     version: int = 1
 
 
@@ -55,6 +58,7 @@ _CONFIG_KEYS = {
     "sync_browser_logins",
     "fix_chat_pictures",
     "sync_archive_state",
+    "routine_mode_when_unset",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "target_policy",
@@ -63,7 +67,10 @@ _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "sync_browser_logins",
     "fix_chat_pictures",
     "sync_archive_state",
+    "routine_mode_when_unset",
 }
+# The modes Claude's routine page offers.
+ROUTINE_MODES = ("default", "acceptEdits", "plan", "auto", "bypassPermissions")
 _PROFILE_KEYS = {"name", "data_root", "launch_command", "enabled", "is_default"}
 _TARGET_KEYS = {"profile", "account", "workspace"}
 _TARGET_POLICIES = {"approved-only", "all-configured-profiles", "logins"}
@@ -234,6 +241,15 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_archive_state = document.get("sync_archive_state", True)
     if not isinstance(sync_archive_state, bool):
         raise ConfigError("sync_archive_state must be a boolean")
+    routine_mode_when_unset = document.get("routine_mode_when_unset")
+    if routine_mode_when_unset is not None and (
+        routine_mode_when_unset not in ROUTINE_MODES
+    ):
+        raise ConfigError(
+            "routine_mode_when_unset must be null or one of: {}".format(
+                ", ".join(ROUTINE_MODES)
+            )
+        )
 
     claude_executable = Path(
         _nonempty_string(document["claude_executable"], "claude_executable")
@@ -253,5 +269,6 @@ def load_config(path: Union[str, Path]) -> Config:
         sync_browser_logins=sync_browser_logins,
         fix_chat_pictures=fix_chat_pictures,
         sync_archive_state=sync_archive_state,
+        routine_mode_when_unset=routine_mode_when_unset,
         version=version,
     )

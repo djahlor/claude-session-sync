@@ -622,9 +622,25 @@ delete made in a known folder during the same sync.
 Each multi-file update has exact preimages, post-write verification, automatic
 rollback, and crash recovery. Manifests and their comparison snapshot share one
 transaction. Definitions sync, including each routine's permission mode and
-saved approvals, because a routine without a mode falls back to its folder's
-default, which is usually manual. Each permission field merges on its own, so a
-copy that never chose a mode cannot erase another account's choice. Bypass mode
+saved approvals, because a routine without a mode runs in the folder's Claude
+Code default mode, which is manual unless `permissions.defaultMode` in
+`settings.json` says otherwise. Each permission field merges on its own, so a
+copy that never chose a mode cannot erase another account's choice.
+
+Claude marks a mode that it copied from the chat that made the routine
+(`permissionModeCarried`). While a server flag is on for the signed-in account,
+or before the flags load right after Claude starts, a run with a marked mode
+starts in manual. Choosing the mode on the routine's page clears the mark. The
+mark travels with the mode. When one copy holds the same mode without the mark,
+the mode was chosen there and the mark goes from every copy; copies made before
+0.6.7 never got the mark and count the same way.
+
+A routine made by a chat can be saved with no mode at all, and then every run
+starts in manual on every account. Set `"routine_mode_when_unset"` in the
+config to one of `default`, `acceptEdits`, `plan`, `auto` or
+`bypassPermissions`, and the sync saves that mode, unmarked, on each routine
+that no copy gives a mode. A mode chosen on the routine's page, manual
+included, is never changed. Off (`null`) by default. Bypass mode
 still needs bypass turned on in each account's Claude settings; elsewhere the
 run drops to accept-edits. Execution history and unknown metadata remain local
 to each destination. Routine errors are reported separately
