@@ -6,6 +6,7 @@ automatic_targets=false
 sync_layout=false
 sync_routines=false
 sync_browser_logins=false
+stop_artifact_warnings=false
 
 for argument in "$@"; do
   case "$argument" in
@@ -21,9 +22,12 @@ for argument in "$@"; do
     --sync-browser-logins)
       sync_browser_logins=true
       ;;
+    --stop-artifact-warnings)
+      stop_artifact_warnings=true
+      ;;
     *)
       echo "Unknown option: $argument" >&2
-      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins]" >&2
+      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins] [--stop-artifact-warnings]" >&2
       exit 2
       ;;
   esac
@@ -77,6 +81,9 @@ fi
 if [[ "$sync_browser_logins" == true ]]; then
   setup_args+=(--sync-browser-logins)
 fi
+if [[ "$stop_artifact_warnings" == true ]]; then
+  setup_args+=(--stop-artifact-warnings)
+fi
 run_source_cli setup "${setup_args[@]}" --apply
 
 echo
@@ -99,4 +106,7 @@ if [[ "$sync_routines" == true ]]; then
 fi
 if [[ "$sync_browser_logins" == true ]]; then
   echo "The built-in browser's site logins come back after an account switch."
+fi
+if [[ "$stop_artifact_warnings" == true ]]; then
+  echo "Claude no longer answers artifact comments by itself, so its 'didn't resume' warnings stop."
 fi

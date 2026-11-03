@@ -742,6 +742,82 @@ partition, its local storage, and that jar's entries in
   SHA-256 hash.
 - A failure here never blocks chat sync or the relaunch.
 
+## Artifact warnings
+
+Optional, off by default (`stop_artifact_warnings`). Turn it on with
+`configure --stop-artifact-warnings --apply`, `setup --stop-artifact-warnings`
+or `./install.sh --stop-artifact-warnings`. Seen in Claude Code 2.1.309, the
+engine that Claude Desktop downloads and runs, on 29 October 2026.
+
+Publishing an artifact turns on automatic replies to its comments. The chat
+saves the watch as a line of type `artifact-comment-monitor` in its transcript,
+`~/.claude/projects/<folder>/<session>.jsonl` (or under `CLAUDE_CONFIG_DIR`),
+and writes a new line each time its list of pages changes. When the chat opens
+again, Claude Code tries to restart every saved watch. A page owned by another
+account cannot be watched from the account signed in now, so after a switch
+each restart fails with a red "Artifact comment monitor ... didn't resume"
+notice. The lines never expire. One Mac held 2,501 such lines in 165 chats on
+29 October 2026.
+
+The cost: Claude stops answering comments on your artifacts by itself in the
+background. The switch below is not in Anthropic's documentation. A Claude
+Code update could rename or remove it, and the warnings would then come back.
+
+`switch`, `auto` and `sync` do two things right after Claude quits, before
+the chat sync:
+
+- **The switch.** The `env` block of `settings.json` gets
+  `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"`. Claude Code checks it
+  before it saves a watch, so a chat started after it saves none. A chat that
+  was already running when it was set, such as one in a terminal, keeps saving
+  watches until it restarts. The edit inserts that one member into the text,
+  in the file's own indentation, and checks that the result parses to the old
+  settings plus the switch. Every other byte stays, and so does the file's
+  mode. A missing `env` block is added, and a missing file is created with
+  mode `0600`. A key already there, with any value, is left alone. A
+  `settings.json` that is a symbolic link (`settings-link`), does not parse as
+  plain JSON (`settings-unreadable`), or changed while sync edited it
+  (`settings-changed`) is left alone too. The transcripts are still cleared.
+- **The saved watches.** Every line whose JSON `type` is exactly
+  `artifact-comment-monitor` goes from each transcript. A line that only
+  mentions the name stays. Each removed line is first appended to
+  `artifact-warnings-removed.jsonl` in the state folder (mode `0600`), with its
+  file, its line number and the line itself, then the transcript is replaced
+  by a copy without those lines, with the same mode. A transcript that changed
+  meanwhile is left for the next sync. A line still being written, with no
+  line end yet, stays. Symbolic links are not followed.
+
+A chat whose Claude Code process may still run is skipped, because it holds
+its watches in memory and keeps writing to its transcript. Sync reads the
+process table and skips a transcript when:
+
+- its session id is in a running command line (`--resume`, `--session-id` or
+  `-r`),
+- it was saved after a running Claude Code process started, whether or not
+  that process names a session, because a process can move to a new
+  transcript (with `--fork-session`, for example), or
+- it was saved in the last 30 seconds.
+
+If Claude opens again during the run, cleaning stops there. A skipped
+transcript is cleared by a later sync once its chat has closed. Each
+transcript is read once: `artifact-warnings-offsets.json` keeps how far it was
+read, and a replaced transcript is read again from the start.
+
+`artifact-warnings-switch.json` records that sync put the switch in. To turn
+the option off, set `"stop_artifact_warnings": false` in the config. The next
+sync then takes the switch out, only when that record exists and the switch
+still says `"0"`. When sync also added the `env` block and nothing else was
+added to it since, the block goes too, and the file is back to what it was. A
+switch you set yourself is never taken out.
+
+The last result is in `artifact-warnings-status.json`. A sync report shows an
+`artifact_warnings` field only when it changed something or failed: `switch`
+(`added`, `present`, `other-value`, `not-set`), `records` and `chats` cleared,
+and `open_chats` skipped. `status` shows `artifact_warnings=on` or `off`,
+`counts.artifact_warnings_cleared` for the records the last sync removed, and
+`artifact_warnings_reason` when the last run failed. A failure here never
+blocks chat sync or the relaunch.
+
 ## Ties
 
 Copies of a chat that differ at the same `lastActivityAt` are a tie. Claude
@@ -878,7 +954,9 @@ claude-session-sync uninstall --apply
 Uninstall removes only the generated runtime, watcher, sidebar helper, and
 LaunchAgent by moving them into the tool's backup area. It preserves the
 private config, transaction state, and the original Claude application for
-recovery.
+recovery. It also leaves the [artifact warnings](#artifact-warnings) switch in
+`settings.json`. To take it out, set `"stop_artifact_warnings": false` and let
+Claude close once before you uninstall, or delete the line yourself.
 
 ## Development
 

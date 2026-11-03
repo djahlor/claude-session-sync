@@ -157,6 +157,33 @@ def _fix_chat_pictures(config: Config, deps: CliDependencies, payload: dict) -> 
         payload["pictures"] = result
 
 
+def _default_artifact_warnings(config: Config, running: Callable[[], bool]) -> dict:
+    from .artifact_warnings import run_artifact_warnings
+
+    return run_artifact_warnings(config, running)
+
+
+def _stop_artifact_warnings(config: Config, deps: CliDependencies) -> dict:
+    """Claude is closed: switch off automatic artifact comment replies and clear
+    the saved watches behind the "didn't resume" warnings. Never raises.
+
+    It runs right after Claude quits, before the chat sync, so a Claude opened
+    again during a long chat sync still starts with the switch set.
+    """
+    try:
+        return deps.artifact_warnings(
+            config, lambda: bool(_running_processes(config, deps))
+        )
+    except Exception as error:
+        return {"state": "skipped", "reason": type(error).__name__}
+
+
+def _report_artifact_warnings(result: dict, payload: dict) -> None:
+    """Reported only when it acts or fails."""
+    if result and result.get("state") != "noop":
+        payload["artifact_warnings"] = result
+
+
 @dataclass(frozen=True)
 class CliDependencies:
     """Injected system boundaries used by command tests and platform adapters."""
@@ -172,6 +199,9 @@ class CliDependencies:
     picture_factory: Callable[[Config], Any] = _default_picture_factory
     live_engine_factory: Callable[..., Any] = _default_live_engine_factory
     live_routine_factory: Callable[..., Any] = _default_live_routine_factory
+    artifact_warnings: Callable[[Config, Callable[[], bool]], dict] = (
+        _default_artifact_warnings
+    )
     clock: Callable[[], float] = time.monotonic
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
@@ -358,6 +388,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep the built-in browser's site logins across account switches",
     )
+    configure.add_argument(
+        "--stop-artifact-warnings",
+        action="store_true",
+        help="turn off automatic artifact comment replies and their 'didn't resume' warnings",
+    )
     configure_mode = configure.add_mutually_exclusive_group(required=True)
     configure_mode.add_argument("--dry-run", action="store_true")
     configure_mode.add_argument("--apply", action="store_true")
@@ -368,6 +403,7 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
     setup.add_argument("--sync-browser-logins", action="store_true")
+    setup.add_argument("--stop-artifact-warnings", action="store_true")
     setup.add_argument(
         "--ask-main-account",
         action="store_true",
@@ -597,6 +633,7 @@ def _run_switch(
         # the long chat sync. Claude then starts with the new account already
         # known and does not clear it again.
         browser_logins = _settle_browser_logins(config, dependencies, (profile,))
+        artifact_warnings = _stop_artifact_warnings(config, dependencies)
         try:
 
             def running() -> bool:
@@ -628,6 +665,7 @@ def _run_switch(
                 )
             )
             payload.update(layout_first)
+            _report_artifact_warnings(artifact_warnings, payload)
             payload["progress"] = finish_progress(config, payload)
         finally:
             # Claude was closed for this switch. It reopens even when the sync
@@ -1220,6 +1258,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
         # Before the chat sync, while Claude is surely closed: a restore a
         # switch missed comes back now, else the jar is saved.
         browser_logins = _settle_browser_logins(config, deps, config.profiles)
+        artifact_warnings = _stop_artifact_warnings(config, deps)
         try:
             payload = _chat_payload(arguments, config, deps)
         except Exception as error:
@@ -1242,6 +1281,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
             browser_logins = _settle_browser_logins(config, deps, config.profiles)
         if browser_logins["state"] != "disabled":
             payload["browser_logins"] = browser_logins
+        _report_artifact_warnings(artifact_warnings, payload)
         payload["progress"] = finish_progress(config, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
         return _exit_code(arguments, payload["progress"])
@@ -1321,6 +1361,7 @@ def _cmd_setup(
         sync_layout=arguments.sync_layout,
         sync_routines=arguments.sync_routines,
         sync_browser_logins=arguments.sync_browser_logins,
+        stop_artifact_warnings=arguments.stop_artifact_warnings,
     )
     ask = None
     if arguments.ask_main_account and arguments.apply:
@@ -1351,6 +1392,7 @@ def _cmd_configure(
         sync_layout=arguments.sync_layout,
         sync_routines=arguments.sync_routines,
         sync_browser_logins=arguments.sync_browser_logins,
+        stop_artifact_warnings=arguments.stop_artifact_warnings,
         apply=arguments.apply,
     )
     _write(payload, as_json=False, stream=output)
@@ -1499,7 +1541,10 @@ def _status_state(
 def _cmd_status(
     arguments, config: Config, deps: CliDependencies, output: TextIO
 ) -> int:
+    from .artifact_warnings import status_fields
+
     running = _running_processes(config, deps)
+    warnings = status_fields(config)
     watcher_error = watcher_failure(config.state_dir)
     layout_failure = adapter_failure(config, "layout")
     routine_failure = adapter_failure(config, "routines")
@@ -1516,6 +1561,7 @@ def _cmd_status(
             "bytes": 0,
             "counts": {
                 "abandoned_preparations": abandoned,
+                "artifact_warnings_cleared": warnings.pop("cleared"),
                 "layout_failures": layout_failure,
                 "profiles": len(config.profiles),
                 "routine_failures": routine_failure,
@@ -1527,6 +1573,7 @@ def _cmd_status(
             "state": _status_state(
                 running, layout_failure, routine_failure, watcher_error
             ),
+            **warnings,
         },
         as_json=arguments.as_json,
         stream=output,

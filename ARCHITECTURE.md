@@ -161,6 +161,19 @@ an empty jar never replaces a saved copy. With Claude closed, `switch` and
 from the copy's; an empty jar under the same account is a deliberate clear and
 marks the copy as never to restore. The live jar is backed up before a restore.
 Only counts, times and a hash of the account id are recorded.
+
+## Artifact warning adapter
+
+The optional adapter (`stop_artifact_warnings`) runs with Claude closed, right
+after Claude quits. It adds `CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT: "0"` to
+the `env` block of Claude Code's `settings.json` as one text insert, verified
+by parsing, and records that it did, so turning the option off removes only a
+switch it added. It then removes `artifact-comment-monitor` lines from closed
+chats' transcripts, after appending each one to a private backup, and replaces
+a transcript only if it did not change while it was copied. Chats that the
+process table says may be open are skipped, and cleaning stops if Claude opens
+again. A failure is reported and never blocks chat sync.
+
 ## State machine
 
 ```text

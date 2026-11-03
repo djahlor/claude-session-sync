@@ -82,6 +82,7 @@ def prepare_config_data(
     sync_layout: bool,
     sync_routines: bool,
     sync_browser_logins: bool = False,
+    stop_artifact_warnings: bool = False,
 ) -> tuple[bytes, dict]:
     """Return validated desired config bytes and a safe change summary."""
 
@@ -94,6 +95,7 @@ def prepare_config_data(
         sync_layout=sync_layout,
         sync_routines=sync_routines,
         sync_browser_logins=sync_browser_logins,
+        stop_artifact_warnings=stop_artifact_warnings,
     )
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     validate_config_data(encoded)
@@ -108,6 +110,7 @@ def configure_file(
     sync_routines: bool,
     apply: bool,
     sync_browser_logins: bool = False,
+    stop_artifact_warnings: bool = False,
 ) -> dict:
     from .filesystem import atomic_write_bytes, ensure_private_directory
 
@@ -118,6 +121,7 @@ def configure_file(
         sync_layout=sync_layout,
         sync_routines=sync_routines,
         sync_browser_logins=sync_browser_logins,
+        stop_artifact_warnings=stop_artifact_warnings,
     )
 
     changes = payload["counts"]["changes"]
@@ -139,6 +143,7 @@ def _apply_config_options(
     sync_layout: bool,
     sync_routines: bool,
     sync_browser_logins: bool = False,
+    stop_artifact_warnings: bool = False,
 ) -> int:
     changes = _drop_personal_profile(document)
 
@@ -164,6 +169,10 @@ def _apply_config_options(
 
     if sync_browser_logins and document.get("sync_browser_logins") is not True:
         document["sync_browser_logins"] = True
+        changes += 1
+
+    if stop_artifact_warnings and document.get("stop_artifact_warnings") is not True:
+        document["stop_artifact_warnings"] = True
         changes += 1
 
     return changes
@@ -204,5 +213,8 @@ def _config_summary(document: dict, changes: int) -> dict:
             "layout_sync": int(document.get("sync_sidebar_layout") is True),
             "routine_sync": int(document.get("sync_code_routines") is True),
             "browser_login_sync": int(document.get("sync_browser_logins") is True),
+            "artifact_warnings_stopped": int(
+                document.get("stop_artifact_warnings") is True
+            ),
         },
     }
