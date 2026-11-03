@@ -677,7 +677,13 @@ delete made in a known folder during the same sync.
 
 Each multi-file update has exact preimages, post-write verification, automatic
 rollback, and crash recovery. Manifests and their comparison snapshot share one
-transaction. Definitions sync, including each routine's permission mode and
+transaction. A run cut short, for example because Claude opened while it wrote,
+is rolled back to the exact old files when it can be. Once Claude has saved
+something of its own in one of those manifests, such as a routine's last run
+time or a new routine, the next sync puts back only the old comparison snapshot
+and keeps every manifest as it is. The merge then reads what the run wrote as
+edits that agree with each other, so the run finishes and Claude's own changes
+stay. A snapshot that changed outside the tool still needs attention. Definitions sync, including each routine's permission mode and
 saved approvals, because a routine without a mode runs in the folder's Claude
 Code default mode, which is manual unless `permissions.defaultMode` in
 `settings.json` says otherwise. Each permission field merges on its own, so a

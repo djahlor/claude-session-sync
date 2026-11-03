@@ -779,6 +779,9 @@ class RoutineSynchronizer:
             validate=validate,
             before_mutation=self._assert_stopped,
             retention=self.config.retention,
+            # Each manifest write is one atomic step toward the merge result.
+            # With the old snapshot back, a run cut short is merged again.
+            merge_baseline=str(self._snapshot_path()),
         )
 
     def _commit(

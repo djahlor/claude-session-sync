@@ -664,6 +664,69 @@ class RoutineSynchronizerTests(unittest.TestCase):
         self.assertEqual(original, second_path.read_bytes())
         self.assertEqual("ROLLED_BACK", json.loads(journal_path.read_text())["state"])
 
+    def test_run_cut_short_by_reopened_claude_merges_again_after_claude_edits(self):
+        # 01-11-2026: Claude reopened while a sync wrote routines, so neither
+        # the write nor its rollback could go on. Claude then saved run times
+        # into a manifest the run had not reached, and every later sync
+        # stopped on "recovery found independently changed data".
+        first = self.target("a")
+        second = self.target("b")
+        third = self.target("c")
+        for target in (first, second, third):
+            self.write_manifest(target, manifest(self.daily()))
+        self.synchronizer().sync()
+        new_skill = self.skill.parent.parent / "new" / "SKILL.md"
+        new_skill.parent.mkdir()
+        new_skill.write_text("new prompt", encoding="utf-8")
+        self.write_manifest(
+            first, manifest(self.daily(), task("new", str(new_skill))), 2**62
+        )
+        claude_open = False
+        manifest_writes = []
+        write = routines_module.atomic_write_bytes
+
+        def reopen_claude_after_first_manifest(path, value):
+            nonlocal claude_open
+            write(path, value)
+            if Path(path).name == "scheduled-tasks.json":
+                manifest_writes.append(Path(path))
+                claude_open = True
+
+        synchronizer = RoutineSynchronizer(
+            self.config,
+            task_root=self.skill.parent.parent,
+            process_probe=lambda *args, **kwargs: ("Claude",) if claude_open else (),
+        )
+        with patch.object(
+            routines_module,
+            "atomic_write_bytes",
+            side_effect=reopen_claude_after_first_manifest,
+        ):
+            with self.assertRaisesRegex(RoutineError, "recovery requires attention"):
+                synchronizer.sync()
+        self.assertEqual([second / "scheduled-tasks.json"], manifest_writes)
+        ran = self.daily()
+        ran["lastRunAt"] = "2026-11-02T22:10:00Z"
+        third_path = self.write_manifest(third, manifest(ran))
+        claude_open = False
+
+        receipt = synchronizer.sync()
+
+        self.assertEqual("synced", receipt.state)
+        for target in (first, second, third):
+            tasks = json.loads((target / "scheduled-tasks.json").read_text())
+            self.assertEqual(
+                ["daily", "new"], [item["id"] for item in tasks["scheduledTasks"]]
+            )
+        third_tasks = json.loads(third_path.read_text())["scheduledTasks"]
+        self.assertEqual("2026-11-02T22:10:00Z", third_tasks[0]["lastRunAt"])
+        states = [
+            json.loads(path.read_text())["state"]
+            for path in synchronizer._journal_root().glob("*.json")
+        ]
+        self.assertNotIn("RECOVERY_REQUIRED", states)
+        self.assertEqual("noop", synchronizer.sync().state)
+
     def test_failed_multi_manifest_write_restores_exact_preimages(self):
         first = self.target("a")
         second = self.target("b")

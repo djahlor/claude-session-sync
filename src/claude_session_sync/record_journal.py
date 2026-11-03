@@ -62,6 +62,7 @@ class RecordJournal:
         retention: int,
         recovery_equivalent: Callable[[str, bytes | None, bytes | None], bool]
         | None = None,
+        merge_baseline: str | None = None,
     ) -> None:
         self.root = root
         self.read = read
@@ -73,6 +74,11 @@ class RecordJournal:
         # Used only to settle an entire unchanged payload without writing data.
         # Partial rollback and normal commits always require exact bytes.
         self.recovery_equivalent = recovery_equivalent
+        # The target an adapter's next merge compares every other target with.
+        # When independently changed data blocks an exact rollback, recovery
+        # puts back only this target and keeps the rest: the next merge then
+        # reads what the run wrote as edits that agree with each other.
+        self.merge_baseline = merge_baseline
 
     def _load(self, path: Path) -> dict[str, Any]:
         try:
@@ -199,6 +205,23 @@ class RecordJournal:
             for path in sorted(self.root.glob("*.json"))
         )
 
+    def _restore_merge_baseline(
+        self, records: Sequence[Record], current: Mapping[str, bytes | None]
+    ) -> bool:
+        if all(current[item.target] in (item.before, item.after) for item in records):
+            return False
+        baseline = next(
+            (item for item in records if item.target == self.merge_baseline), None
+        )
+        if baseline is None or current[baseline.target] not in (
+            baseline.before,
+            baseline.after,
+        ):
+            return False
+        self._restore([baseline])
+        self.before_mutation()
+        return True
+
     def recover(self) -> None:
         if not os.path.lexists(str(self.root)):
             return
@@ -223,14 +246,23 @@ class RecordJournal:
                     }
             else:
                 try:
-                    self._restore(records)
+                    merge_again = self._restore_merge_baseline(records, current)
+                    if not merge_again:
+                        self._restore(records)
                 except BaseException as error:
                     document["state"] = "RECOVERY_REQUIRED"
                     self._save(path, document)
                     raise RecordRecoveryError(
                         f"recovery requires attention: {error}"
                     ) from error
-                document["state"] = "ROLLED_BACK"
+                if merge_again:
+                    document["state"] = "COMMITTED"
+                    document["recovery"] = "merge-again"
+                    document["recovery_observed_sha256"] = {
+                        target: digest(value) for target, value in current.items()
+                    }
+                else:
+                    document["state"] = "ROLLED_BACK"
             self._save(path, document)
 
     def commit(
