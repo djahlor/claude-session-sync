@@ -24,8 +24,8 @@ Optional, off by default (`stop_artifact_warnings`). With Claude closed:
    state folder.
 
 The cost: Claude stops answering artifact comments by itself in the
-background. Anthropic does not document the switch. It was found in Claude
-Code 2.1.309, and an update could remove it.
+background. The switch is listed in Anthropic's Claude Code environment
+variables (https://code.claude.com/docs/en/env-vars), from Claude Code 2.1.228.
 """
 
 from __future__ import annotations

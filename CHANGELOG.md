@@ -4,6 +4,22 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.8.0] - 2026-11-03
+
+### Added
+
+- The install asks once whether to stop the red "Artifact comment monitor ... didn't resume" warnings, and says the cost: Claude stops answering comments on artifact pages by itself. Enter means no. The answer is saved in the config, so an update never asks again; agents and scripts pass `--stop-artifact-warnings` instead.
+- The share-artifacts skill for Claude Code. An artifact page belongs to the account that published it and looks deleted on the others. Ask Claude "share this page with my other accounts": it finds the page, asks whether the other accounts should read it or also edit it, gives the Share clicks with the emails to paste, and checks the result. The install offers to add it, and each update keeps it current. Sync does not share pages itself, because that would mean reading Claude's sign-in and scripting claude.ai, which Anthropic's terms forbid; evidence in [docs/artifact-sharing-findings.md](docs/artifact-sharing-findings.md).
+- `get.sh` passes options after a dash to the installer, for an install with no questions: `zsh -c "$(curl -fsSL .../get.sh)" - --stop-artifact-warnings --share-skill`.
+
+### Changed
+
+- The status window can be closed: it has a close button, a click on it closes it, and it closes by itself after 8 seconds instead of 10. **Show the status window** in the **Sync** menu turns it off for good. It no longer opens at every login or update, only when Claude quits or reopens by itself or sync needs attention.
+
+### Fixed
+
+- The README, the technical reference and the 0.6.8 notes said Anthropic does not document `CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT`. It is listed in the [Claude Code environment variables](https://code.claude.com/docs/en/env-vars), from Claude Code 2.1.228.
+
 ## [0.7.1] - 2026-11-03
 
 ### Added
@@ -30,7 +46,7 @@ To update, run the install command in the [README](README.md#install) again. Che
 
 ### Added
 
-- `stop_artifact_warnings` in the config, to stop the red "Artifact comment monitor ... didn't resume" warnings. Each artifact page Claude publishes turns on automatic replies to its comments and saves a note in the chat's history. Reopening the chat restarts every saved note, and after an account switch a page owned by another account fails each time: 2,501 notes in 165 chats on 29-10-2026. With `configure --stop-artifact-warnings --apply`, each sync with Claude closed adds `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"` to the `env` block of `~/.claude/settings.json`, so new chats save no notes, and removes the saved notes from closed chats after a backup. A chat whose Claude Code process still runs is skipped. Turned off, the next sync takes the key out only if sync put it in. The cost: Claude no longer answers artifact comments by itself in the background. Anthropic does not document the switch; it was found in Claude Code 2.1.309, and an update could remove it. `status` shows `artifact_warnings` and `artifact_warnings_cleared`. Off by default.
+- `stop_artifact_warnings` in the config, to stop the red "Artifact comment monitor ... didn't resume" warnings. Each artifact page Claude publishes turns on automatic replies to its comments and saves a note in the chat's history. Reopening the chat restarts every saved note, and after an account switch a page owned by another account fails each time: 2,501 notes in 165 chats on 29-10-2026. With `configure --stop-artifact-warnings --apply`, each sync with Claude closed adds `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"` to the `env` block of `~/.claude/settings.json`, so new chats save no notes, and removes the saved notes from closed chats after a backup. A chat whose Claude Code process still runs is skipped. Turned off, the next sync takes the key out only if sync put it in. The cost: Claude no longer answers artifact comments by itself in the background. The switch is listed in Anthropic's [Claude Code environment variables](https://code.claude.com/docs/en/env-vars), from Claude Code 2.1.228. `status` shows `artifact_warnings` and `artifact_warnings_cleared`. Off by default.
 
 ## [0.6.7] - 2026-10-29
 

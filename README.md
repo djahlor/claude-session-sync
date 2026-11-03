@@ -2,7 +2,7 @@
 
 [![Test](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Keep your Claude Code chats, groups, routines and browser logins when you switch accounts in the Claude Desktop app on a Mac.
+Keep your Claude Code chats, groups, routines and browser logins when you switch accounts in the Claude Desktop app on a Mac, and stop the artifact warnings that switching leaves behind.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
@@ -24,6 +24,8 @@ For people with more than one Claude account on one Mac, for example a work acco
 | Claude Code routines, with their permission mode and saved approvals | Each switch and each quit | On |
 | Site logins in Claude's built-in browser | Each switch, with one restart | Off, [turn it on](#browser-logins) |
 | Pictures sent in a chat, shown from your Mac in every account ([how](docs/technical-reference.md#pictures-sent-in-a-chat)) | Each switch | On |
+| Stops the red artifact "didn't resume" warnings in old chats | Each switch and each quit | Asked at install, [cost](#artifact-warnings) |
+| Artifact pages on your other accounts, with a Claude skill | When you ask Claude | Asked at install, [how](#artifact-pages-on-your-other-accounts) |
 
 It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account. A routine saved with no mode runs in manual on every account; `routine_mode_when_unset` in the config gives such routines a mode ([how](docs/technical-reference.md#claude-code-routines)).
 
@@ -42,6 +44,18 @@ zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sy
 
 It downloads the latest version, builds its helpers, and adds a background helper with a small **Sync** item in the menu bar. It never replaces or quits the Claude app. The same command updates it.
 
+It asks up to three questions, each once:
+
+1. Whether to [stop the artifact warnings](#artifact-warnings). Press Enter to skip.
+2. Which account is the main one, only when your accounts have different groups.
+3. Whether to add the [share-artifacts skill](#artifact-pages-on-your-other-accounts) to Claude Code. Press Enter to add it.
+
+An update keeps your answers and does not ask again. To answer up front, with no questions, put the options after a dash:
+
+```sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
+```
+
 ### Without Terminal
 
 1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
@@ -50,14 +64,14 @@ It downloads the latest version, builds its helpers, and adds a background helpe
 
 ### With an AI agent
 
-Ask your agent: "Install or update Claude Session Sync from github.com/djahlor/claude-session-sync, then check it." The install command needs no keyboard. Without a terminal it skips the main-account question and keeps the account already chosen. The agent can check the result with `--version` and `status` from [Commands](#commands). A fix shows in `status` only after Claude has closed once, and quitting Claude ends every open chat, so the agent should ask you before it quits Claude.
+Ask your agent: "Install or update Claude Session Sync from github.com/djahlor/claude-session-sync, then check it." The install command needs no keyboard. Without a terminal it asks nothing: it keeps the account already chosen, and the warning fix and the skill stay as they were unless the agent passes `--stop-artifact-warnings` or `--share-skill`. The agent can check the result with `--version` and `status` from [Commands](#commands). A fix shows in `status` only after Claude has closed once, and quitting Claude ends every open chat, so the agent should ask you before it quits Claude.
 
 ## Switch accounts
 
 1. Sign out of Claude.
 2. Sign in to the other account.
 
-While you sign in, sync copies chats and routines into the other accounts. Claude reads them when the new account signs in, so they need no restart. Claude closes, syncs and opens again by itself only when something still needs it closed: groups that differ from the account you left, browser logins, or a sign-in faster than the sync. After the sign-in, sync waits up to 20 seconds for Claude to load the new account's groups and compares them. When they already match, Claude stays open. A restart is shorter because the chats are already done. Chats and routines also sync when you quit Claude. A small status window and the **Sync** menu show what is happening, even if macOS hides notifications.
+While you sign in, sync copies chats and routines into the other accounts. Claude reads them when the new account signs in, so they need no restart. Claude closes, syncs and opens again by itself only when something still needs it closed: groups that differ from the account you left, browser logins, or a sign-in faster than the sync. After the sign-in, sync waits up to 20 seconds for Claude to load the new account's groups and compares them. When they already match, Claude stays open. A restart is shorter because the chats are already done. Chats and routines also sync when you quit Claude. When Claude closes or opens again by itself, a small status window says why, even if macOS hides notifications. It closes after a few seconds, with its close button, or with a click. To stop it, turn off **Show the status window** in the **Sync** menu. The menu always shows the latest status.
 
 Nothing syncs while you work in Claude, because Claude keeps chats in memory and locks its database while it runs. Sync writes only while Claude is closed or signed out, and never into the account Claude still has open ([how](docs/live-sync-findings.md)).
 
@@ -99,12 +113,27 @@ With this option on, every sync does two things while Claude is closed:
 1. It adds `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"` to the `env` block of `~/.claude/settings.json`, so new chats save no notes. Every other line of the file stays as it was. If that key is already there, sync leaves it alone.
 2. It removes the saved notes from the chat histories in `~/.claude/projects/`. Each removed line is first copied to a backup in sync's private folder. A chat whose Claude Code process still runs is skipped until it closes.
 
-Turn it on with `configure --stop-artifact-warnings --apply` from [Commands](#commands). It works from the next time Claude closes.
+The installer asks whether to turn it on. You can also turn it on later with `configure --stop-artifact-warnings --apply` from [Commands](#commands). It works from the next time Claude closes.
 
 - It is off by default, because it has a cost: Claude stops answering comments on your artifacts by itself in the background.
-- Anthropic does not document this switch. It was found in Claude Code 2.1.309, and a Claude Code update could rename or remove it. The warnings would then come back.
+- The switch is listed in Anthropic's [Claude Code environment variables](https://code.claude.com/docs/en/env-vars). It needs Claude Code 2.1.228 or later.
 - To turn it off, set `"stop_artifact_warnings": false` in the config. The next sync takes the key out of `settings.json`, but only if sync put it there.
 - `status` shows `artifact_warnings=on` or `off`, and `artifact_warnings_cleared` counts the notes the last sync removed.
+
+## Artifact pages on your other accounts
+
+Each artifact page belongs to the account that published it. After a switch, its link says the page is not found, and Claude cannot update it from the other account. Only the page's own **Share** menu fixes that, so sync does not do it for you ([why](docs/artifact-sharing-findings.md)).
+
+The share-artifacts skill makes it a few clicks. The installer offers to add it. Then ask Claude:
+
+> Share this page with my other accounts.
+
+Claude asks for your accounts' emails once, finds the page, and asks which way:
+
+- **Read only.** You set the page to anyone with the link. It opens on every account at once, with no email. Anyone who has the link can see it.
+- **Edit too.** You invite your other accounts as Editor, with the emails Claude gives you to paste. Each account gets an email and accepts once. Then Claude can update the page from that account too. One account can send about 100 invites a day.
+
+After you accept on another account, Claude checks that the page is shared with it.
 
 ## Commands
 
@@ -131,7 +160,7 @@ All commands and recovery steps are in the [technical reference](docs/technical-
 
 Run the install command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
 
-To remove it, run `"$css" uninstall --apply`. If you turned on [artifact warnings](#artifact-warnings), turn that off and quit Claude once first, or the switch stays in `settings.json`.
+To remove it, run `"$css" uninstall --apply`. If you turned on [artifact warnings](#artifact-warnings), turn that off and quit Claude once first, or the switch stays in `settings.json`. The skill stays in `~/.claude/skills/share-artifacts`; delete that folder to remove it.
 
 ## If something goes wrong
 

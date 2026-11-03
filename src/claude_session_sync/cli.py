@@ -411,6 +411,11 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--sync-browser-logins", action="store_true")
     setup.add_argument("--stop-artifact-warnings", action="store_true")
     setup.add_argument(
+        "--ask-artifact-warnings",
+        action="store_true",
+        help="on a terminal, ask once whether to stop the artifact 'didn't resume' warnings",
+    )
+    setup.add_argument(
         "--ask-main-account",
         action="store_true",
         help="on a terminal, ask whose pins and groups the other accounts copy",
@@ -1155,6 +1160,46 @@ def _ask_main_account(
     )
 
 
+ARTIFACT_WARNINGS_QUESTION = (
+    '\nStop the red "Artifact comment monitor ... didn\'t resume" warnings?\n'
+    "Old chats show them after a switch, for pages another account published.\n"
+    "The cost: Claude stops answering comments on your pages by itself.\n"
+    "You can still ask Claude to read and answer them.\n\n"
+    "Type y to stop them, or press Enter to skip: "
+)
+
+
+def _ask_artifact_warnings(source: bytes, stdin: TextIO, output: TextIO) -> bytes:
+    """At install, ask once whether to stop the artifact "didn't resume" warnings.
+
+    Asks only when both input and output are a terminal and the config holds
+    no answer yet, so an update never asks again. Enter means no, because the
+    option has a cost. The answer goes into the config as true or false; the
+    end of input leaves the config as it was.
+    """
+
+    if not (stdin.isatty() and output.isatty()):
+        return source
+    document = json.loads(source.decode("utf-8"))
+    if not isinstance(document, dict) or "stop_artifact_warnings" in document:
+        return source
+    _discard_typeahead(stdin)
+    output.write(ARTIFACT_WARNINGS_QUESTION)
+    output.flush()
+    line = stdin.readline()
+    if not line:
+        output.write("\n")
+        return source
+    stop = line.strip().lower() in ("y", "yes")
+    document["stop_artifact_warnings"] = stop
+    output.write(
+        "The warnings stop from the next time Claude closes.\n"
+        if stop
+        else "Skipped. To stop them later: configure --stop-artifact-warnings --apply\n"
+    )
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def _discard_typeahead(stdin: TextIO) -> None:
     """Drop keys pressed while setup compiled, so they cannot answer the question."""
 
@@ -1452,6 +1497,12 @@ def _cmd_setup(
         source = arguments.config.read_bytes()
     else:
         source = installer.default_config_data()
+    if (
+        arguments.ask_artifact_warnings
+        and arguments.apply
+        and not arguments.stop_artifact_warnings
+    ):
+        source = _ask_artifact_warnings(source, answers, output)
     desired, config_payload = prepare_config_data(
         source,
         automatic_targets=arguments.automatic_targets,
