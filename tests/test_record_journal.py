@@ -40,7 +40,7 @@ class RecordJournalTests(unittest.TestCase):
         self.writes.append(target)
         self.values.pop(target, None)
 
-    def journal(self, write=None, recovery_equivalent=None):
+    def journal(self, write=None, recovery_equivalent=None, merge_baseline=None):
         return RecordJournal(
             self.root,
             read=self.values.get,
@@ -50,6 +50,7 @@ class RecordJournalTests(unittest.TestCase):
             before_mutation=self.guard,
             retention=1,
             recovery_equivalent=recovery_equivalent,
+            merge_baseline=merge_baseline,
         )
 
     def metadata_equivalent(self, target, expected, current):
@@ -125,6 +126,44 @@ class RecordJournalTests(unittest.TestCase):
         self.assertEqual([], self.writes)
         self.assertEqual({"a": b"new-a", "b": b"independent"}, self.values)
         self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
+
+    def test_changed_data_puts_back_only_the_merge_baseline(self):
+        path = self.pending()
+        self.values = {"a": b"independent", "b": b"new-b"}
+        self.journal(merge_baseline="b").recover()
+        self.assertEqual(["b"], self.writes)
+        self.assertEqual({"a": b"independent", "b": b"old-b"}, self.values)
+        document = json.loads(path.read_text())
+        self.assertEqual("COMMITTED", document["state"])
+        self.assertEqual("merge-again", document["recovery"])
+        self.assertEqual(
+            {"a": digest(b"independent"), "b": digest(b"new-b")},
+            document["recovery_observed_sha256"],
+        )
+
+    def test_changed_merge_baseline_still_needs_attention(self):
+        path = self.pending()
+        self.values = {"a": b"new-a", "b": b"independent"}
+        with self.assertRaisesRegex(RecordRecoveryError, "independently"):
+            self.journal(merge_baseline="b").recover()
+        self.assertEqual([], self.writes)
+        self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
+
+    def test_merge_baseline_waits_for_the_app_to_close(self):
+        path = self.pending()
+        self.values = {"a": b"independent", "b": b"old-b"}
+        self.running = True
+        with self.assertRaisesRegex(RecordRecoveryError, "Claude running"):
+            self.journal(merge_baseline="b").recover()
+        self.assertEqual([], self.writes)
+        self.assertEqual("RECOVERY_REQUIRED", json.loads(path.read_text())["state"])
+
+    def test_merge_baseline_keeps_exact_rollback_when_possible(self):
+        path = self.pending()
+        self.values["a"] = b"new-a"
+        self.journal(merge_baseline="b").recover()
+        self.assertEqual({"a": b"old-a", "b": b"old-b"}, self.values)
+        self.assertEqual("ROLLED_BACK", json.loads(path.read_text())["state"])
 
     def test_mixed_recovery_restores_only_written_records(self):
         path = self.pending()
