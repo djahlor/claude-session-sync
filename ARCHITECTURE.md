@@ -37,7 +37,11 @@ account UUID marker and signed-in flag. A sign-out while Claude runs starts
 it signs in and holds no folder but the one just left, so chats, archive state
 and routines sync into every other account's folders while Claude stays open
 (live.py). A stable account change keeps Claude open when that sync finished
-first and nothing left needs Claude closed. Otherwise it asks Claude to quit
+first and nothing left needs Claude closed. When groups are the only reason
+left, `signed-in-groups(profile)` reads a disposable copy of Claude's sidebar
+database until Claude has merged the new account's server groups, then
+compares them with the main account's; the same groups keep Claude open too.
+Otherwise it asks Claude to quit
 normally, runs `switch(profile)` with Claude closed, and reopens Claude. A
 quit runs `auto`.
 Saving a chat does not trigger a sync. At start the watcher runs `auto` once,

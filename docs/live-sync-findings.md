@@ -7,7 +7,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 **Possible in part.**
 
 - **No restart needed:** chats (new, changed and deleted), whether a chat is archived, sent pictures, and Code routines. Claude reads all of these from disk when an account signs in, so sync writes them while you are signed out, before the next sign-in.
-- **Still needs Claude closed:** groups (sections) and the built-in browser's site logins. Claude keeps them in stores it locks while it runs, and at a sign-in it loads each account's groups from Anthropic's servers.
+- **Still needs Claude closed:** groups (sections) and the built-in browser's site logins. Claude keeps them in stores it locks while it runs, and at a sign-in it loads each account's groups from Anthropic's servers. Since 0.7.1 groups cost the restart only when the account signed in to shows different groups than the main account (item 13).
 - **Falls back to the restart** when the sync cannot finish before you sign in again, or when one of the parts above still needs Claude closed. The fallback is today's behaviour.
 
 ## How Claude loads each part
@@ -26,6 +26,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 | 10 | Groups need a closed Claude. | The Code sidebar is the claude.ai web view. Its sections live in localStorage `dframe-store` (Claude's LevelDB, locked while it runs) and per account on Anthropic's servers. At an in-app account change the web app clears `ccd-sync-pending:*` and merges the new account's server copy into its slot, so a local copy cannot win without a restart (public JS, `shared-m-8-…js`). | verified |
 | 11 | Browser logins need a closed Claude. | Claude clears the built-in browser on every account change (0.6.0 notes) and its cookie database is open while it runs. | verified in 0.6.0; not re-checked on 4.4212.0 |
 | 12 | The gap between sign-out and sign-in is short. | Log: 14, 18, 37, 20 and 17 seconds for the five switches since 28-10. | verified |
+| 13 | The web view records a sign-in only after it merged the account's groups. | At an in-app account change it clears `ccd-sync-pending:*`, merges the account's server copy into `codeSidebarByScope[<account>/<org>]`, then writes `ccd-sync-owner` and `ccd-sync-org` (public JS). On a copy of the Mac's database on 03-11, both keys held `\x01` and a 36-character id, and `<owner>/<org>` was both a slot and `lastSidebarScopeKey`; the owner had 5 slots, one per org. | order verified in code; key shape verified on a copy |
 
 ## What goes wrong when sync writes while Claude runs
 
@@ -42,6 +43,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 - **A check before every write.** The engine checks right before journaling and right before its first write that no other profile's Claude runs and that Claude is still signed out. Before every later file it checks again that `windowSizeWasSignedIn` is still `false` and `lastKnownAccountUuid` still names the account just left. At the first sign of a sign-in it ends the run and keeps what it wrote, like a run cut short; the switch restart writes the rest.
 - **Restart only when needed.** At the sign-in, the helper skips the restart when the signed-out sync finished before the sign-in and nothing else needs Claude closed. The reasons that keep it: `signed-in-during-sync`, `chats`, `routines`, `archive`, `groups` (sidebar sync on) and `browser-logins` (browser login sync on).
 - **Faster checks.** The archive pass now reuses the planner's file list instead of listing all 46,000 chat files again. A no-change pass went from 15 to 21 seconds to 9 to 14 seconds on the clone.
+- **Groups checked after the sign-in (0.7.1).** When groups are the only reason left, the helper runs `signed-in-groups`. It reads a disposable copy of Claude's database every second for up to 20 seconds, until `ccd-sync-owner` names the new account and the sidebar shows that account's slot (item 13). The same sections as the main account's, still the same in a second copy 6 seconds later: no restart, and the new account becomes the main one. Anything else, a timeout, an unreadable copy or a waiting `keep-sidebar` choice: the restart, as before. A quit during the check runs the switch's sync with Claude left closed. A second reviewer read the change and found four medium issues (a quit or a helper restart during the check lost the group copy, a waiting `keep-sidebar` choice was skipped, a sign-out during the check was missed) and smaller ones; all are fixed.
 - **One switch.** `sync_while_signed_out: false` in the config turns the sign-out sync off.
 - **Other profiles.** The sync skips when another profile's Claude is open, because that Claude holds its own folders.
 
@@ -63,6 +65,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 
 - **A real switch with Claude open.** It needs a sign-out and sign-in on his Mac with this build installed. Signing out ends every running Code chat, so it was not done from a chat.
 - **`windowSizeWasSignedIn` at a real sign-out.** Seen in code only.
+- **The groups check at a real sign-in.** Tested with records shaped like the copy of 03-11 and with the compiled helper beside a stand-in app. How long Claude takes to write `ccd-sync-owner` after a sign-in, and whether the sidebar must be on screen before `lastSidebarScopeKey` names the new slot, were not measured. Either one past 20 seconds costs only the restart.
 - **How often the sync beats the sign-in.** A no-change pass takes 9 to 14 seconds on his busy Mac, and his last five sign-ins came 14 to 37 seconds after the sign-out. A quick sign-in falls back to today's restart.
 
 ## Upstream check

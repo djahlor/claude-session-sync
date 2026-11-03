@@ -47,6 +47,10 @@ SYNC_ACTIVE_KEY = ORIGIN_PREFIX + b"ccd-sync-active"
 SYNC_QUARANTINE_KEY = ORIGIN_PREFIX + b"ccd-sync-quarantine"
 
 
+# The org of the account in ccd-sync-owner, stored the same way.
+SYNC_ORG_KEY = ORIGIN_PREFIX + b"ccd-sync-org"
+
+
 SYNC_METADATA_KEYS = (
     SYNC_OWNER_KEY,
     SYNC_ACTIVE_KEY,
@@ -416,6 +420,55 @@ def plan_account_copy(
     if slots[source].get("sections") == slots[active].get("sections"):
         return AccountCopyPlan(active)
     return AccountCopyPlan(active, source=source, target=active)
+
+
+# What a check right after an in-app sign-in found. Only SAME_GROUPS lets the
+# switch skip its restart; NOT_RECONCILED is read again until the check times out.
+SAME_GROUPS = "same-groups"
+NOT_RECONCILED = "not-reconciled"
+
+
+def groups_after_sign_in(
+    records: Mapping[bytes, bytes | None], account: str, main_scope: str | None
+) -> tuple[str, str | None]:
+    """Whether the account just signed in already shows the main account's groups.
+
+    At an in-app sign-in Claude's web view clears its pending uploads, merges
+    the account's server copy into the account's slot, and only then records
+    the account in ccd-sync-owner and its org in ccd-sync-org. Until both name
+    it and the sidebar shows that slot, the slot may still be an old copy.
+    Returns what was found and the signed-in scope.
+    """
+
+    owner = _owner_account(records.get(SYNC_OWNER_KEY))
+    org = _owner_account(records.get(SYNC_ORG_KEY))
+    if owner is None or org is None or owner.lower() != account:
+        return NOT_RECONCILED, None
+    record = records.get(DFRAME_STORE_KEY)
+    if not keeps_sidebar_on_server(record):
+        return "claude-keeps-sidebar-locally", None
+    assert record is not None  # keeps_sidebar_on_server read it
+    state = _decode_record(record, "dframe store record")["state"]
+    slots = state["codeSidebarByScope"]
+    scope = f"{owner}/{org}"
+    if state.get("lastSidebarScopeKey") != scope or scope not in slots:
+        return NOT_RECONCILED, None
+    if records.get(SYNC_QUARANTINE_KEY) is not None:
+        return "claude-settings-sync-quarantined", scope
+    upload = records.get(GROUP_UPLOAD_KEY)
+    scoped = b"\x01" + scope.encode("utf-8")
+    if upload is not None and upload not in (scoped, scoped + b"|migrate"):
+        return "another-upload-pending", scope
+    if main_scope is None:
+        return "no-main-account", scope
+    if main_scope not in slots:
+        return "main-account-sidebar-missing", scope
+    _manual_sections(slots[main_scope], "main account sidebar")
+    _manual_sections(slots[scope], "signed-in account sidebar")
+    # The same test a switch's copy uses to decide there is nothing to copy.
+    if slots[main_scope].get("sections") != slots[scope].get("sections"):
+        return "different-groups", scope
+    return SAME_GROUPS, scope
 
 
 def _decode_main_scope(content: bytes | None) -> str | None:

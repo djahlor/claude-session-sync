@@ -284,6 +284,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     signed_out.add_argument("profile")
     signed_out.add_argument("--json", action="store_true", dest="as_json")
+    signed_in_groups = commands.add_parser(
+        "signed-in-groups",
+        help="after a sign-in with Claude open, check whether groups still need a restart",
+    )
+    signed_in_groups.add_argument("profile")
+    signed_in_groups.add_argument("--json", action="store_true", dest="as_json")
     switch.add_argument("--no-launch", action="store_true")
     switch_layout = switch.add_mutually_exclusive_group()
     switch_layout.add_argument(
@@ -826,6 +832,97 @@ def _run_signed_out(
                 config, "needs-attention", reason="sync-error", next_action="run-doctor"
             )
         raise
+    finally:
+        handoff.release()
+
+
+def _run_signed_in_groups(
+    arguments: Any,
+    config: Config,
+    dependencies: CliDependencies,
+    output: TextIO,
+) -> int:
+    """Whether a switch still needs its restart for groups, checked after the sign-in.
+
+    Claude loads the new account's groups from Anthropic's servers at sign-in.
+    When they already match the main account's, the restart would copy
+    nothing, so the new account becomes the main one and Claude stays open.
+    Reads only disposable copies of Claude's database. Anything unclear, and a
+    sign-in Claude has not settled within the time limit, keeps the restart.
+    """
+
+    from .layout import main_account_blocker, read_pending_adoption
+    from .layout_records import SAME_GROUPS, LayoutError
+    from .live import GROUPS_CONFIRM_SECONDS, wait_for_groups
+    from .locking import ExclusiveFileLock, LockUnavailableError
+    from .logins import last_known_account, signed_in
+
+    profile = _find_profile(config, arguments.profile)
+
+    def report(reason: str, *, restart: bool = True) -> int:
+        state = "restart" if restart else "no-restart"
+        payload = {"state": state, "reason": reason, "restart": restart}
+        _write(payload, as_json=arguments.as_json, stream=output)
+        return 0
+
+    if not config.sync_sidebar_layout:
+        # Groups do not sync, so they never need the restart.
+        return report("sidebar-sync-off", restart=False)
+    blocker = main_account_blocker(config)
+    if blocker is not None:
+        return report(blocker)
+    # A copy of the database can be torn or the helper slow: both keep the restart.
+    unreadable = (LayoutError, OSError, subprocess.SubprocessError)
+    handoff = ExclusiveFileLock(
+        config.state_dir / "switch-handoff.lock", mode="auto", timeout=0
+    )
+    try:
+        handoff.acquire()
+    except LockUnavailableError:
+        return report("busy")
+    try:
+        account = last_known_account(profile.data_root)
+        if account is None or signed_in(profile.data_root) is False:
+            return report("not-signed-in")
+        try:
+            # A keep-sidebar choice is applied by the switch's copy.
+            if read_pending_adoption(config.state_dir) is not None:
+                return report("main-account-choice-pending")
+        except LayoutError:
+            return report("main-account-choice-pending")
+        layout = dependencies.layout_factory(config)
+
+        def check() -> tuple[str, str | None, str | None]:
+            if not _running_processes(config, dependencies):
+                return "claude-closed", None, None
+            if (
+                last_known_account(profile.data_root) != account
+                or signed_in(profile.data_root) is False
+            ):
+                return "account-changed", None, None
+            return layout.groups_after_sign_in(account)
+
+        try:
+            found = wait_for_groups(check, dependencies.clock, dependencies.sleeper)
+            if found is not None and found[0] == SAME_GROUPS:
+                # Chromium writes Local Storage to disk in delayed batches, so
+                # a second copy a little later must agree.
+                dependencies.sleeper(GROUPS_CONFIRM_SECONDS)
+                if check() != found:
+                    return report("groups-changed-during-check")
+        except unreadable:
+            return report("sidebar-unreadable")
+        if found is None:
+            return report("timed-out")
+        verdict, scope, main_scope = found
+        if verdict != SAME_GROUPS:
+            return report(verdict)
+        assert scope is not None and main_scope is not None
+        try:
+            layout.follow_signed_in_account(scope, main_scope)
+        except (LayoutError, OSError):
+            return report("main-account-not-saved")
+        return report(SAME_GROUPS, restart=False)
     finally:
         handoff.release()
 
@@ -1618,6 +1715,7 @@ _COMMANDS: dict[str, Callable[..., int]] = {
     "auto": _run_sync,
     "switch": _run_switch,
     "signed-out-sync": _run_signed_out,
+    "signed-in-groups": _run_signed_in_groups,
     "rollback": _cmd_rollback,
     "browser-logins": _cmd_browser_logins,
     "status": _cmd_status,

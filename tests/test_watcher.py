@@ -388,6 +388,22 @@ class WatcherTests(unittest.TestCase):
     def test_a_switch_that_still_needs_claude_closed_restarts_it_once(self):
         self.live_scenario(sign_out=True, signed_out_restart=True)
 
+    def test_a_switch_to_an_account_with_the_same_groups_keeps_claude_open(self):
+        self.live_scenario(sign_out=True, signed_out_restart=True, groups_match=True)
+
+    def test_a_quit_during_the_groups_check_still_copies_the_groups(self):
+        self.live_scenario(
+            sign_out=True, signed_out_restart=True, quit_during_check=True
+        )
+
+    def test_groups_are_checked_only_when_they_are_the_last_restart_reason(self):
+        self.live_scenario(
+            sign_out=True,
+            signed_out_restart=True,
+            groups_match=True,
+            restart_reasons=("groups", "browser-logins"),
+        )
+
     def fake_claude(self, root):
         """A tiny app standing in for Claude, so the watcher can see it run and quit."""
         app = root / "SyncTest.app"
@@ -435,6 +451,9 @@ class WatcherTests(unittest.TestCase):
         request_text="",
         sign_out=False,
         signed_out_restart=False,
+        groups_match=False,
+        restart_reasons=("groups",),
+        quit_during_check=False,
     ):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
@@ -456,12 +475,19 @@ class WatcherTests(unittest.TestCase):
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "if sys.argv[1] == 'switch':\n"
                 f" assert subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], stdout=subprocess.DEVNULL).returncode == 1, 'sync ran before app exited'\n"
-                f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
+                f" if '--no-launch' not in sys.argv: subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started'}})); raise SystemExit(1)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
                 "elif sys.argv[1] == 'signed-out-sync':\n"
                 f" restart = {signed_out_restart!r}\n"
-                " print(json.dumps({'state': 'committed', 'progress': 'finished', 'restart': restart, 'restart_reasons': ['groups'] if restart else []}))\n"
+                f" reasons = {list(restart_reasons)!r} if restart else []\n"
+                " print(json.dumps({'state': 'committed', 'progress': 'finished', 'restart': restart, 'restart_reasons': reasons}))\n"
+                "elif sys.argv[1] == 'signed-in-groups':\n"
+                f" same = {groups_match!r}\n"
+                f" if {quit_during_check!r}: subprocess.run(['/usr/bin/pkill', '-f', {str(executable)!r}])\n"
+                " time.sleep(2 if " + repr(quit_during_check) + " else 1)\n"
+                f" reason = 'claude-closed' if {quit_during_check!r} else 'same-groups' if same else 'different-groups'\n"
+                " print(json.dumps({'state': 'no-restart' if same else 'restart', 'reason': reason, 'restart': not same}))\n"
                 "else:\n"
                 f" if {request_during_sync!r} and len(calls.read_text().splitlines()) == 1: time.sleep(3)\n"
                 f" if {claude_open_waits!r}: print(json.dumps({{'state': 'waiting', 'reason': 'claude-open', 'progress': 'waiting-for-Claude'}})); raise SystemExit(0)\n"
@@ -586,7 +612,44 @@ class WatcherTests(unittest.TestCase):
                     self.assertTrue(app_running(), "a sign-out must never quit Claude")
                     time.sleep(2)
                     claude_config(str(uuid.uuid4()), True)
-                    if signed_out_restart:
+
+                    def groups_checks():
+                        return [i for i in entries() if i[0] == "signed-in-groups"]
+
+                    checks_groups = signed_out_restart and restart_reasons == (
+                        "groups",
+                    )
+                    if checks_groups:
+                        self.assertTrue(
+                            wait_for(groups_checks, 10),
+                            "groups as the last reason must be checked",
+                        )
+                        self.assertEqual(
+                            ["signed-in-groups", "Work", "--json"], groups_checks()[0]
+                        )
+                        self.assertEqual([], switches(), "the check comes first")
+                    if quit_during_check:
+                        self.assertTrue(
+                            wait_for(lambda: switches(), 30),
+                            "the quit sync must still copy the groups",
+                        )
+                        self.assertIn("--after-account-switch", switches()[0])
+                        self.assertIn("--no-launch", switches()[0])
+                        time.sleep(4)
+                        # pgrep -f would also match the helper's own arguments.
+                        self.assertEqual(
+                            1,
+                            subprocess.run(
+                                ["/usr/bin/pgrep", "-x", executable.name],
+                                stdout=subprocess.DEVNULL,
+                            ).returncode,
+                            "a quit Claude stays closed",
+                        )
+                        self.assertEqual(1, len(switches()), "no restart loop")
+                        self.assertEqual(
+                            "finished", json.loads(status.read_text())["restart_phase"]
+                        )
+                    elif signed_out_restart and not (checks_groups and groups_match):
                         self.assertTrue(
                             wait_for(lambda: switches(), 30),
                             "groups still need one restart",
@@ -595,6 +658,8 @@ class WatcherTests(unittest.TestCase):
                         self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
                         time.sleep(4)
                         self.assertEqual(1, len(switches()), "no restart loop")
+                        if not checks_groups:
+                            self.assertEqual([], groups_checks(), "no check needed")
                     else:
                         time.sleep(8)
                         self.assertEqual([], switches(), "no restart needed")
@@ -602,8 +667,13 @@ class WatcherTests(unittest.TestCase):
                         saved = json.loads(status.read_text())
                         self.assertEqual("finished", saved["restart_phase"])
                         self.assertEqual(
-                            "synced-while-signed-out",
+                            "same-groups"
+                            if checks_groups
+                            else "synced-while-signed-out",
                             json.loads(saved["output"])["restart_skipped"],
+                        )
+                        self.assertEqual(
+                            1 if checks_groups else 0, len(groups_checks())
                         )
                 if claude_open_waits and not request_restart:
                     time.sleep(4)
