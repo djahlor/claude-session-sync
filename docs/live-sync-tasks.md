@@ -14,8 +14,9 @@ Branch `claude/sync-without-restart-e3187c`, from `main` at 0.6.7. PR #22 is ope
 - [x] Independent review of the change
 - [ ] Live check with Claude open: needs this build installed and one real switch by him
 - [x] PR to `main`
+- [x] Skip the restart for groups when the arriving account already has the same groups (0.7.1): wait until Claude's web view has merged that account's server copy (`ccd-sync-owner` names it), then compare its slot with the main account's slot
+- [ ] Live check of the groups check: one real switch between two accounts with the same groups
 
 ## Later
 
-- Skip the restart for groups when the arriving account already has the same groups: wait until Claude's web view has merged that account's server copy (`ccd-sync-owner` names it), then compare its slot with the slot of the account just left.
 - Make a no-change check faster than about 10 seconds, so it beats a quick sign-in more often.

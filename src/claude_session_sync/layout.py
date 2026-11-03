@@ -37,9 +37,11 @@ from .layout_records import (  # noqa: F401  the module's public names stay impo
     ORIGIN_PREFIX,
     PER_ACCOUNT,
     PER_ACCOUNT_REASON,
+    SAME_GROUPS,
     SNAPSHOT_VERSION,
     SYNC_ACTIVE_KEY,
     SYNC_METADATA_KEYS,
+    SYNC_ORG_KEY,
     SYNC_OWNER_KEY,
     SYNC_QUARANTINE_KEY,
     UPLOAD_ON_NEXT_START,
@@ -80,6 +82,7 @@ from .layout_records import (  # noqa: F401  the module's public names stay impo
     _valid_scope,
     _validated_scopes,
     copy_sidebar_slot,
+    groups_after_sign_in,
     groups_differ,
     keeps_sidebar_on_server,
     load_snapshot,
@@ -452,6 +455,53 @@ class LayoutSynchronizer:
         return LayoutReceipt(
             PER_ACCOUNT, profiles, len(replacements), groups, filed, 0, reason
         )
+
+    def groups_after_sign_in(self, account: str) -> tuple[str, str | None, str | None]:
+        """Compare the account just signed in with the main account, while Claude runs.
+
+        Reads a disposable copy of Claude's database and never the live files.
+        Returns what groups_after_sign_in found, the signed-in scope and the
+        main scope it was compared with.
+        """
+        with self._database_copy(self.config.profiles[0].data_root) as database:
+            records = {
+                key: database.get_optional(key)
+                for key in (DFRAME_STORE_KEY, *SYNC_METADATA_KEYS, SYNC_ORG_KEY)
+            }
+        main_scope = _decode_main_scope(_snapshot_bytes(self._main_scope_path()))
+        verdict, scope = groups_after_sign_in(records, account, main_scope)
+        return verdict, scope, main_scope
+
+    def follow_signed_in_account(self, scope: str, main_scope: str) -> None:
+        """Make the signed-in account the main one, as a switch's sync would.
+
+        Only for an account that already shows main_scope's groups. The next
+        switch then copies from it. Writes only this tool's own file, so it
+        works while Claude runs, and raises LayoutBusyError while another sync
+        could write the same file or changed the main account since the check.
+        """
+        if not _valid_scope(scope):
+            raise LayoutError("account sidebar scope is malformed")
+        try:
+            lock = ExclusiveFileLock(
+                self.config.state_dir / "transaction.lock", mode="auto", timeout=0
+            ).acquire()
+        except LockUnavailableError as error:
+            raise LayoutBusyError("another synchronization is still running") from error
+        try:
+            # An unfinished copy may still change the main account; its recovery wins.
+            if self._journal(self._account_journal_root()).has_unfinished():
+                raise LayoutBusyError("an account sidebar copy needs recovery")
+            path = self._main_scope_path()
+            current = _decode_main_scope(_snapshot_bytes(path))
+            if current not in (main_scope, scope):
+                raise LayoutBusyError("the main account changed during the check")
+            if current != scope:
+                atomic_write_bytes(path, _encode_main_scope(scope))
+        except RecordJournalError as error:
+            raise LayoutError(str(error)) from error
+        finally:
+            lock.release()
 
     def accounts(self, target_sessions: Mapping[str, set[str]]) -> list[SidebarAccount]:
         """The default profile's accounts as rows. Works while Claude is open."""

@@ -10,20 +10,34 @@ signed out. The next sign-in reads what was written.
 
 Groups and browser logins live in stores Claude locks while it runs, so they
 still need Claude closed. The result names every reason the switch still needs
-a restart.
+a restart. When groups are the last reason, a check after the sign-in can still
+skip it: Claude loads the new account's groups from Anthropic's servers, and
+when they already match the main account's, a restart would copy nothing.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .filesystem import normalized_path
+from .layout_records import NOT_RECONCILED
 from .logins import last_known_account, signed_in
 
 # Claude retires sessions parked for other accounts at sign-out. Their last
 # saves land within a second, so the pass waits this long before it plans.
 SIGNED_OUT_SETTLE_SECONDS = 1.0
+
+# Claude's web view merges the new account's groups a few seconds after the
+# sign-in, and Chromium saves them to disk a few seconds after that.
+GROUPS_CHECK_SECONDS = 20.0
+GROUPS_CHECK_INTERVAL = 1.0
+# Chromium writes Local Storage to disk in delayed batches. Same groups are read
+# once more a little later, so a copy taken between two writes cannot pass alone.
+GROUPS_CONFIRM_SECONDS = 6.0
+
+# What the groups check found, the signed-in scope and the main scope.
+GroupsFound = tuple[str, Optional[str], Optional[str]]
 
 
 def signed_in_again(data_root: Path, departing: str) -> bool:
@@ -102,3 +116,20 @@ def restart_reasons(config: Any, payload: dict) -> list[str]:
     if config.sync_browser_logins:
         reasons.append("browser-logins")
     return reasons
+
+
+def wait_for_groups(
+    check: Callable[[], GroupsFound],
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> Optional[GroupsFound]:
+    """Run check until it finds more than NOT_RECONCILED. None at the time limit."""
+
+    deadline = clock() + GROUPS_CHECK_SECONDS
+    while True:
+        found = check()
+        if found[0] != NOT_RECONCILED:
+            return found
+        if clock() >= deadline:
+            return None
+        sleeper(GROUPS_CHECK_INTERVAL)

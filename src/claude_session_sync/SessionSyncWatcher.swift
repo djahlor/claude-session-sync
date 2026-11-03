@@ -126,6 +126,10 @@ private final class SessionSyncWatcher: NSObject {
   private var quitCount = 0
   // What the last signed-out sync left for the switch that follows it.
   private var signedOutResult: SignedOutResult?
+  // A switch waits for this check before it decides on the restart.
+  private var groupsChecking = false
+  // Claude quit during that check: the quit sync still copies the groups.
+  private var switchAfterQuit = false
   private var statusItem: NSStatusItem?
   private var noticePanel: NSPanel?
   private var noticeGeneration = 0
@@ -313,6 +317,8 @@ private final class SessionSyncWatcher: NSObject {
   }
 
   private func checkSignedOut() {
+    // A sign-out during the groups check is picked up once the check ends.
+    guard !groupsChecking else { return }
     let now = readSignedIn()
     defer { if now != nil { signedIn = now } }
     guard signedIn == true, now == false, profile != nil, !restartRequested, !running,
@@ -409,7 +415,7 @@ private final class SessionSyncWatcher: NSObject {
   }
 
   private func checkAccount() {
-    guard !restartRequested else { return }
+    guard !restartRequested, !groupsChecking else { return }
     guard let hash = readAccountHash() else {
       candidateHash = nil
       candidateSince = nil
@@ -442,24 +448,123 @@ private final class SessionSyncWatcher: NSObject {
     if let result = signedOut, result.accountHash == previous, !result.restart,
       !signedOutRunning {
       // Everything synced while Claude was signed out, and nothing left needs it closed.
-      if restartPhase != "needs-attention" { restartPhase = "finished" }
-      do { try saveRestartState() } catch {
-        restartFailed("Could not save account-switch status.")
-        return
-      }
-      writeStatus(exitStatus: 0, output: Data(
-        "{\"progress\":\"finished\",\"restart_skipped\":\"synced-while-signed-out\"}".utf8),
-        launchFailed: false)
-      notify("Account changed. Chats were synced while you signed in, so Claude stays open.")
+      finishWithoutRestart("synced-while-signed-out",
+        "Account changed. Chats were synced while you signed in, so Claude stays open.")
+      return
+    }
+    let reasons = signedOut?.accountHash == previous ? signedOut?.reasons ?? [] : []
+    // Another sync still running keeps the restart, which waits for it. The
+    // receipt keeps the account just left until the check decides, so a
+    // helper restarted meanwhile sees the switch again.
+    if reasons == ["groups"], !running {
+      startGroupsCheck()
       return
     }
     do { try saveRestartState() } catch {
       restartFailed("Could not save account-switch status.")
       return
     }
-    let reasons = signedOut?.accountHash == previous ? signedOut?.reasons ?? [] : []
+    restartAfterSwitch(reasons)
+  }
+
+  private func restartAfterSwitch(_ reasons: [String]) {
     showStatus(restartMessage(reasons), banner: true)
     requestRestart(mode: "after-account-switch")
+  }
+
+  private func finishWithoutRestart(_ reason: String, _ message: String) {
+    if restartPhase != "needs-attention" { restartPhase = "finished" }
+    do { try saveRestartState() } catch {
+      restartFailed("Could not save account-switch status.")
+      return
+    }
+    let data = (try? JSONSerialization.data(
+      withJSONObject: ["progress": "finished", "restart_skipped": reason])) ?? Data()
+    writeStatus(exitStatus: 0, output: data, launchFailed: false)
+    notify(message)
+  }
+
+  // Claude loads the new account's groups from its servers at sign-in. When
+  // they already match the account just left's, the restart has nothing to
+  // copy. The sync tool reads a copy of Claude's database, waits up to about
+  // 20 seconds for Claude to settle the sign-in, and keeps the restart when
+  // anything is unclear.
+  private func startGroupsCheck() {
+    let output = Pipe()
+    guard let profile = profile,
+      let task = cliProcess(["signed-in-groups", profile, "--json"], output: output)
+    else {
+      restartAfterGroupsCheck()
+      return
+    }
+    running = true
+    groupsChecking = true
+    showStatus("Account changed. Chats are synced. Checking the groups.")
+    let quits = quitCount
+    let completion = ProcessCompletion { [weak self] exitStatus, data in
+      self?.queue.async {
+        self?.finishGroupsCheck(exitStatus: exitStatus, output: data, quits: quits)
+      }
+    }
+    task.terminationHandler = { process in
+      completion.record(exitStatus: process.terminationStatus)
+    }
+    do {
+      try task.run()
+      drain(output, into: completion)
+    } catch {
+      task.terminationHandler = nil
+      completion.cancel()
+      running = false
+      groupsChecking = false
+      restartAfterGroupsCheck()
+    }
+  }
+
+  private func finishGroupsCheck(exitStatus: Int32, output: Data, quits: Int) {
+    running = false
+    groupsChecking = false
+    let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+    let reason = result?["reason"] as? String ?? ""
+    let keepOpen = exitStatus == 0 && result?["restart"] as? Bool == false
+    if quits != quitCount || reason == "claude-closed" {
+      // Claude quit during the check. Its sync still copies the groups the
+      // restart would have, unless they already matched. The switch command
+      // waits for Claude to be closed before it writes anything.
+      switchAfterQuit = !keepOpen
+      do { try saveRestartState() } catch {
+        restartFailed("Could not save account-switch status.")
+        return
+      }
+      // A quit notice can come late or not at all, so the sync is asked for here too.
+      if quits == quitCount { requestAuto(afterQuit: true) }
+      runQueuedWork(restarting: false)
+      return
+    }
+    if keepOpen {
+      finishWithoutRestart(reason.isEmpty ? "groups-checked" : reason, reason == "same-groups"
+        ? "Account changed. Chats are synced and the groups already match, so Claude stays open."
+        : "Account changed. Chats are synced, so Claude stays open.")
+      runQueuedWork(restarting: false)
+      return
+    }
+    // Anything else restarts as before, even a sign-out during the check: the
+    // switch's copy still needs Claude closed, and skipping it could leave the
+    // account signed in to with old groups if the next sign-in is to it again.
+    restartAfterGroupsCheck()
+  }
+
+  // Queued like a restart asked for during a sync, so a request that came in
+  // meanwhile runs once, with its own mode when it named one.
+  private func restartAfterGroupsCheck() {
+    do { try saveRestartState() } catch {
+      restartFailed("Could not save account-switch status.")
+      return
+    }
+    showStatus(restartMessage(["groups"]), banner: true)
+    restartPending = true
+    if pendingRestartMode == nil { pendingRestartMode = "after-account-switch" }
+    runQueuedWork(restarting: false)
   }
 
   // A request made while a sync runs waits for it instead of being dropped.
@@ -599,7 +704,12 @@ private final class SessionSyncWatcher: NSObject {
       if let mode = restartMode { arguments.append("--" + mode) }
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"syncing\"}".utf8), launchFailed: false)
       showStatus("Syncing, then reopening Claude")
+    } else if switchAfterQuit, let profile = profile {
+      // The groups the switch's restart would have copied, with Claude left closed.
+      arguments = ["switch", profile, "--wait-for-exit", "30", "--after-account-switch",
+                   "--no-launch", "--json"]
     }
+    switchAfterQuit = false
     guard let task = cliProcess(arguments, output: output) else {
       running = false
       return

@@ -4,6 +4,12 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.7.1] - 2026-11-03
+
+### Added
+
+- A switch to an account that already has the same groups no longer restarts Claude. When groups are the only thing left that needs Claude closed, the background helper waits up to 20 seconds after the sign-in for Claude to load the new account's groups from Anthropic's servers, then compares them with the main account's. The same groups keep Claude open, and the new account becomes the main one. Different groups, a sign-in Claude has not settled in time, or anything unclear restart Claude once, as before. It reads only a copy of Claude's database. With browser logins on, every switch still restarts once.
+
 ## [0.7.0] - 2026-11-03
 
 ### Added

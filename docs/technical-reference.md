@@ -359,7 +359,8 @@ When the layout adapter finds a seeded section list, it works this way and
 reports `state: per-account`:
 
 - `sidebar-main-0.json` in the state folder names the main account: the one
-  signed in at the last closed sync.
+  signed in at the last closed sync, or at the last switch whose groups
+  already matched ([groups check](#groups-check-after-the-sign-in)).
 - After a switch, it copies the main account's slot into the signed-in
   account's slot, rebuilds that account's `customGroupsByScope` entry from the
   sections, sets the pending-upload flag for that account, and makes it the
@@ -537,6 +538,53 @@ account change there merges that account's server copy into its slot and
 clears the pending-upload flag, so only a copy written while Claude is closed
 wins. Browser logins need it because the built-in browser's cookie database is
 open while Claude runs.
+
+### Groups check after the sign-in
+
+The restart for groups copies the main account's sections into the account
+just signed in. When that account's server copy already holds the same
+sections, the copy would change nothing. So when `groups` is the only reason
+left, the watcher runs `signed-in-groups <profile> --json` before it decides:
+
+- It reads a disposable copy of Claude's `Local Storage/leveldb`, the same way
+  `probe` does, and never opens the live files.
+- It waits until Claude settled the sign-in: `ccd-sync-owner` names the
+  account in `lastKnownAccountUuid`, `ccd-sync-org` names its org, and
+  `lastSidebarScopeKey` is that `ACCOUNT/WORKSPACE` with a slot in
+  `codeSidebarByScope`. The web view writes the owner and org only after it
+  merged the account's server copy, so before then the slot can still be an
+  old copy. It reads a fresh copy every second for up to 20 seconds.
+- It compares that slot's `sections` with the main account's slot, the test
+  the switch's copy uses to decide there is nothing to copy. Same sections are
+  read once more 6 seconds later and must still agree, because Chromium writes
+  Local Storage to disk in delayed batches (how long was not measured). Then it reports `restart: false`,
+  `reason: same-groups`, and makes the signed-in account the main one, so the
+  next switch copies from it. The watcher keeps Claude open and records
+  `restart_skipped=same-groups`.
+- Everything else keeps the restart, with its reason: `different-groups`,
+  `groups-changed-during-check`, `timed-out`, `sidebar-unreadable` (a copy, a
+  record or the helper failed), `claude-closed`, `account-changed` (another
+  sign-out or sign-in during the wait), `not-signed-in`, `busy`,
+  `main-account-choice-pending` (a `keep-sidebar` choice waits for the
+  switch's copy), `no-main-account`, `main-account-sidebar-missing`,
+  `claude-keeps-sidebar-locally`, `claude-settings-sync-quarantined`,
+  `another-upload-pending`, `needs-one-default-profile`, and
+  `main-account-not-saved` (an unfinished sidebar copy needs recovery, another
+  sync holds `transaction.lock`, or the main account changed during the
+  check). A failed or unreadable result also restarts. With
+  `sync_sidebar_layout` off it reports `restart: false`,
+  `reason: sidebar-sync-off`.
+
+While the check runs, the watcher keeps the account just left in its restart
+receipt, so a helper restarted meanwhile sees the switch again and restarts.
+A sign-out during the check is picked up when the check ends. When Claude
+quits during the check, or the check finds it closed, its quit sync runs
+`switch <profile> --after-account-switch --no-launch --json` instead of
+`auto`, so the groups are still copied and Claude stays closed. A restart
+asked for during the check runs once, in its own mode.
+
+With browser logins on, `browser-logins` stays a reason, so the check does
+not run and every switch still restarts once.
 
 A sync with nothing to do read 46,000 chat files in 9 to 14 seconds on a busy
 Mac, and the last five sign-ins on the development Mac came 14 to 37 seconds
