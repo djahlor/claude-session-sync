@@ -9,7 +9,6 @@ To update, run the install command in the [README](README.md#install) again. Che
 ### Added
 
 - A switch can go without a restart. Claude reads the next account's chats and routines from disk when that account signs in, so the background helper now syncs them the moment you sign out, while you sign in to the other account. The account just left is never written then, because Claude still saves its chats until the next sign-in; its copies follow at the next quit. Claude restarts only when something still needs it closed: groups, browser logins, or a sign-in that came before the sync finished. On by default; `sync_while_signed_out: false` in the config turns it off. Findings and evidence: [docs/live-sync-findings.md](docs/live-sync-findings.md).
-- `restart_for_browser_logins` in the config. Off, browser logins come back at the next quit instead of forcing a restart after a switch. On by default.
 
 ### Changed
 

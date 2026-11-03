@@ -13,21 +13,44 @@ still need Claude closed. The result names every reason the switch still needs
 a restart.
 """
 
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from .logins import signed_in
+from .filesystem import normalized_path
+from .logins import last_known_account, signed_in
 
 # Claude retires sessions parked for other accounts at sign-out. Their last
 # saves land within a second, so the pass waits this long before it plans.
 SIGNED_OUT_SETTLE_SECONDS = 1.0
 
 
-def holds_folders(running: Callable[[], bool], data_root: Path) -> bool:
-    """True while a Claude process runs and is not known to be signed out."""
+def signed_in_again(data_root: Path, departing: str) -> bool:
+    """True unless Claude is known to be still signed out of departing.
 
-    return bool(running()) and signed_in(data_root) is not False
+    lastKnownAccountUuid changes at a sign-in to another account. The flag
+    also covers a sign-in back to the same one.
+    """
+
+    return (
+        signed_in(data_root) is not False or last_known_account(data_root) != departing
+    )
+
+
+def holds_folders(processes: Iterable[Any], data_root: Path, departing: str) -> bool:
+    """True while a Claude process may hold a folder other than departing's.
+
+    A Claude of another profile holds its own folders whatever this one does.
+    """
+
+    processes = tuple(processes)
+    if not processes:
+        return False
+    root = normalized_path(data_root)
+    if any(normalized_path(process.user_data_dir) != root for process in processes):
+        return True
+    return signed_in_again(data_root, departing)
 
 
 class KeepAccountsUnchanged:
@@ -76,6 +99,6 @@ def restart_reasons(config: Any, payload: dict) -> list[str]:
         reasons.append("routines")
     if config.sync_sidebar_layout:
         reasons.append("groups")
-    if config.sync_browser_logins and config.restart_for_browser_logins:
+    if config.sync_browser_logins:
         reasons.append("browser-logins")
     return reasons

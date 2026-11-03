@@ -73,9 +73,11 @@ window display progress without depending on Notification Center.
    recorded so rollback can remove only the exact content the run introduced.
 5. Files change only by same-directory atomic replacement, by a hard-link
    create that never overwrites, or by a journaled removal. A write needs every
-   managed Claude process stopped, or, at sign-out, Claude still signed out and
-   the folder outside the account just left. The engine checks before
-   journaling and again before the first write.
+   managed Claude process stopped, or, at sign-out, no other profile's Claude
+   open, Claude still signed out and the folder outside the account just
+   left. The engine checks before journaling and again before the first
+   write; at sign-out it also checks Claude's sign-in markers before every
+   write and ends the run, keeping what it wrote, at the first sign-in.
 6. A rollback verifies every preimage before it changes live data and never
    suppresses restore failures. A chat run that a killed process left open
    mid-apply is closed by the next chat sync. It keeps what it wrote, and its

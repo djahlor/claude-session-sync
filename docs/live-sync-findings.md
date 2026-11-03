@@ -31,7 +31,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 
 - **Into the signed-in account.** Claude keeps showing what it loaded, then overwrites the file from memory at the chat's next save (item 3). This is the old live sync's problem from 26-09.
 - **Into the account just left, while signed out.** Same problem: Claude still saves those chats there until the next sign-in (item 4).
-- **During the sign-in itself.** If a write lands after Claude listed the new folder, Claude shows the old copy until the next load; a new chat added after the listing is missing until then. Nothing is lost, and the next sync settles it, but the account looks stale. Sync checks before writing that Claude is still signed out, and asks for the restart when the sign-in came during the sync.
+- **During the sign-in itself.** If a write lands after Claude listed the new folder, Claude keeps the old copy in memory and can save it back, for example when the chat gets focus. That old copy then looks like the newest change: it can undo an archive or a rename made in the account just left. So sync checks before every file it writes, and ends the run at the first sign that Claude signed in. Claude lists the new folder 1 to 5 seconds after the sign-in, and the check reads the same file Claude writes at the sign-in, so every write lands before that listing.
 - **Routines of the signed-in account.** Claude rewrites the whole list from memory at its next bookkeeping write (item 8).
 - **Groups and browser logins.** Claude holds both databases open (items 10 and 11).
 
@@ -39,14 +39,15 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 
 - **A sync at sign-out.** The menu-bar helper reads `windowSizeWasSignedIn` every second. When it goes from `true` to `false` while Claude runs, it runs `signed-out-sync`, which matches Djahlor's words of 26-09-2026: "only when when i sign out or close the app maybe".
 - **Every folder but the account just left.** Chats, archive state and routines are written into every other account's folders. The account just left is read as the source and never written: its copies are held back for the next quit. Routines wait whole if the account just left would change, because a routine sync writes every manifest together.
-- **A check before writing.** The engine checks right before journaling and again right before its first write that Claude is still signed out.
-- **Restart only when needed.** At the sign-in, the helper skips the restart when the signed-out sync finished before the sign-in and nothing else needs Claude closed. The reasons that keep it: `signed-in-during-sync`, `chats`, `routines`, `archive`, `groups` (sidebar sync on) and `browser-logins` (when `restart_for_browser_logins` is on).
+- **A check before every write.** The engine checks right before journaling and right before its first write that no other profile's Claude runs and that Claude is still signed out. Before every later file it checks again that `windowSizeWasSignedIn` is still `false` and `lastKnownAccountUuid` still names the account just left. At the first sign of a sign-in it ends the run and keeps what it wrote, like a run cut short; the switch restart writes the rest.
+- **Restart only when needed.** At the sign-in, the helper skips the restart when the signed-out sync finished before the sign-in and nothing else needs Claude closed. The reasons that keep it: `signed-in-during-sync`, `chats`, `routines`, `archive`, `groups` (sidebar sync on) and `browser-logins` (browser login sync on).
 - **Faster checks.** The archive pass now reuses the planner's file list instead of listing all 46,000 chat files again. A no-change pass went from 15 to 21 seconds to 9 to 14 seconds on the clone.
-- **Two switches.** `sync_while_signed_out` (on) turns the sign-out sync off. `restart_for_browser_logins` (on) can be turned off to let browser logins come back at the next quit instead of forcing a restart.
+- **One switch.** `sync_while_signed_out: false` in the config turns the sign-out sync off.
+- **Other profiles.** The sync skips when another profile's Claude is open, because that Claude holds its own folders.
 
 ## How it was tested
 
-- **Unit and command tests:** `tests/test_signed_out_sync.py` (19 tests, real folders, planner and engine) and a routine test in `tests/test_routines.py`.
+- **Unit and command tests:** `tests/test_signed_out_sync.py` (21 tests, real folders, planner and engine) and two routine tests in `tests/test_routines.py`.
 - **The real helper:** two new scenarios in `tests/test_watcher.py` run the compiled helper beside a stand-in app. A sign-out runs `signed-out-sync` and never quits the app; at the sign-in, a clean result keeps the app open, and a result that needs groups restarts it once.
 - **Full suite:** 554 tests pass with ruff, ruff format and mypy.
 - **Rehearsal on a copy of his data.** His 24 chat folders (12 GB) and the sync state were cloned with APFS clones into a scratch folder; his live Claude folders and live sync state were only read. After one closed sync to settle the clone, a working session was faked in the signed-in account (10 chats with new activity and titles, 1 new chat, 1 archived chat). Then:
@@ -55,6 +56,8 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
   - The account just left stayed byte for byte the same: 9,690 files hashed before and after.
   - 48 copies were held back, all for that account's other four folders.
   - The next closed sync wrote those 48 (44 copies and 4 archives), and the sync after it found nothing to do.
+
+- **Independent review.** A second reviewer read the whole change and found two medium issues and five small ones. All are fixed: the sync skips when another profile's Claude is open; it checks for a sign-in before every file and ends the run there instead of writing on; routines wait while an unfinished routine run needs recovery; a quit during the sync drops its result; an earlier `needs-attention` stays; a sign-in race reports `waiting` instead of a fault; and an option to let browser logins wait for the next quit was dropped, because the 15-minute snapshot could then replace the saved logins.
 
 ## Not verified
 

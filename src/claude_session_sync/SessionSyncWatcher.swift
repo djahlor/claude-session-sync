@@ -122,6 +122,8 @@ private final class SessionSyncWatcher: NSObject {
   // starts a sync of every folder but the account just left.
   private var signedIn: Bool?
   private var signedOutRunning = false
+  // Claude quits seen, so a signed-out sync that a quit interrupted is dropped.
+  private var quitCount = 0
   // What the last signed-out sync left for the switch that follows it.
   private var signedOutResult: SignedOutResult?
   private var statusItem: NSStatusItem?
@@ -331,9 +333,11 @@ private final class SessionSyncWatcher: NSObject {
     running = true
     signedOutRunning = true
     showStatus("Signed out. Syncing chats for the next account.")
+    let quits = quitCount
     let completion = ProcessCompletion { [weak self] exitStatus, data in
       self?.queue.async {
-        self?.finishSignedOut(exitStatus: exitStatus, output: data, departing: departing)
+        self?.finishSignedOut(
+          exitStatus: exitStatus, output: data, departing: departing, quits: quits)
       }
     }
     task.terminationHandler = { process in
@@ -351,12 +355,13 @@ private final class SessionSyncWatcher: NSObject {
     }
   }
 
-  private func finishSignedOut(exitStatus: Int32, output: Data, departing: String) {
+  private func finishSignedOut(exitStatus: Int32, output: Data, departing: String, quits: Int) {
     running = false
     signedOutRunning = false
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
     let restart = exitStatus != 0 || (result?["restart"] as? Bool ?? true)
-    signedOutResult = SignedOutResult(
+    // After a quit the next sign-in is a fresh start; the quit sync covers it.
+    signedOutResult = quits != quitCount ? nil : SignedOutResult(
       accountHash: departing, restart: restart,
       reasons: result?["restart_reasons"] as? [String] ?? [])
     if result?["state"] as? String != "skipped" {
@@ -437,7 +442,7 @@ private final class SessionSyncWatcher: NSObject {
     if let result = signedOut, result.accountHash == previous, !result.restart,
       !signedOutRunning {
       // Everything synced while Claude was signed out, and nothing left needs it closed.
-      restartPhase = "finished"
+      if restartPhase != "needs-attention" { restartPhase = "finished" }
       do { try saveRestartState() } catch {
         restartFailed("Could not save account-switch status.")
         return
@@ -846,6 +851,7 @@ private final class SessionSyncWatcher: NSObject {
         self.quittingPIDs.remove(pid)
         // A quit syncs everything itself; a sign-in after it is a fresh start.
         self.signedOutResult = nil
+        self.quitCount += 1
         self.requestAuto(afterQuit: true)
       }
     }

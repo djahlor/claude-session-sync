@@ -499,8 +499,9 @@ has the evidence from Claude Desktop 4.4212.0.
 So when `windowSizeWasSignedIn` goes from `true` to `false` while Claude runs,
 the watcher runs `signed-out-sync <profile> --json`:
 
-- It skips when Claude is closed (`claude-closed`), signed in or not known to
-  be signed out (`signed-in`), the account just left is unknown
+- It skips when Claude is closed (`claude-closed`), another profile's Claude
+  is open (`other-profile-open`), Claude is signed in or not known to be
+  signed out (`signed-in`), the account just left is unknown
   (`account-unknown`), another writer runs (`busy`), or
   `sync_while_signed_out` is `false` (`disabled`).
 - It waits one second, then syncs chats, archive state, sent pictures and
@@ -510,12 +511,17 @@ the watcher runs `signed-out-sync <profile> --json`:
   then. An archive that came from elsewhere and that account must take makes
   the archive pass wait whole (`archive=waiting`). Routines write every
   manifest together, so they wait whole when that account's manifest would
-  change (`deferred`, `account-still-open`).
-- It reads the flag again at the end and reports `signed_in_during_sync`, then
+  change (`deferred`, `account-still-open`) or an unfinished routine run
+  waits for recovery (`deferred`, `recovery-pending`).
+- Before every file it writes, it checks that `windowSizeWasSignedIn` is
+  still `false` and `lastKnownAccountUuid` still names the account just left.
+  At the first sign of a sign-in it ends the run and keeps what it wrote,
+  like a run cut short. A sign-in before the first write reports
+  `state=waiting`, `reason=signed-in`.
+- It checks again at the end and reports `signed_in_during_sync`, then
   `restart` and `restart_reasons`: `signed-in-during-sync`, `chats`,
   `archive`, `routines`, `groups` (whenever `sync_sidebar_layout` is on) and
-  `browser-logins` (when `sync_browser_logins` and
-  `restart_for_browser_logins` are on).
+  `browser-logins` (whenever `sync_browser_logins` is on).
 
 When the account change follows, the watcher keeps Claude open if that sync
 finished for the account just left with no reason left, and records
@@ -523,14 +529,14 @@ finished for the account just left with no reason left, and records
 normally, runs `switch <profile> --after-account-switch --json` with Claude
 closed, and reopens Claude, as before. A failed sync still reopens Claude and
 reports why. A failed restart check leaves Claude open. Signing in again to
-the account just left, or quitting Claude, drops the sync's result.
+the account just left, or quitting Claude, drops the sync's result. A
+`needs-attention` state from before stays until a sync clears it.
 
 Groups need the restart because the Code sidebar is the claude.ai web view: an
 account change there merges that account's server copy into its slot and
 clears the pending-upload flag, so only a copy written while Claude is closed
 wins. Browser logins need it because the built-in browser's cookie database is
-open while Claude runs. With `restart_for_browser_logins` off, they come back
-at the next quit instead.
+open while Claude runs.
 
 A sync with nothing to do read 46,000 chat files in 9 to 14 seconds on a busy
 Mac, and the last five sign-ins on the development Mac came 14 to 37 seconds

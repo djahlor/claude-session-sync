@@ -556,6 +556,25 @@ class RoutineSynchronizerTests(unittest.TestCase):
             (self.config.state_dir / "code-routines-snapshot.json").exists()
         )
 
+    def test_an_unfinished_routine_run_waits_for_a_closed_claude(self):
+        first = self.target("a")
+        self.write_manifest(first, manifest(self.daily()))
+        journal = self.config.state_dir / "routine-runs"
+        journal.mkdir(parents=True)
+        (journal / "run.json").write_text(json.dumps({"state": "PREPARED"}))
+        synchronizer = RoutineSynchronizer(
+            self.config,
+            task_root=self.skill.parent.parent,
+            process_probe=lambda *args, **kwargs: (),
+            read_only_accounts=frozenset({"a"}),
+        )
+
+        receipt = synchronizer.sync()
+
+        self.assertEqual(
+            ("deferred", "recovery-pending"), (receipt.state, receipt.reason)
+        )
+
     def test_deletion_propagates_after_snapshot(self):
         first = self.target("a")
         second = self.target("b")

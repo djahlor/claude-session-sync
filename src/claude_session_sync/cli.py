@@ -69,13 +69,22 @@ def _default_engine_factory(config: Config) -> Any:
     )
 
 
-def _default_live_engine_factory(config: Config, holds: Callable[[], bool]) -> Any:
-    """The chat engine for a sync while Claude is open and signed out."""
+def _default_live_engine_factory(
+    config: Config, holds: Callable[[], bool], signed_in_again: Callable[[], bool]
+) -> Any:
+    """The chat engine for a sync while Claude is open and signed out.
+
+    holds runs before journaling and before the first write; the cheaper
+    signed_in_again runs before every write.
+    """
 
     from .transaction import TransactionEngine
 
     return TransactionEngine(
-        config.state_dir, process_probe=holds, retention=config.retention
+        config.state_dir,
+        process_probe=holds,
+        retention=config.retention,
+        write_guard=signed_in_again,
     )
 
 
@@ -668,6 +677,7 @@ def _run_signed_out(
         KeepAccountsUnchanged,
         holds_folders,
         restart_reasons,
+        signed_in_again,
     )
     from .locking import ExclusiveFileLock, LockUnavailableError
     from .logins import last_known_account, signed_in
@@ -690,12 +700,15 @@ def _run_signed_out(
         return skipped("busy")
     syncing = False
     try:
-
-        def running() -> bool:
-            return bool(_running_processes(config, dependencies))
-
-        if not running():
+        processes = _running_processes(config, dependencies)
+        if not processes:
             return skipped("claude-closed")
+        root = normalized_path(profile.data_root)
+        if not profile.is_default or any(
+            normalized_path(process.user_data_dir) != root for process in processes
+        ):
+            # Another profile's Claude holds its own folders.
+            return skipped("other-profile-open")
         if signed_in(profile.data_root) is not False:
             return skipped("signed-in")
         departing = last_known_account(profile.data_root)
@@ -704,13 +717,18 @@ def _run_signed_out(
         dependencies.sleeper(SIGNED_OUT_SETTLE_SECONDS)
 
         def holds() -> bool:
-            return holds_folders(running, profile.data_root)
+            return holds_folders(
+                _running_processes(config, dependencies), profile.data_root, departing
+            )
+
+        def again() -> bool:
+            return signed_in_again(profile.data_root, departing)
 
         read_only = frozenset({departing})
         record_progress(config, "syncing")
         syncing = True
         engine = KeepAccountsUnchanged(
-            dependencies.live_engine_factory(config, holds), read_only
+            dependencies.live_engine_factory(config, holds, again), read_only
         )
         started = dependencies.clock()
         chat_run = None
@@ -734,7 +752,9 @@ def _run_signed_out(
         except Exception as error:
             payload = _chat_failure(error)
             if payload["reason"] == "claude-open":
-                payload["reason"] = "signed-in"
+                # Signed in before or during the writes: nothing is broken,
+                # the switch restart syncs instead.
+                payload = {"state": "waiting", "reason": "signed-in"}
         if engine.held_back:
             payload.setdefault("counts", {})["held_back"] = engine.held_back
         if chat_run is not None and chat_run.archive_waiting:
@@ -755,7 +775,7 @@ def _run_signed_out(
                 names=("routines",),
             )
         )
-        payload["signed_in_during_sync"] = signed_in(profile.data_root) is not False
+        payload["signed_in_during_sync"] = again()
         payload["progress"] = finish_progress(config, payload)
         reasons = restart_reasons(config, payload)
         payload["restart"] = bool(reasons)

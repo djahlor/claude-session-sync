@@ -43,9 +43,6 @@ class Config:
     # Sync chats and routines while Claude is open and signed out, so a switch
     # needs no restart for them.
     sync_while_signed_out: bool = True
-    # Restart Claude after a switch to put browser logins back. When off they
-    # come back the next time Claude quits.
-    restart_for_browser_logins: bool = True
     version: int = 1
 
 
@@ -66,7 +63,6 @@ _CONFIG_KEYS = {
     "sync_archive_state",
     "routine_mode_when_unset",
     "sync_while_signed_out",
-    "restart_for_browser_logins",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "target_policy",
@@ -77,7 +73,6 @@ _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "sync_archive_state",
     "routine_mode_when_unset",
     "sync_while_signed_out",
-    "restart_for_browser_logins",
 }
 # The modes Claude's routine page offers.
 ROUTINE_MODES = ("default", "acceptEdits", "plan", "auto", "bypassPermissions")
@@ -254,9 +249,6 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_while_signed_out = document.get("sync_while_signed_out", True)
     if not isinstance(sync_while_signed_out, bool):
         raise ConfigError("sync_while_signed_out must be a boolean")
-    restart_for_browser_logins = document.get("restart_for_browser_logins", True)
-    if not isinstance(restart_for_browser_logins, bool):
-        raise ConfigError("restart_for_browser_logins must be a boolean")
     routine_mode_when_unset = document.get("routine_mode_when_unset")
     if routine_mode_when_unset is not None and (
         routine_mode_when_unset not in ROUTINE_MODES
@@ -287,6 +279,5 @@ def load_config(path: Union[str, Path]) -> Config:
         sync_archive_state=sync_archive_state,
         routine_mode_when_unset=routine_mode_when_unset,
         sync_while_signed_out=sync_while_signed_out,
-        restart_for_browser_logins=restart_for_browser_logins,
         version=version,
     )

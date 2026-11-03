@@ -614,6 +614,17 @@ class RoutineSynchronizer:
             ) from error
         try:
             targets = self._targets()
+            if self.read_only_accounts and self._journal(targets).has_unfinished():
+                # Recovery may write any manifest, including a read-only one.
+                return RoutineReceipt(
+                    "deferred",
+                    len(self.config.profiles),
+                    len(targets),
+                    0,
+                    0,
+                    0,
+                    "recovery-pending",
+                )
             self._recover_pending(targets)
             samples = tuple(self._sample(target) for target in targets)
             snapshot_path = self._snapshot_path()

@@ -187,6 +187,18 @@ class RecordJournal:
                     return phase, True
         return None, False
 
+    def has_unfinished(self) -> bool:
+        """Whether recover() would act: some run is neither committed nor rolled back."""
+
+        if not os.path.lexists(str(self.root)):
+            return False
+        if self.root.is_symlink() or not self.root.is_dir():
+            raise RecordRecoveryError("recovery state is unsafe")
+        return any(
+            self._load(path)["state"] not in TERMINAL
+            for path in sorted(self.root.glob("*.json"))
+        )
+
     def recover(self) -> None:
         if not os.path.lexists(str(self.root)):
             return

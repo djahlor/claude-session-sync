@@ -32,13 +32,23 @@ def finish_progress(config, payload: dict) -> str:
     outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
     attention = any(
         value
-        not in ("committed", "synced", "noop", "disabled", "deferred", "per-account")
+        not in (
+            "committed",
+            "synced",
+            "noop",
+            "disabled",
+            "deferred",
+            "per-account",
+            "waiting",
+        )
         for value in outcomes
     )
     attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
     if attention:
         state = "needs-attention"
-    elif any(adapter.get("state") == "deferred" for adapter in adapters):
+    elif payload.get("state") == "waiting" or any(
+        adapter.get("state") == "deferred" for adapter in adapters
+    ):
         state = "waiting-for-Claude"
     else:
         state = "finished"

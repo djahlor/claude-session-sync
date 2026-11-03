@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from test_cli_live import (
     A_ACCOUNT,
@@ -45,9 +46,12 @@ class SignedOutSyncTests(ChatCliFixture):
             json.dumps(values), encoding="utf-8"
         )
 
-    def live_engine(self, config, holds):
+    def live_engine(self, config, holds, signed_in_again):
         return TransactionEngine(
-            config.state_dir, process_probe=holds, retention=config.retention
+            config.state_dir,
+            process_probe=holds,
+            retention=config.retention,
+            write_guard=signed_in_again,
         )
 
     def signed_out_sync(self, **dependencies):
@@ -123,17 +127,80 @@ class SignedOutSyncTests(ChatCliFixture):
 
         payload = self.signed_out_sync(sleeper=lambda _seconds: self.sign_in(B_ACCOUNT))
 
-        self.assertEqual("failed", payload["state"])
+        self.assertEqual("waiting", payload["state"])
         self.assertEqual("signed-in", payload["reason"])
         self.assertIsNone(self.read(self.b, X))
         self.assertTrue(payload["signed_in_during_sync"])
         self.assertIn("chats", payload["restart_reasons"])
+        # A sign-in race is no fault: the switch restart syncs instead.
+        self.assertEqual("waiting-for-Claude", payload["progress"])
+
+    def test_a_new_account_in_the_config_counts_as_signed_in(self):
+        self.write(self.a, X)
+
+        payload = self.signed_out_sync(
+            sleeper=lambda _seconds: self.sign_out(B_ACCOUNT)
+        )
+
+        self.assertEqual("signed-in", payload["reason"])
+        self.assertIsNone(self.read(self.b, X))
+
+    def test_a_sign_in_between_two_writes_ends_the_run_there(self):
+        self.write(self.a, X)
+        self.write(self.a, Y)
+        checks = []
+
+        def guard_then_sign_in(config, holds, signed_in_again):
+            def again():
+                checks.append(True)
+                if len(checks) == 2:
+                    self.sign_in(B_ACCOUNT)
+                return signed_in_again()
+
+            return self.live_engine(config, holds, again)
+
+        payload = self.signed_out_sync(live_engine_factory=guard_then_sign_in)
+
+        # The run ends at the sign-in and keeps the copy written before it.
+        self.assertEqual("committed", payload["state"])
+        self.assertEqual(1, payload["counts"]["operations"])
+        written = [self.read(self.b, X), self.read(self.b, Y)]
+        self.assertEqual(1, sum(copy is not None for copy in written))
+        self.assertIn("signed-in-during-sync", payload["restart_reasons"])
+        # The next sync writes the rest, with no recovery left to do.
+        self.running = False
+        self.assertEqual(0, self.cli("sync", "--json")[0])
+        self.assertIsNotNone(self.read(self.b, X))
+        self.assertIsNotNone(self.read(self.b, Y))
+
+    def test_another_profiles_open_claude_stops_it(self):
+        other = self.root / "Other"
+        self.config = replace(
+            self.config,
+            profiles=(
+                *self.config.profiles,
+                Profile("Other", other, ("open",), False),
+            ),
+        )
+        self.write(self.a, X)
+
+        class TwoClaudes:
+            def running(probe, **_options):
+                return (
+                    SimpleNamespace(pid=1, user_data_dir=self.data_root, argv=()),
+                    SimpleNamespace(pid=2, user_data_dir=other, argv=()),
+                )
+
+        payload = self.signed_out_sync(process_probe=TwoClaudes())
+
+        self.assertEqual("other-profile-open", payload["reason"])
+        self.assertIsNone(self.read(self.b, X))
 
     def test_a_sign_in_during_the_sync_asks_for_the_restart(self):
         self.write(self.a, X)
 
-        def engine(config, holds):
-            inner = self.live_engine(config, holds)
+        def engine(config, holds, signed_in_again):
+            inner = self.live_engine(config, holds, signed_in_again)
             apply = inner.apply
 
             def apply_then_sign_in(plan):
@@ -182,15 +249,6 @@ class SignedOutSyncTests(ChatCliFixture):
         self.assertIsNotNone(self.read(self.b, X))
         self.assertTrue(payload["restart"])
         self.assertEqual(["groups", "browser-logins"], payload["restart_reasons"])
-
-    def test_browser_logins_can_wait_for_the_next_quit(self):
-        self.config = replace(
-            self.config, sync_browser_logins=True, restart_for_browser_logins=False
-        )
-
-        payload = self.signed_out_sync()
-
-        self.assertFalse(payload["restart"])
 
     def test_an_archive_that_would_change_the_account_left_waits_whole(self):
         # Archived in B with nothing remembered: archived wins, so the archive
