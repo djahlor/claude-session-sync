@@ -69,6 +69,37 @@ def _default_engine_factory(config: Config) -> Any:
     )
 
 
+def _default_live_engine_factory(
+    config: Config, holds: Callable[[], bool], signed_in_again: Callable[[], bool]
+) -> Any:
+    """The chat engine for a sync while Claude is open and signed out.
+
+    holds runs before journaling and before the first write; the cheaper
+    signed_in_again runs before every write.
+    """
+
+    from .transaction import TransactionEngine
+
+    return TransactionEngine(
+        config.state_dir,
+        process_probe=holds,
+        retention=config.retention,
+        write_guard=signed_in_again,
+    )
+
+
+def _default_live_routine_factory(
+    config: Config, holds: Callable[[], bool], read_only: frozenset[str]
+) -> Any:
+    from .routines import RoutineSynchronizer
+
+    return RoutineSynchronizer(
+        config,
+        process_probe=lambda *_args, **_kwargs: holds(),
+        read_only_accounts=read_only,
+    )
+
+
 def _default_installer_factory(config_path: Path) -> Any:
     from .installer import Installer, InstallLayout
 
@@ -166,6 +197,8 @@ class CliDependencies:
     layout_factory: LayoutFactory = _default_layout_factory
     routine_factory: RoutineFactory = _default_routine_factory
     picture_factory: Callable[[Config], Any] = _default_picture_factory
+    live_engine_factory: Callable[..., Any] = _default_live_engine_factory
+    live_routine_factory: Callable[..., Any] = _default_live_routine_factory
     artifact_warnings: Callable[[Config, Callable[[], bool]], dict] = (
         _default_artifact_warnings
     )
@@ -245,6 +278,12 @@ def _parser() -> argparse.ArgumentParser:
         "restart-check", help="inspect which default-profile processes may be restarted"
     )
     restart_check.add_argument("profile")
+    signed_out = commands.add_parser(
+        "signed-out-sync",
+        help="sync while Claude is open and signed out, before the next sign-in",
+    )
+    signed_out.add_argument("profile")
+    signed_out.add_argument("--json", action="store_true", dest="as_json")
     switch.add_argument("--no-launch", action="store_true")
     switch_layout = switch.add_mutually_exclusive_group()
     switch_layout.add_argument(
@@ -652,6 +691,141 @@ def _run_switch(
             payload["browser_logins"] = browser_logins
         _write(payload, as_json=as_json, stream=output)
         return 0 if payload["progress"] == "finished" else 1
+    finally:
+        handoff.release()
+
+
+def _run_signed_out(
+    arguments: Any,
+    config: Config,
+    dependencies: CliDependencies,
+    output: TextIO,
+) -> int:
+    """Sync chats and routines while Claude is open and signed out.
+
+    Claude reads the next account's folders when it signs in, so a switch
+    then needs no restart for them. The account just left stays untouched,
+    because Claude still saves its chats. The report says whether the switch
+    still needs one restart, and why.
+    """
+
+    from .chat_sync import ChatStateError, run_chat_sync
+    from .live import (
+        SIGNED_OUT_SETTLE_SECONDS,
+        KeepAccountsUnchanged,
+        holds_folders,
+        restart_reasons,
+        signed_in_again,
+    )
+    from .locking import ExclusiveFileLock, LockUnavailableError
+    from .logins import last_known_account, signed_in
+
+    profile = _find_profile(config, arguments.profile)
+
+    def skipped(reason: str) -> int:
+        payload = {"state": "skipped", "reason": reason, "restart": True}
+        _write(payload, as_json=arguments.as_json, stream=output)
+        return 0
+
+    if not config.sync_while_signed_out:
+        return skipped("disabled")
+    handoff = ExclusiveFileLock(
+        config.state_dir / "switch-handoff.lock", mode="auto", timeout=0
+    )
+    try:
+        handoff.acquire()
+    except LockUnavailableError:
+        return skipped("busy")
+    syncing = False
+    try:
+        processes = _running_processes(config, dependencies)
+        if not processes:
+            return skipped("claude-closed")
+        root = normalized_path(profile.data_root)
+        if not profile.is_default or any(
+            normalized_path(process.user_data_dir) != root for process in processes
+        ):
+            # Another profile's Claude holds its own folders.
+            return skipped("other-profile-open")
+        if signed_in(profile.data_root) is not False:
+            return skipped("signed-in")
+        departing = last_known_account(profile.data_root)
+        if departing is None:
+            return skipped("account-unknown")
+        dependencies.sleeper(SIGNED_OUT_SETTLE_SECONDS)
+
+        def holds() -> bool:
+            return holds_folders(
+                _running_processes(config, dependencies), profile.data_root, departing
+            )
+
+        def again() -> bool:
+            return signed_in_again(profile.data_root, departing)
+
+        read_only = frozenset({departing})
+        record_progress(config, "syncing")
+        syncing = True
+        engine = KeepAccountsUnchanged(
+            dependencies.live_engine_factory(config, holds, again), read_only
+        )
+        started = dependencies.clock()
+        chat_run = None
+        try:
+            chat_run = run_chat_sync(
+                config,
+                dependencies.planner_factory(config),
+                engine,
+                read_only_accounts=read_only,
+            )
+            payload = _chat_run_summary(
+                chat_run, round((dependencies.clock() - started) * 1000)
+            )
+        except ChatStateError:
+            payload = {
+                "state": "failed",
+                "reason": "state-unusable",
+                "next_action": "run-doctor",
+                "error_type": "chat-state-error",
+            }
+        except Exception as error:
+            payload = _chat_failure(error)
+            if payload["reason"] == "claude-open":
+                # Signed in before or during the writes: nothing is broken,
+                # the switch restart syncs instead.
+                payload = {"state": "waiting", "reason": "signed-in"}
+        if engine.held_back:
+            payload.setdefault("counts", {})["held_back"] = engine.held_back
+        if chat_run is not None and chat_run.archive_waiting:
+            payload["archive"] = "waiting"
+        _fix_chat_pictures(config, dependencies, payload)
+        payload.update(
+            run_adapters(
+                config,
+                replace(
+                    dependencies,
+                    routine_factory=lambda routine_config: (
+                        dependencies.live_routine_factory(
+                            routine_config, holds, read_only
+                        )
+                    ),
+                ),
+                holds,
+                names=("routines",),
+            )
+        )
+        payload["signed_in_during_sync"] = again()
+        payload["progress"] = finish_progress(config, payload)
+        reasons = restart_reasons(config, payload)
+        payload["restart"] = bool(reasons)
+        payload["restart_reasons"] = reasons
+        _write(payload, as_json=arguments.as_json, stream=output)
+        return 0
+    except Exception:
+        if syncing:
+            record_progress(
+                config, "needs-attention", reason="sync-error", next_action="run-doctor"
+            )
+        raise
     finally:
         handoff.release()
 
@@ -1443,6 +1617,7 @@ _COMMANDS: dict[str, Callable[..., int]] = {
     "sync": _run_sync,
     "auto": _run_sync,
     "switch": _run_switch,
+    "signed-out-sync": _run_signed_out,
     "rollback": _cmd_rollback,
     "browser-logins": _cmd_browser_logins,
     "status": _cmd_status,

@@ -1,7 +1,8 @@
 """Read which accounts signed in to Claude on this Mac, from Claude's own files.
 
-Ported from vinlim/claude-desktop-sync (0BSD). Only the account id is read from
-Claude's config.json, and only login lines from its main.log.
+Ported from vinlim/claude-desktop-sync (0BSD). Only the account id and the
+signed-in flag are read from Claude's config.json, and only login lines from
+its main.log.
 """
 
 import os
@@ -30,8 +31,8 @@ def default_app_log() -> Path:
     return Path.home() / "Library" / "Logs" / "Claude" / "main.log"
 
 
-def last_known_account(data_root: Path) -> Optional[str]:
-    """Read only lastKnownAccountUuid. The rest of this file can hold credentials."""
+def _claude_config_value(data_root: Path, key: str) -> object:
+    """Read one value. The rest of this file can hold credentials."""
 
     path = Path(data_root) / "config.json"
     try:
@@ -40,8 +41,25 @@ def last_known_account(data_root: Path) -> Optional[str]:
         document = json.loads(path.read_bytes().decode("utf-8"))
     except (OSError, UnicodeError, ValueError):
         return None
-    value = document.get("lastKnownAccountUuid") if isinstance(document, dict) else None
+    return document.get(key) if isinstance(document, dict) else None
+
+
+def last_known_account(data_root: Path) -> Optional[str]:
+    """The account signed in now, or the one just left while Claude is signed out."""
+
+    value = _claude_config_value(data_root, "lastKnownAccountUuid")
     return value.lower() if isinstance(value, str) and value else None
+
+
+def signed_in(data_root: Path) -> Optional[bool]:
+    """Whether Claude is signed in, or None when its config does not say.
+
+    Claude sets windowSizeWasSignedIn to false the moment it signs out and to
+    true at the next sign-in (Claude Desktop 4.4212.0).
+    """
+
+    value = _claude_config_value(data_root, "windowSizeWasSignedIn")
+    return value if isinstance(value, bool) else None
 
 
 def logins_in_app_log(app_log: Path, now_ms: int) -> list[tuple[str, int]]:

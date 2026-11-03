@@ -40,6 +40,9 @@ class Config:
     # Save this permission mode on a routine that has none, so it stops running
     # in manual. Off when None.
     routine_mode_when_unset: Union[str, None] = None
+    # Sync chats and routines while Claude is open and signed out, so a switch
+    # needs no restart for them.
+    sync_while_signed_out: bool = True
     # Turn off Claude Code's automatic artifact comment replies and clear the
     # saved watches that show "didn't resume" warnings.
     stop_artifact_warnings: bool = False
@@ -62,6 +65,7 @@ _CONFIG_KEYS = {
     "fix_chat_pictures",
     "sync_archive_state",
     "routine_mode_when_unset",
+    "sync_while_signed_out",
     "stop_artifact_warnings",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
@@ -72,6 +76,7 @@ _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "fix_chat_pictures",
     "sync_archive_state",
     "routine_mode_when_unset",
+    "sync_while_signed_out",
     "stop_artifact_warnings",
 }
 # The modes Claude's routine page offers.
@@ -246,6 +251,9 @@ def load_config(path: Union[str, Path]) -> Config:
     sync_archive_state = document.get("sync_archive_state", True)
     if not isinstance(sync_archive_state, bool):
         raise ConfigError("sync_archive_state must be a boolean")
+    sync_while_signed_out = document.get("sync_while_signed_out", True)
+    if not isinstance(sync_while_signed_out, bool):
+        raise ConfigError("sync_while_signed_out must be a boolean")
     routine_mode_when_unset = document.get("routine_mode_when_unset")
     if routine_mode_when_unset is not None and (
         routine_mode_when_unset not in ROUTINE_MODES
@@ -278,6 +286,7 @@ def load_config(path: Union[str, Path]) -> Config:
         fix_chat_pictures=fix_chat_pictures,
         sync_archive_state=sync_archive_state,
         routine_mode_when_unset=routine_mode_when_unset,
+        sync_while_signed_out=sync_while_signed_out,
         stop_artifact_warnings=stop_artifact_warnings,
         version=version,
     )

@@ -95,6 +95,7 @@ class TransactionEngine:
         lock_timeout: float = 5.0,
         fault_injector: FaultInjector | None = None,
         retention: int | None = None,
+        write_guard: Callable[[], bool] | None = None,
     ) -> None:
         if retention is not None and retention < 1:
             raise ValueError("retention must be at least one run")
@@ -104,6 +105,10 @@ class TransactionEngine:
         self.lock_timeout = lock_timeout
         self.fault_injector = fault_injector
         self.retention = retention
+        # Checked before every write, cheaper than process_probe. True ends the
+        # run there and keeps what it wrote, as a run cut short: a rollback
+        # would need Claude closed.
+        self.write_guard = write_guard
 
     def apply(self, plan: Any) -> RunReceipt:
         """Apply a plan under the single-writer lock.
@@ -228,6 +233,8 @@ class TransactionEngine:
             self._verify_destinations_unchanged(journal.records)
             self._ensure_apps_stopped()
             for record in journal.records:
+                if self.write_guard is not None and self.write_guard():
+                    break
                 destination = Path(record["destination"])
                 kind = record["kind"]
                 if kind == "retire":

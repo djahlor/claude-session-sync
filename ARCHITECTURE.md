@@ -15,9 +15,9 @@ apply(plan) -> RunReceipt
 rollback(run_id) -> RecoveryReceipt
 ```
 
-Every sync runs with Claude closed. `auto` and `sync` check the managed Claude
-processes first, and while one runs they write nothing and report that they are
-waiting. The planner decides per session from content and a private record of
+Every sync runs with Claude closed, except the sync at sign-out. `auto` and
+`sync` check the managed Claude processes first, and while one runs they write
+nothing and report that they are waiting. The planner decides per session from content and a private record of
 the last agreed version (rules.py, ported from vinlim/claude-desktop-sync under
 0BSD).
 
@@ -32,8 +32,14 @@ reports the failure. A launch fails only when the launch command cannot start
 or exits with an error. It adds no synchronization policy.
 
 In automatic target mode, the native watcher observes the default profile's
-account UUID marker. A stable account change asks Claude to quit normally, runs
-`switch(profile)` with Claude closed, and reopens Claude. A quit runs `auto`.
+account UUID marker and signed-in flag. A sign-out while Claude runs starts
+`signed-out-sync(profile)`: Claude reads an account's chats and routines when
+it signs in and holds no folder but the one just left, so chats, archive state
+and routines sync into every other account's folders while Claude stays open
+(live.py). A stable account change keeps Claude open when that sync finished
+first and nothing left needs Claude closed. Otherwise it asks Claude to quit
+normally, runs `switch(profile)` with Claude closed, and reopens Claude. A
+quit runs `auto`.
 Saving a chat does not trigger a sync. At start the watcher runs `auto` once,
 which waits if Claude is open. A persistent status menu and a non-activating
 window display progress without depending on Notification Center.
@@ -67,8 +73,11 @@ window display progress without depending on Notification Center.
    recorded so rollback can remove only the exact content the run introduced.
 5. Files change only by same-directory atomic replacement, by a hard-link
    create that never overwrites, or by a journaled removal. A write needs every
-   managed Claude process stopped. The engine checks before journaling and
-   again before the first write.
+   managed Claude process stopped, or, at sign-out, no other profile's Claude
+   open, Claude still signed out and the folder outside the account just
+   left. The engine checks before journaling and again before the first
+   write; at sign-out it also checks Claude's sign-in markers before every
+   write and ends the run, keeping what it wrote, at the first sign-in.
 6. A rollback verifies every preimage before it changes live data and never
    suppresses restore failures. A chat run that a killed process left open
    mid-apply is closed by the next chat sync. It keeps what it wrote, and its

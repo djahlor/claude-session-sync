@@ -533,6 +533,48 @@ class RoutineSynchronizerTests(unittest.TestCase):
             )
         self.assertEqual("noop", self.synchronizer().sync().state)
 
+    def test_an_account_claude_may_still_write_defers_the_whole_run(self):
+        first = self.target("a")
+        second = self.target("b")
+        self.write_manifest(second, manifest(self.daily()))
+        before = (second / "scheduled-tasks.json").read_bytes()
+        synchronizer = RoutineSynchronizer(
+            self.config,
+            task_root=self.skill.parent.parent,
+            process_probe=lambda *args, **kwargs: (),
+            read_only_accounts=frozenset({"a"}),
+        )
+
+        receipt = synchronizer.sync()
+
+        self.assertEqual(
+            ("deferred", "account-still-open"), (receipt.state, receipt.reason)
+        )
+        self.assertFalse((first / "scheduled-tasks.json").exists())
+        self.assertEqual(before, (second / "scheduled-tasks.json").read_bytes())
+        self.assertFalse(
+            (self.config.state_dir / "code-routines-snapshot.json").exists()
+        )
+
+    def test_an_unfinished_routine_run_waits_for_a_closed_claude(self):
+        first = self.target("a")
+        self.write_manifest(first, manifest(self.daily()))
+        journal = self.config.state_dir / "routine-runs"
+        journal.mkdir(parents=True)
+        (journal / "run.json").write_text(json.dumps({"state": "PREPARED"}))
+        synchronizer = RoutineSynchronizer(
+            self.config,
+            task_root=self.skill.parent.parent,
+            process_probe=lambda *args, **kwargs: (),
+            read_only_accounts=frozenset({"a"}),
+        )
+
+        receipt = synchronizer.sync()
+
+        self.assertEqual(
+            ("deferred", "recovery-pending"), (receipt.state, receipt.reason)
+        )
+
     def test_deletion_propagates_after_snapshot(self):
         first = self.target("a")
         second = self.target("b")

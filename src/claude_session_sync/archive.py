@@ -186,44 +186,35 @@ class ArchiveSync:
         self.targets = dict(targets)
         self.ledger = _load_ledger(self.state_dir / LEDGER_FILENAME)
 
-    def flags(self) -> dict[str, dict[str, list]]:
+    def flags(
+        self, scanned: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> dict[str, dict[str, list]]:
         """Each folder's flags now: {folder: {session: [flag, size, mtime_ns]}}.
 
         A file with the size and save time remembered is not read again.
+        scanned, the chat files the planner just listed, saves listing every
+        folder again. A copy that changed since is caught when it is read.
         """
 
         current: dict[str, dict[str, list]] = {}
         for key, target in sorted(self.targets.items()):
             remembered = self.ledger.get(key, {})
             entries: dict[str, list] = {}
-            try:
-                names = [entry.name for entry in os.scandir(str(target.path))]
-            except OSError:
-                continue
-            for name in names:
-                if not (name.startswith("local_") and name.endswith(".json")):
-                    continue
-                session_id = name[len("local_") : -len(".json")]
-                path = Path(target.path) / name
-                try:
-                    metadata = os.lstat(str(path))
-                except OSError:
-                    continue
+            if scanned is not None and key in scanned:
+                files = [
+                    (session_id, Path(replica.path), replica.size, replica.mtime_ns)
+                    for session_id, replica in scanned[key].items()
+                ]
+            else:
+                files = list(_listed(Path(target.path)))
+            for session_id, path, size, mtime_ns in files:
                 held = remembered.get(session_id)
-                if (
-                    held
-                    and held[1] == metadata.st_size
-                    and held[2] == metadata.st_mtime_ns
-                ):
+                if held and held[1] == size and held[2] == mtime_ns:
                     entries[session_id] = held
                     continue
                 flag = _read_flag(path, session_id)
                 if flag is not None:
-                    entries[session_id] = [
-                        int(flag),
-                        metadata.st_size,
-                        metadata.st_mtime_ns,
-                    ]
+                    entries[session_id] = [int(flag), size, mtime_ns]
             current[key] = entries
         return current
 
@@ -340,11 +331,40 @@ def spread_archive_state(
     engine: Any,
     *,
     skip: Iterable[str] = (),
-) -> tuple[ArchiveReport, tuple[Operation, ...]]:
-    """Give every copy of a chat the archive state that won. Returns what was applied."""
+    read_only_accounts: frozenset[str] = frozenset(),
+    scanned: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[ArchiveReport | None, tuple[Operation, ...]]:
+    """Give every copy of a chat the archive state that won. Returns what was applied.
+
+    Copies in read_only_accounts are left for a later run. One of their
+    copies already holds the winning state, and its flag is not remembered
+    (see remember_archive_state), so the next run still sees that archive as
+    fresh. When none of them holds it, the archive came from elsewhere and
+    could not win later, so then nothing is written and the report is None.
+    """
 
     sync = ArchiveSync(state_dir, targets)
-    decisions = sync.decisions(sync.flags(), skip)
+    current = sync.flags(scanned)
+    decisions = sync.decisions(current, skip)
+    held = read_only_folders(targets, read_only_accounts)
+
+    def held_agrees(winner: ArchiveCopy) -> bool:
+        session_id = winner.path.name[len("local_") : -len(".json")]
+        return any(
+            current.get(key, {}).get(session_id, [None])[0] == int(winner.archived)
+            for key in held
+        )
+
+    if any(
+        any(loser.folder in held for loser in losers) and not held_agrees(winner)
+        for winner, losers in decisions
+    ):
+        return None, ()
+    decisions = [
+        (winner, kept)
+        for winner, losers in decisions
+        if (kept := [loser for loser in losers if loser.folder not in held])
+    ]
     if not decisions:
         return ArchiveReport(), ()
     stage = Path(state_dir) / STAGE_DIRNAME / uuid.uuid4().hex
@@ -377,13 +397,17 @@ def spread_archive_state(
 
 
 def preview_archive_state(
-    state_dir: Path, targets: Mapping[str, Any], *, skip: Iterable[str] = ()
+    state_dir: Path,
+    targets: Mapping[str, Any],
+    *,
+    skip: Iterable[str] = (),
+    scanned: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ArchiveReport:
     """What spread_archive_state would change, without writing anything."""
 
     sync = ArchiveSync(state_dir, targets)
     archived = opened = 0
-    for winner, losers in sync.decisions(sync.flags(), skip):
+    for winner, losers in sync.decisions(sync.flags(scanned), skip):
         if winner.archived:
             archived += len(losers)
         else:
@@ -391,9 +415,45 @@ def preview_archive_state(
     return ArchiveReport(archived=archived, opened=opened)
 
 
-def remember_archive_state(state_dir: Path, targets: Mapping[str, Any]) -> None:
+def read_only_folders(
+    targets: Mapping[str, Any], accounts: frozenset[str]
+) -> frozenset[str]:
+    return frozenset(
+        key for key, target in targets.items() if target.account_id.lower() in accounts
+    )
+
+
+def remember_archive_state(
+    state_dir: Path, targets: Mapping[str, Any], *, keep: frozenset[str] = frozenset()
+) -> None:
+    """Remember every folder's flags, except keep's: those stay as last remembered."""
+
     sync = ArchiveSync(state_dir, targets)
-    sync.remember(sync.flags())
+    current = sync.flags()
+    for key in keep:
+        current[key] = sync.ledger.get(key, {})
+    sync.remember(current)
+
+
+def _listed(folder: Path) -> Iterable[tuple[str, Path, int, int]]:
+    try:
+        names = [entry.name for entry in os.scandir(str(folder))]
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("local_") and name.endswith(".json")):
+            continue
+        path = folder / name
+        try:
+            metadata = os.lstat(str(path))
+        except OSError:
+            continue
+        yield (
+            name[len("local_") : -len(".json")],
+            path,
+            metadata.st_size,
+            (metadata.st_mtime_ns),
+        )
 
 
 def _read_flag(path: Path, session_id: str) -> bool | None:
