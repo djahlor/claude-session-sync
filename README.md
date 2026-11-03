@@ -89,6 +89,22 @@ With browser logins on, the background helper saves a copy of the built-in brows
 - If you clear the built-in browser yourself without switching, sync keeps it cleared.
 - The copy stays in sync's private folder, still encrypted with Claude's own key. Sync reads counts and times, never a cookie.
 
+## Artifact warnings
+
+When Claude publishes an artifact page, the chat turns on automatic replies to comments on that page and saves a note about it in the chat's history. Each time the chat opens again, Claude tries to restart every saved note. After an account switch, a page owned by another account cannot be watched, so each note shows a red warning such as "Artifact comment monitor ... didn't resume". The notes never expire, so old chats show them again on every reopen.
+
+With this option on, every sync does two things while Claude is closed:
+
+1. It adds `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"` to the `env` block of `~/.claude/settings.json`, so new chats save no notes. Every other line of the file stays as it was. If that key is already there, sync leaves it alone.
+2. It removes the saved notes from the chat histories in `~/.claude/projects/`. Each removed line is first copied to a backup in sync's private folder. A chat whose Claude Code process still runs is skipped until it closes.
+
+Turn it on with `configure --stop-artifact-warnings --apply` from [Commands](#commands). It works from the next time Claude closes.
+
+- It is off by default, because it has a cost: Claude stops answering comments on your artifacts by itself in the background.
+- Anthropic does not document this switch. It was found in Claude Code 2.1.309, and a Claude Code update could rename or remove it. The warnings would then come back.
+- To turn it off, set `"stop_artifact_warnings": false` in the config. The next sync takes the key out of `settings.json`, but only if sync put it there.
+- `status` shows `artifact_warnings=on` or `off`, and `artifact_warnings_cleared` counts the notes the last sync removed.
+
 ## Commands
 
 The installed tool lives in your Library folder. Set it once per Terminal window:
@@ -105,6 +121,7 @@ css="$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync
 | `"$css" configure --sync-layout --apply` | Turns on groups |
 | `"$css" configure --sync-browser-logins --apply` | Turns on browser logins |
 | `"$css" browser-logins status --json` | Shows the saved browser copy, counts only |
+| `"$css" configure --stop-artifact-warnings --apply` | Stops the artifact "didn't resume" warnings ([cost](#artifact-warnings)) |
 | `"$css" uninstall --apply` | Removes the background helper and menu-bar item |
 
 All commands and recovery steps are in the [technical reference](docs/technical-reference.md).
@@ -113,7 +130,7 @@ All commands and recovery steps are in the [technical reference](docs/technical-
 
 Run the install command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
 
-To remove it, run `"$css" uninstall --apply`.
+To remove it, run `"$css" uninstall --apply`. If you turned on [artifact warnings](#artifact-warnings), turn that off and quit Claude once first, or the switch stays in `settings.json`.
 
 ## If something goes wrong
 

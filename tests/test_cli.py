@@ -441,8 +441,10 @@ class CliRecoveryAndHealthTests(unittest.TestCase):
                 json.loads(status_out.getvalue()),
                 {
                     "bytes": 0,
+                    "artifact_warnings": "off",
                     "counts": {
                         "abandoned_preparations": 0,
+                        "artifact_warnings_cleared": 0,
                         "layout_failures": 0,
                         "profiles": 2,
                         "routine_failures": 0,
@@ -659,7 +661,8 @@ class CliConfigureTests(unittest.TestCase):
             self.assertEqual(
                 "state=planned counts={'actions': 1, 'backups': 0, 'changes': 4, "
                 "'automatic_targets': 1, 'layout_sync': 1, 'routine_sync': 1, "
-                "'browser_login_sync': 0} bytes=0 duration_ms=0\n",
+                "'browser_login_sync': 0, 'artifact_warnings_stopped': 0} "
+                "bytes=0 duration_ms=0\n",
                 output.getvalue(),
             )
             self.assertFalse(config_path.exists())

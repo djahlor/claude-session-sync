@@ -57,12 +57,17 @@ class PictureReceipt:
     picture_count: int
 
 
+def claude_config_dir() -> Path:
+    """Claude Code's own folder, shared by every account."""
+
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
 def projects_root() -> Path:
     """Where Claude Code keeps chat transcripts, shared by every account."""
 
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    base = Path(configured).expanduser() if configured else Path.home() / ".claude"
-    return base / "projects"
+    return claude_config_dir() / "projects"
 
 
 def _attachment_lists(value: Any) -> Iterator[list[Any]]:
