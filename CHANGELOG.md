@@ -4,6 +4,12 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.6.8] - 2026-11-03
+
+### Added
+
+- `stop_artifact_warnings` in the config, to stop the red "Artifact comment monitor ... didn't resume" warnings. Each artifact page Claude publishes turns on automatic replies to its comments and saves a note in the chat's history. Reopening the chat restarts every saved note, and after an account switch a page owned by another account fails each time: 2,501 notes in 165 chats on 29-10-2026. With `configure --stop-artifact-warnings --apply`, each sync with Claude closed adds `"CLAUDE_CODE_ARTIFACT_COMMENTS_AUTOREACT": "0"` to the `env` block of `~/.claude/settings.json`, so new chats save no notes, and removes the saved notes from closed chats after a backup. A chat whose Claude Code process still runs is skipped. Turned off, the next sync takes the key out only if sync put it in. The cost: Claude no longer answers artifact comments by itself in the background. Anthropic does not document the switch; it was found in Claude Code 2.1.309, and an update could remove it. `status` shows `artifact_warnings` and `artifact_warnings_cleared`. Off by default.
+
 ## [0.6.7] - 2026-10-29
 
 ### Fixed

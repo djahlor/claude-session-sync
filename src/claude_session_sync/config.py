@@ -40,6 +40,9 @@ class Config:
     # Save this permission mode on a routine that has none, so it stops running
     # in manual. Off when None.
     routine_mode_when_unset: Union[str, None] = None
+    # Turn off Claude Code's automatic artifact comment replies and clear the
+    # saved watches that show "didn't resume" warnings.
+    stop_artifact_warnings: bool = False
     version: int = 1
 
 
@@ -59,6 +62,7 @@ _CONFIG_KEYS = {
     "fix_chat_pictures",
     "sync_archive_state",
     "routine_mode_when_unset",
+    "stop_artifact_warnings",
 }
 _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "target_policy",
@@ -68,6 +72,7 @@ _REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {
     "fix_chat_pictures",
     "sync_archive_state",
     "routine_mode_when_unset",
+    "stop_artifact_warnings",
 }
 # The modes Claude's routine page offers.
 ROUTINE_MODES = ("default", "acceptEdits", "plan", "auto", "bypassPermissions")
@@ -250,6 +255,9 @@ def load_config(path: Union[str, Path]) -> Config:
                 ", ".join(ROUTINE_MODES)
             )
         )
+    stop_artifact_warnings = document.get("stop_artifact_warnings", False)
+    if not isinstance(stop_artifact_warnings, bool):
+        raise ConfigError("stop_artifact_warnings must be a boolean")
 
     claude_executable = Path(
         _nonempty_string(document["claude_executable"], "claude_executable")
@@ -270,5 +278,6 @@ def load_config(path: Union[str, Path]) -> Config:
         fix_chat_pictures=fix_chat_pictures,
         sync_archive_state=sync_archive_state,
         routine_mode_when_unset=routine_mode_when_unset,
+        stop_artifact_warnings=stop_artifact_warnings,
         version=version,
     )
