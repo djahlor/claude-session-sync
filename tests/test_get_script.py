@@ -14,7 +14,9 @@ SCRIPT = Path(__file__).resolve().parents[1] / "get.sh"
 class GetScriptTests(unittest.TestCase):
     """The one-command installer, run against a local archive with a fake install.sh."""
 
-    def run_get(self, root: Path, *, claude_app: bool = True, tools: bool = True):
+    def run_get(
+        self, root: Path, *options: str, claude_app: bool = True, tools: bool = True
+    ):
         source = root / "claude-session-sync-main"
         source.mkdir()
         installer = source / "install.sh"
@@ -45,7 +47,7 @@ class GetScriptTests(unittest.TestCase):
             stub.chmod(0o755)
             environment["PATH"] = "{}:{}".format(stubs, environment["PATH"])
         return subprocess.run(
-            ["zsh", str(SCRIPT)],
+            ["zsh", "-c", SCRIPT.read_text(), "-", *options],
             env=environment,
             text=True,
             capture_output=True,
@@ -64,6 +66,24 @@ class GetScriptTests(unittest.TestCase):
         )
         download = re.search(r"SETUP_DIR=([^\r\n]*)", result.stdout).group(1)
         self.assertFalse(Path(download).exists(), "the download folder is removed")
+
+    def test_options_after_the_dash_reach_the_installer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sync-get-") as directory:
+            result = self.run_get(
+                Path(directory), "--stop-artifact-warnings", "--share-skill"
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            re.findall(r"SETUP_ARG=([^\r\n]*)", result.stdout),
+            [
+                "--automatic-targets",
+                "--sync-layout",
+                "--sync-routines",
+                "--stop-artifact-warnings",
+                "--share-skill",
+            ],
+        )
 
     def test_without_claude_desktop_nothing_is_installed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sync-get-") as directory:

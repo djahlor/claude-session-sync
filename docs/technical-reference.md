@@ -176,9 +176,33 @@ The same setup can run from Terminal:
 ./install.sh --automatic-targets --sync-layout --sync-routines
 ```
 
-An AI agent can run either command for you. Setup asks its one question, the
-main account, only when a person sits at a terminal. Without one it keeps the
-account already chosen. Setup replaces the helpers and restarts the watcher. It
+Two more questions come with the install, each asked once and only on a
+terminal:
+
+- `setup --ask-artifact-warnings` asks whether to stop the artifact "didn't
+  resume" warnings ([Artifact warnings](#artifact-warnings)). Enter means no.
+  The answer goes into the config as `stop_artifact_warnings` `true` or
+  `false`, so an update with the key present never asks again. The end of
+  input leaves the key out and asks next time. `install.sh` passes it unless
+  `--stop-artifact-warnings` already turns the option on.
+- `install.sh` asks whether to add the share-artifacts skill
+  ([Artifact pages on other accounts](#artifact-pages-on-other-accounts)).
+  Enter means yes: it copies `skills/share-artifacts/SKILL.md` to
+  `~/.claude/skills/share-artifacts/`. An update refreshes that file when it is
+  there and leaves `accounts.txt` beside it alone. A skip writes
+  `share-skill-skipped` in the support folder, so an update does not ask again.
+  `--share-skill` adds it with no question, and `--no-share-skill` skips it.
+
+`get.sh` passes every option after a dash to `install.sh`:
+
+```sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
+```
+
+An AI agent can run either command for you. Setup asks its questions only when
+a person sits at a terminal. Without one it keeps the account already chosen
+and leaves the warning fix and the skill as they were, unless the options turn
+them on. Setup replaces the helpers and restarts the watcher. It
 never quits Claude. The restarted watcher quits Claude only when the signed-in
 account differs from the one it last saw, which is the normal switch restart.
 The same command installs and updates, so when something needs attention,
@@ -253,7 +277,12 @@ Code tab once. `claude-session-sync restart-claude` asks the helper to quit Clau
 sync, and reopen it now. Status reports waiting, syncing, finished, or needs
 attention, and the last successful sync time. A missing or interrupted run is never reported as finished. A
 menu-bar status item and a non-activating status window show progress without
-depending on macOS notification permissions.
+depending on macOS notification permissions. The window opens only when Claude
+quits or reopens by itself, or when sync needs attention; a login or an update
+starts the helper without it. It closes after 8 seconds, with its close button,
+or with a click on it. **Show the status window** in the **Sync** menu turns it
+off by writing `status-window-off` in the state folder, and on again by
+removing that file.
 
 Safe mode still syncs after a manual quit.
 
@@ -605,8 +634,9 @@ Every write goes through the journal. Each run keeps the files it replaced or
 removed. The newest runs always stay; older ones stay for 30 days while all
 kept runs fit in 500 MB.
 
-The watcher owns a persistent menu-bar status item and a non-activating status
-window. It does not rely on AppleScript or Notification Center delivery.
+The watcher owns a persistent menu-bar status item and a closable,
+non-activating status window. It does not rely on AppleScript or Notification
+Center delivery.
 
 ## Pins and groups across accounts
 
@@ -814,8 +844,10 @@ notice. The lines never expire. One Mac held 2,501 such lines in 165 chats on
 29 October 2026.
 
 The cost: Claude stops answering comments on your artifacts by itself in the
-background. The switch below is not in Anthropic's documentation. A Claude
-Code update could rename or remove it, and the warnings would then come back.
+background. The switch below is listed in Anthropic's
+[Claude Code environment variables](https://code.claude.com/docs/en/env-vars):
+"Set to `0` to stop Claude replying on its own to comments sent to it". It
+needs Claude Code 2.1.228 or later.
 
 `switch`, `auto` and `sync` do two things right after Claude quits, before
 the chat sync:
@@ -871,6 +903,23 @@ and `open_chats` skipped. `status` shows `artifact_warnings=on` or `off`,
 `counts.artifact_warnings_cleared` for the records the last sync removed, and
 `artifact_warnings_reason` when the last run failed. A failure here never
 blocks chat sync or the relaunch.
+
+## Artifact pages on other accounts
+
+An artifact page belongs to the account that published it, and the other
+accounts cannot open it until the owner shares it from the page's **Share**
+menu. Sync does not share pages: it would have to read the Claude app's
+encrypted claude.ai sign-in and drive claude.ai with a script, which
+Anthropic's terms forbid. The evidence is in
+[artifact-sharing-findings.md](artifact-sharing-findings.md).
+
+The [share-artifacts skill](../skills/share-artifacts/SKILL.md) prepares the
+clicks instead. It keeps the person's account emails in
+`~/.claude/skills/share-artifacts/accounts.txt`, lists this account's pages
+with the Artifact tool (`action: "list"`, `scope: "mine"`), asks whether the
+other accounts should read or also edit, and gives the Share steps with the
+emails to paste. After an accept on another account, it checks the page is in
+that account's `scope: "shared"` list. It never sends anything itself.
 
 ## Ties
 

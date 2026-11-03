@@ -86,6 +86,69 @@ private final class ProcessCompletion {
   }
 }
 
+// A click anywhere on the status window closes it.
+private final class NoticeContentView: NSView {
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    frame.contains(point) ? self : nil
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    window?.close()
+  }
+}
+
+// The small window for the moments Claude quits or reopens by itself, since
+// macOS can hide notifications. Its close button, a click on it, or a few
+// seconds close it. The Sync menu turns it off.
+private final class StatusNotice {
+  static let seconds = 8.0
+  private(set) var panel: NSPanel?
+  private var generation = 0
+
+  @discardableResult
+  func show(_ message: String) -> NSPanel {
+    generation += 1
+    let shown = generation
+    panel?.close()
+    let label = NSTextField(wrappingLabelWithString: message)
+    label.isSelectable = false
+    label.font = .systemFont(ofSize: 13)
+    label.preferredMaxLayoutWidth = 292
+    let height = max(label.fittingSize.height, 18) + 24
+    let content = NoticeContentView(frame: NSRect(x: 0, y: 0, width: 320, height: height))
+    label.frame = NSRect(x: 14, y: 12, width: 292, height: height - 24)
+    content.addSubview(label)
+    let panel = NSPanel(contentRect: content.frame,
+      styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
+      backing: .buffered, defer: false)
+    panel.isReleasedWhenClosed = false
+    panel.title = "Claude Session Sync"
+    panel.level = .floating
+    panel.hidesOnDeactivate = false
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    panel.contentView = content
+    panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+    panel.standardWindowButton(.zoomButton)?.isHidden = true
+    if let screen = NSScreen.main {
+      panel.setFrameTopLeftPoint(
+        NSPoint(x: screen.visibleFrame.maxX - panel.frame.width - 16, y: screen.visibleFrame.maxY - 12))
+    }
+    self.panel = panel
+    panel.orderFrontRegardless()
+    DispatchQueue.main.asyncAfter(deadline: .now() + StatusNotice.seconds) { [weak self] in
+      if self?.generation == shown { self?.close() }
+    }
+    return panel
+  }
+
+  func close() {
+    panel?.close()
+    panel = nil
+  }
+}
+
 // Chats and routines sync when Claude quits, and while it is open and signed
 // out: Claude reads the next account's folders when that account signs in.
 // Pins, groups and browser logins sync only with Claude closed. Claude locks
@@ -131,9 +194,11 @@ private final class SessionSyncWatcher: NSObject {
   // Claude quit during that check: the quit sync still copies the groups.
   private var switchAfterQuit = false
   private var statusItem: NSStatusItem?
-  private var noticePanel: NSPanel?
-  private var noticeGeneration = 0
+  private let notice = StatusNotice()
+  // Present when the status window is turned off in the Sync menu.
+  private let noticeOffURL: URL
   private var lastMessage = ""
+  private var menuMessage = ""
   // The built-in browser loses its site logins on every account change. A
   // copy saved while it is healthy is what the switch puts back.
   private let importsURL: URL?
@@ -153,6 +218,7 @@ private final class SessionSyncWatcher: NSObject {
     self.restartURL = directory.appendingPathComponent("account-restart.json")
     self.restartRequestURL = directory.appendingPathComponent("restart-request")
     self.switchGuardURL = directory.appendingPathComponent("switch-guard")
+    self.noticeOffURL = directory.appendingPathComponent("status-window-off")
     self.importsURL = accountURL?.deletingLastPathComponent().appendingPathComponent("chrome-import-sites.json")
     super.init()
     if accountURL != nil {
@@ -191,7 +257,9 @@ private final class SessionSyncWatcher: NSObject {
       timer.resume()
       accountTimer = timer
     }
-    showStatus(restartPhase == "needs-attention" ? "Sync needs attention" : readyMessage, banner: true)
+    // A login or an update starts the helper; only a problem opens the window then.
+    let attention = restartPhase == "needs-attention"
+    showStatus(attention ? "Sync needs attention" : readyMessage, banner: attention)
   }
 
   private var readyMessage: String {
@@ -852,33 +920,38 @@ private final class SessionSyncWatcher: NSObject {
       self.statusItem?.button?.title = message.contains("attention") ? "Sync !" :
         message.contains("finished") ? "Sync ✓" : "Sync"
       self.statusItem?.button?.toolTip = message
-      let menu = NSMenu()
-      let item = NSMenuItem(title: message, action: nil, keyEquivalent: "")
-      menu.addItem(item)
-      self.statusItem?.menu = menu
-      guard banner else { return }
-      self.noticeGeneration += 1
-      let generation = self.noticeGeneration
-      self.noticePanel?.close()
-      let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 370, height: 92),
-        styleMask: [.titled, .nonactivatingPanel], backing: .buffered, defer: false)
-      panel.title = "Claude Session Sync"
-      panel.level = .floating
-      panel.hidesOnDeactivate = false
-      panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-      let label = NSTextField(wrappingLabelWithString: message)
-      label.frame = NSRect(x: 18, y: 12, width: 334, height: 60)
-      label.font = .systemFont(ofSize: 14)
-      panel.contentView?.addSubview(label)
-      if let screen = NSScreen.main {
-        panel.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.maxX - 390, y: screen.visibleFrame.maxY - 18))
-      }
-      self.noticePanel = panel
-      panel.orderFrontRegardless()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-        if self.noticeGeneration == generation { self.noticePanel?.orderOut(nil) }
-      }
+      self.menuMessage = message
+      self.rebuildMenu()
+      guard banner, self.noticeOn else { return }
+      self.notice.show(message)
     }
+  }
+
+  private var noticeOn: Bool {
+    !FileManager.default.fileExists(atPath: noticeOffURL.path)
+  }
+
+  private func rebuildMenu() {
+    let menu = NSMenu()
+    menu.addItem(NSMenuItem(title: menuMessage, action: nil, keyEquivalent: ""))
+    menu.addItem(.separator())
+    let toggle = NSMenuItem(
+      title: "Show the status window", action: #selector(toggleNotice(_:)), keyEquivalent: "")
+    toggle.target = self
+    toggle.state = noticeOn ? .on : .off
+    menu.addItem(toggle)
+    statusItem?.menu = menu
+  }
+
+  @objc private func toggleNotice(_ sender: NSMenuItem) {
+    if noticeOn {
+      FileManager.default.createFile(
+        atPath: noticeOffURL.path, contents: Data(), attributes: [.posixPermissions: 0o600])
+      notice.close()
+    } else {
+      try? FileManager.default.removeItem(at: noticeOffURL)
+    }
+    rebuildMenu()
   }
 
   private func runPendingIfNeeded() {

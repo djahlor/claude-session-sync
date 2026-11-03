@@ -4,7 +4,10 @@
 #   zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
 #
 # `zsh -c "$(curl ...)"` keeps the keyboard attached, so the installer can ask
-# which account is the main one. Piping curl into zsh would not.
+# its questions. Piping curl into zsh would not. Options for install.sh go
+# after a dash, for an install with no questions:
+#
+#   zsh -c "$(curl -fsSL .../get.sh)" - --stop-artifact-warnings --share-skill
 
 set -euo pipefail
 
@@ -45,4 +48,4 @@ trap 'rm -rf "$work"' EXIT
 echo "Downloading Claude Session Sync..."
 curl -fsSL "$archive" | tar -xz -C "$work" --strip-components 1
 
-"$work/install.sh" --automatic-targets --sync-layout --sync-routines
+"$work/install.sh" --automatic-targets --sync-layout --sync-routines "$@"

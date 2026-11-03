@@ -7,6 +7,8 @@ sync_layout=false
 sync_routines=false
 sync_browser_logins=false
 stop_artifact_warnings=false
+# ask, yes or no: whether to add the share-artifacts skill to Claude Code.
+share_skill=ask
 
 for argument in "$@"; do
   case "$argument" in
@@ -25,9 +27,15 @@ for argument in "$@"; do
     --stop-artifact-warnings)
       stop_artifact_warnings=true
       ;;
+    --share-skill)
+      share_skill=yes
+      ;;
+    --no-share-skill)
+      share_skill=no
+      ;;
     *)
       echo "Unknown option: $argument" >&2
-      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins] [--stop-artifact-warnings]" >&2
+      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins] [--stop-artifact-warnings] [--share-skill | --no-share-skill]" >&2
       exit 2
       ;;
   esac
@@ -83,15 +91,54 @@ if [[ "$sync_browser_logins" == true ]]; then
 fi
 if [[ "$stop_artifact_warnings" == true ]]; then
   setup_args+=(--stop-artifact-warnings)
+else
+  # On a terminal, setup asks once whether to stop the artifact warnings.
+  setup_args+=(--ask-artifact-warnings)
 fi
 run_source_cli setup "${setup_args[@]}" --apply
+
+# The share-artifacts skill shows Claude how to open a page from every account.
+# Once added, each update keeps it current; the account list beside it stays.
+# A skip is remembered, so an update does not ask again.
+skill_source="$script_dir/skills/share-artifacts/SKILL.md"
+skill_dir="$HOME/.claude/skills/share-artifacts"
+skill_skipped="$support_dir/share-skill-skipped"
+if [[ "$share_skill" == ask && -f "$skill_dir/SKILL.md" ]]; then
+  share_skill=yes
+elif [[ "$share_skill" == ask && -f "$skill_skipped" ]]; then
+  share_skill=no
+elif [[ "$share_skill" == ask ]]; then
+  share_skill=no
+  if [[ -t 0 && -t 1 ]]; then
+    echo
+    echo "Add the share-artifacts skill to Claude Code?"
+    echo "Pages Claude publishes belong to one account and look deleted on the others."
+    echo "Ask Claude \"share this page with my other accounts\" and it walks you through it."
+    echo
+    printf "Press Enter to add it, or type n to skip: "
+    if read -r reply; then
+      if [[ "$reply" == [nN]* ]]; then
+        : > "$skill_skipped"
+      else
+        share_skill=yes
+      fi
+    fi
+  fi
+fi
+skill_added=false
+if [[ "$share_skill" == yes && -f "$skill_source" ]]; then
+  mkdir -p "$skill_dir"
+  cp "$skill_source" "$skill_dir/SKILL.md"
+  rm -f "$skill_skipped"
+  skill_added=true
+fi
 
 echo
 echo "Claude Session Sync is installed."
 echo "Open Claude normally. No separate profile app is needed."
 if [[ "$automatic_targets" == true ]]; then
   echo "Chats sync when you switch accounts and when you quit Claude."
-  echo "After a switch, Claude closes, syncs, and opens again by itself."
+  echo "After a switch, Claude closes and reopens by itself only when something still needs it closed."
   echo "A new account joins the next time Claude closes after you sign in and open the Code tab once."
 else
   echo "Safe mode is active. New account and workspace IDs need explicit approval."
@@ -109,4 +156,7 @@ if [[ "$sync_browser_logins" == true ]]; then
 fi
 if [[ "$stop_artifact_warnings" == true ]]; then
   echo "Claude no longer answers artifact comments by itself, so its 'didn't resume' warnings stop."
+fi
+if [[ "$skill_added" == true ]]; then
+  echo "To open a page from your other accounts, ask Claude: share this page with my other accounts."
 fi
