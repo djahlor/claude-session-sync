@@ -4,6 +4,12 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.6.9] - 2026-11-03
+
+### Fixed
+
+- Routine sync stopped for good after Claude opened during a switch. Claude opened while the sync wrote routines, so the write stopped, and its rollback stopped too, since nothing is written while Claude runs. Claude then saved run times and new routines into manifests the run had not reached, and every later sync ended with `recovery requires attention: recovery found independently changed data`: 6 of 24 files written on 01-11-2026, no routine sync since. The next sync with Claude closed now puts back only the old comparison snapshot, keeps every manifest as it is, and merges again, so the cut run finishes and Claude's own changes stay. A snapshot that changed outside the tool still needs attention.
+
 ## [0.6.8] - 2026-11-03
 
 ### Added
