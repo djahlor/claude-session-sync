@@ -20,9 +20,9 @@ For people with more than one Claude account on one Mac, for example a work acco
 |---|---|---|
 | Claude Code chats | Each switch and each quit | On |
 | Whether a chat is archived | Each switch and each quit | On |
-| Custom groups, which Claude now calls sections | Each switch | On |
+| Custom groups, which Claude now calls sections | Each switch, with one restart | On |
 | Claude Code routines, with their permission mode and saved approvals | Each switch and each quit | On |
-| Site logins in Claude's built-in browser | Each switch | Off, [turn it on](#browser-logins) |
+| Site logins in Claude's built-in browser | Each switch, with one restart | Off, [turn it on](#browser-logins) |
 | Pictures sent in a chat, shown from your Mac in every account ([how](docs/technical-reference.md#pictures-sent-in-a-chat)) | Each switch | On |
 
 It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account. A routine saved with no mode runs in manual on every account; `routine_mode_when_unset` in the config gives such routines a mode ([how](docs/technical-reference.md#claude-code-routines)).
@@ -56,9 +56,10 @@ Ask your agent: "Install or update Claude Session Sync from github.com/djahlor/c
 
 1. Sign out of Claude.
 2. Sign in to the other account.
-3. Claude closes, syncs, and opens again by itself.
 
-Nothing syncs while Claude is open, because Claude keeps chats in memory and locks its database while it runs. Chats and routines also sync when you quit Claude. A small status window and the **Sync** menu show what is happening, even if macOS hides notifications.
+While you sign in, sync copies chats and routines into the other accounts. Claude reads them when the new account signs in, so they need no restart. Claude closes, syncs and opens again by itself only when something still needs it closed: groups, browser logins, or a sign-in faster than the sync. With groups on, as in the standard install, that is every switch, and the restart is shorter because the chats are already done. Chats and routines also sync when you quit Claude. A small status window and the **Sync** menu show what is happening, even if macOS hides notifications.
+
+Nothing syncs while you work in Claude, because Claude keeps chats in memory and locks its database while it runs. Sync writes only while Claude is closed or signed out, and never into the account Claude still has open ([how](docs/live-sync-findings.md)).
 
 A new account joins the next time Claude closes after you sign in and open the Code tab once. You do not have to start a chat first.
 
@@ -127,7 +128,8 @@ Sync keeps recovery backups and stops a change when it finds damaged data, confl
 
 ## Limits
 
-- Sync writes only while Claude is closed, and quitting Claude ends every open chat.
+- Sync writes only while Claude is closed or signed out, and quitting Claude ends every open chat.
+- Groups and browser logins still need one restart after a switch. Without them, a switch restarts only when you sign in before the sync finishes. A sync with nothing to do takes about 10 seconds on 46,000 chat files.
 - Sync reads Claude's private files, which an update can change. Sync then stops that part, leaves the rest running, and says so.
 - The last full live test used Claude Desktop 2.31226.1 on 10 October 2026. Groups were checked on 2.42304.0 on 19 October 2026. Browser login saving was checked on 2.42304.2 on 20 October 2026, and its restore is tested on copies.
 - To check that Claude is closed, use `pgrep -x Claude`. `pgrep -f` also matches the background helper.

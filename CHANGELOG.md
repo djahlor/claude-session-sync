@@ -4,6 +4,17 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.7.0] - 2026-11-03
+
+### Added
+
+- A switch can go without a restart. Claude reads the next account's chats and routines from disk when that account signs in, so the background helper now syncs them the moment you sign out, while you sign in to the other account. The account just left is never written then, because Claude still saves its chats until the next sign-in; its copies follow at the next quit. Claude restarts only when something still needs it closed: groups, browser logins, or a sign-in that came before the sync finished. On by default; `sync_while_signed_out: false` in the config turns it off. Findings and evidence: [docs/live-sync-findings.md](docs/live-sync-findings.md).
+- `restart_for_browser_logins` in the config. Off, browser logins come back at the next quit instead of forcing a restart after a switch. On by default.
+
+### Changed
+
+- The archive pass reuses the chat planner's file list instead of listing every chat file again. A sync with nothing to do took 9 to 14 seconds instead of 15 to 21 on a copy of 46,000 chat files.
+
 ## [0.6.7] - 2026-10-29
 
 ### Fixed

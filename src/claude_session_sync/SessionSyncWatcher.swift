@@ -35,6 +35,13 @@ private enum Limits {
   static let readChunkBytes = 4_096
 }
 
+private struct SignedOutResult {
+  // The account Claude signed out of, hashed like the restart receipt.
+  let accountHash: String
+  let restart: Bool
+  let reasons: [String]
+}
+
 private enum BrowserLoginSchedule {
   static let firstSnapshot: TimeInterval = 60
   static let afterImport: TimeInterval = 5
@@ -79,11 +86,12 @@ private final class ProcessCompletion {
   }
 }
 
-// Chats, pins, groups, and routines sync only with Claude closed, when Claude
-// quits and when the signed-in account changes. A switch quits Claude once,
-// syncs, copies pins and groups from the account just left, and reopens Claude.
-// Claude locks its own database while open and reloads each account's groups
-// from its servers at sign-in, so nothing can be carried over while it runs.
+// Chats and routines sync when Claude quits, and while it is open and signed
+// out: Claude reads the next account's folders when that account signs in.
+// Pins, groups and browser logins sync only with Claude closed. Claude locks
+// its own database while open and reloads each account's groups from its
+// servers at sign-in, so a switch that needs them quits Claude once, syncs,
+// copies groups from the account just left, and reopens Claude.
 private final class SessionSyncWatcher: NSObject {
   private let command: [String]
   private let claudeExecutable: String
@@ -110,6 +118,12 @@ private final class SessionSyncWatcher: NSObject {
   private var pendingRestartMode: String?
   private var restartMode: String?
   private var lastFailureKey: String?
+  // Whether Claude was signed in at the last check. A sign-out while it runs
+  // starts a sync of every folder but the account just left.
+  private var signedIn: Bool?
+  private var signedOutRunning = false
+  // What the last signed-out sync left for the switch that follows it.
+  private var signedOutResult: SignedOutResult?
   private var statusItem: NSStatusItem?
   private var noticePanel: NSPanel?
   private var noticeGeneration = 0
@@ -195,6 +209,14 @@ private final class SessionSyncWatcher: NSObject {
     else { return nil }
     // Never retain or log the surrounding config, which can contain credentials.
     return SHA256.hash(data: Data(uuid.uuidString.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  private func readSignedIn() -> Bool? {
+    guard let url = accountURL, let data = try? privateData(url),
+      let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    // Claude sets this to false the moment it signs out, and to true at sign-in.
+    return document["windowSizeWasSignedIn"] as? Bool
   }
 
   private func saveRestartState() throws {
@@ -284,7 +306,75 @@ private final class SessionSyncWatcher: NSObject {
       return
     }
     scheduleBrowserLoginSnapshot()
+    checkSignedOut()
     checkAccount()
+  }
+
+  private func checkSignedOut() {
+    let now = readSignedIn()
+    defer { if now != nil { signedIn = now } }
+    guard signedIn == true, now == false, profile != nil, !restartRequested, !running,
+      let departing = accountHash
+    else { return }
+    startSignedOutSync(departing: departing)
+  }
+
+  // Claude reads the next account's chats and routines when it signs in, so
+  // they sync now, while the sign-in page is open, and the switch may need no
+  // restart at all. The sync tool checks that Claude is open and signed out.
+  private func startSignedOutSync(departing: String) {
+    guard let profile = profile else { return }
+    let output = Pipe()
+    guard let task = cliProcess(["signed-out-sync", profile, "--json"], output: output)
+    else { return }
+    signedOutResult = nil
+    running = true
+    signedOutRunning = true
+    showStatus("Signed out. Syncing chats for the next account.")
+    let completion = ProcessCompletion { [weak self] exitStatus, data in
+      self?.queue.async {
+        self?.finishSignedOut(exitStatus: exitStatus, output: data, departing: departing)
+      }
+    }
+    task.terminationHandler = { process in
+      completion.record(exitStatus: process.terminationStatus)
+    }
+    do {
+      try task.run()
+      drain(output, into: completion)
+    } catch {
+      task.terminationHandler = nil
+      completion.cancel()
+      running = false
+      signedOutRunning = false
+      runQueuedWork(restarting: false)
+    }
+  }
+
+  private func finishSignedOut(exitStatus: Int32, output: Data, departing: String) {
+    running = false
+    signedOutRunning = false
+    let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+    let restart = exitStatus != 0 || (result?["restart"] as? Bool ?? true)
+    signedOutResult = SignedOutResult(
+      accountHash: departing, restart: restart,
+      reasons: result?["restart_reasons"] as? [String] ?? [])
+    if result?["state"] as? String != "skipped" {
+      writeStatus(exitStatus: exitStatus, output: output, launchFailed: false)
+    }
+    showStatus(restart ? readyMessage : "Chats synced for the next account. Claude stays open.")
+    runQueuedWork(restarting: false)
+  }
+
+  private func restartMessage(_ reasons: [String]) -> String {
+    let names = ["groups": "groups", "browser-logins": "browser logins",
+                 "routines": "routines", "archive": "archived chats"]
+    let parts = reasons.compactMap { names[$0] }
+    guard !parts.isEmpty, parts.count == reasons.count else {
+      return "Account changed. Restarting Claude once to sync."
+    }
+    return "Account changed. Chats are synced. Restarting Claude once for "
+      + parts.joined(separator: " and ") + "."
   }
 
   // Every 15 minutes, and a few seconds after Claude records an import.
@@ -328,6 +418,8 @@ private final class SessionSyncWatcher: NSObject {
     guard hash != previous else {
       candidateHash = nil
       candidateSince = nil
+      // Signed in again to the account it left: that sync is no switch's.
+      if signedIn == true && !signedOutRunning { signedOutResult = nil }
       return
     }
     if candidateHash != hash {
@@ -340,11 +432,28 @@ private final class SessionSyncWatcher: NSObject {
     candidateHash = nil
     candidateSince = nil
     if restartPhase != "needs-attention" { restartPhase = "ready" }
+    let signedOut = signedOutResult
+    signedOutResult = nil
+    if let result = signedOut, result.accountHash == previous, !result.restart,
+      !signedOutRunning {
+      // Everything synced while Claude was signed out, and nothing left needs it closed.
+      restartPhase = "finished"
+      do { try saveRestartState() } catch {
+        restartFailed("Could not save account-switch status.")
+        return
+      }
+      writeStatus(exitStatus: 0, output: Data(
+        "{\"progress\":\"finished\",\"restart_skipped\":\"synced-while-signed-out\"}".utf8),
+        launchFailed: false)
+      notify("Account changed. Chats were synced while you signed in, so Claude stays open.")
+      return
+    }
     do { try saveRestartState() } catch {
       restartFailed("Could not save account-switch status.")
       return
     }
-    showStatus("Account changed. Restarting Claude once to sync.", banner: true)
+    let reasons = signedOut?.accountHash == previous ? signedOut?.reasons ?? [] : []
+    showStatus(restartMessage(reasons), banner: true)
     requestRestart(mode: "after-account-switch")
   }
 
@@ -501,16 +610,7 @@ private final class SessionSyncWatcher: NSObject {
     }
     do {
       try task.run()
-      // Drain while the child runs, but retain only bounded aggregate output.
-      DispatchQueue.global(qos: .utility).async {
-        var data = Data()
-        while true {
-          let chunk = output.fileHandleForReading.readData(ofLength: Limits.readChunkBytes)
-          if chunk.isEmpty { break }
-          data.append(chunk.prefix(max(0, Limits.syncOutputBytes - data.count)))
-        }
-        completion.record(output: data)
-      }
+      drain(output, into: completion)
     } catch {
       task.terminationHandler = nil
       completion.cancel()
@@ -520,6 +620,19 @@ private final class SessionSyncWatcher: NSObject {
       running = false
       if restarting { restartFailed("The sync tool could not start. Claude has not been reopened.") }
       runPendingIfNeeded()
+    }
+  }
+
+  // Drain while the child runs, but retain only bounded aggregate output.
+  private func drain(_ output: Pipe, into completion: ProcessCompletion) {
+    DispatchQueue.global(qos: .utility).async {
+      var data = Data()
+      while true {
+        let chunk = output.fileHandleForReading.readData(ofLength: Limits.readChunkBytes)
+        if chunk.isEmpty { break }
+        data.append(chunk.prefix(max(0, Limits.syncOutputBytes - data.count)))
+      }
+      completion.record(output: data)
     }
   }
 
@@ -731,6 +844,8 @@ private final class SessionSyncWatcher: NSObject {
       guard let self = self else { return }
       if executableMatches || knownBundle || self.quittingPIDs.contains(pid) {
         self.quittingPIDs.remove(pid)
+        // A quit syncs everything itself; a sign-in after it is a fresh start.
+        self.signedOutResult = nil
         self.requestAuto(afterQuit: true)
       }
     }

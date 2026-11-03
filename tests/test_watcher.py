@@ -382,6 +382,12 @@ class WatcherTests(unittest.TestCase):
     def test_an_adoption_request_reaches_the_closed_claude_sync(self):
         self.live_scenario(request_restart=True, request_text="adopt-current-sidebar\n")
 
+    def test_a_switch_synced_while_signed_out_keeps_claude_open(self):
+        self.live_scenario(sign_out=True)
+
+    def test_a_switch_that_still_needs_claude_closed_restarts_it_once(self):
+        self.live_scenario(sign_out=True, signed_out_restart=True)
+
     def fake_claude(self, root):
         """A tiny app standing in for Claude, so the watcher can see it run and quit."""
         app = root / "SyncTest.app"
@@ -427,12 +433,15 @@ class WatcherTests(unittest.TestCase):
         block_preflight=False,
         request_during_sync=False,
         request_text="",
+        sign_out=False,
+        signed_out_restart=False,
     ):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app, executable = self.fake_claude(root)
             account = root / "config.json"
-            account.write_text(json.dumps({"lastKnownAccountUuid": str(uuid.uuid4())}))
+            first_account = str(uuid.uuid4())
+            account.write_text(json.dumps({"lastKnownAccountUuid": first_account}))
             folder = root / "claude-code-sessions" / "account" / "workspace"
             folder.mkdir(parents=True)
             calls = root / "calls.jsonl"
@@ -450,6 +459,9 @@ class WatcherTests(unittest.TestCase):
                 f" subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started'}})); raise SystemExit(1)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
+                "elif sys.argv[1] == 'signed-out-sync':\n"
+                f" restart = {signed_out_restart!r}\n"
+                " print(json.dumps({'state': 'committed', 'progress': 'finished', 'restart': restart, 'restart_reasons': ['groups'] if restart else []}))\n"
                 "else:\n"
                 f" if {request_during_sync!r} and len(calls.read_text().splitlines()) == 1: time.sleep(3)\n"
                 f" if {claude_open_waits!r}: print(json.dumps({{'state': 'waiting', 'reason': 'claude-open', 'progress': 'waiting-for-Claude'}})); raise SystemExit(0)\n"
@@ -546,6 +558,53 @@ class WatcherTests(unittest.TestCase):
                     self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
                     time.sleep(4)
                     self.assertEqual(1, len(switches()), "no restart loop")
+                if sign_out:
+
+                    def claude_config(account_id, signed_in):
+                        account.write_text(
+                            json.dumps(
+                                {
+                                    "lastKnownAccountUuid": account_id,
+                                    "windowSizeWasSignedIn": signed_in,
+                                }
+                            )
+                        )
+
+                    def signed_out_syncs():
+                        return [i for i in entries() if i[0] == "signed-out-sync"]
+
+                    claude_config(first_account, True)
+                    time.sleep(2)
+                    self.assertEqual([], signed_out_syncs(), "signed in: no sync")
+                    claude_config(first_account, False)
+                    self.assertTrue(
+                        wait_for(signed_out_syncs, 10), "a sign-out must sync"
+                    )
+                    self.assertEqual(
+                        ["signed-out-sync", "Work", "--json"], entries()[1]
+                    )
+                    self.assertTrue(app_running(), "a sign-out must never quit Claude")
+                    time.sleep(2)
+                    claude_config(str(uuid.uuid4()), True)
+                    if signed_out_restart:
+                        self.assertTrue(
+                            wait_for(lambda: switches(), 30),
+                            "groups still need one restart",
+                        )
+                        self.assertIn("--after-account-switch", switches()[0])
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
+                        time.sleep(4)
+                        self.assertEqual(1, len(switches()), "no restart loop")
+                    else:
+                        time.sleep(8)
+                        self.assertEqual([], switches(), "no restart needed")
+                        self.assertTrue(app_running(), "Claude stays open")
+                        saved = json.loads(status.read_text())
+                        self.assertEqual("finished", saved["restart_phase"])
+                        self.assertEqual(
+                            "synced-while-signed-out",
+                            json.loads(saved["output"])["restart_skipped"],
+                        )
                 if claude_open_waits and not request_restart:
                     time.sleep(4)
                     self.assertEqual(
@@ -623,6 +682,7 @@ class WatcherTests(unittest.TestCase):
                     all(item[0] != "switch" for item in entries())
                     or request_restart
                     or change_account
+                    or signed_out_restart
                 )
             finally:
                 if process.poll() is None:

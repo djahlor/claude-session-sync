@@ -88,7 +88,9 @@ An unknown pins, groups, or routines record skips that update with
 sync, `status` reports `needs-attention`, and `doctor` shows which part failed.
 The last full check on a copy of real data used Claude Desktop 1.46388.4, in
 September 2026. The last live sync with Claude closed used Claude Desktop
-2.31226.1, on 10 October 2026.
+2.31226.1, on 10 October 2026. The sync at sign-out was rehearsed on a copy of
+real data with Claude Desktop 4.4212.0 on 3 November 2026; a live switch with
+it has not run yet.
 
 ### Tested live
 
@@ -474,17 +476,65 @@ agreed one, so a rename or archive since then is recognised as the change.
 ## Account switches and new accounts
 
 Claude holds the signed-in account's chats in memory and writes them back from
-memory, so sync never writes while Claude runs. Every write first checks that
-no managed Claude process runs, once before the run's journal is written and
-again before the first file changes.
+memory, so sync never writes into a folder Claude has open. Every write first
+checks that no managed Claude process runs, or, for the sync at sign-out, that
+Claude is still signed out: once before the run's journal is written and again
+before the first file changes.
 
-The watcher reads only `lastKnownAccountUuid` from Claude's `config.json` and
-keeps a SHA-256 fingerprint of it. It never reads cookies, copies credentials,
-or writes Claude's account config. A switch asks Claude to quit normally, runs
-`switch <profile> --after-account-switch --json` with Claude closed, and
-reopens Claude. Claude quitting runs `auto`. Saving a chat does not start a
-sync. A failed sync still reopens Claude and reports why. A failed restart
-check leaves Claude open. It never force-kills Claude.
+The watcher reads only `lastKnownAccountUuid` and `windowSizeWasSignedIn` from
+Claude's `config.json` and keeps a SHA-256 fingerprint of the account. It never
+reads cookies, copies credentials, or writes Claude's account config. Claude
+quitting runs `auto`. Saving a chat does not start a sync. It never
+force-kills Claude.
+
+### Sync at sign-out
+
+Claude reads an account's chat folder and routine list when that account signs
+in, with the same loader it uses at start, and never watches them while it
+runs. While it is signed out it keeps the chats of the account just left in
+memory and saves them into that account's folder until the next sign-in, and
+it holds no other account's folder. [live-sync-findings.md](live-sync-findings.md)
+has the evidence from Claude Desktop 4.4212.0.
+
+So when `windowSizeWasSignedIn` goes from `true` to `false` while Claude runs,
+the watcher runs `signed-out-sync <profile> --json`:
+
+- It skips when Claude is closed (`claude-closed`), signed in or not known to
+  be signed out (`signed-in`), the account just left is unknown
+  (`account-unknown`), another writer runs (`busy`), or
+  `sync_while_signed_out` is `false` (`disabled`).
+- It waits one second, then syncs chats, archive state, sent pictures and
+  routines. Every folder of the account just left is read but never written:
+  those copies are counted as `held_back` and follow at the next quit. Their
+  archive flags are not remembered, so an archive made there still spreads
+  then. An archive that came from elsewhere and that account must take makes
+  the archive pass wait whole (`archive=waiting`). Routines write every
+  manifest together, so they wait whole when that account's manifest would
+  change (`deferred`, `account-still-open`).
+- It reads the flag again at the end and reports `signed_in_during_sync`, then
+  `restart` and `restart_reasons`: `signed-in-during-sync`, `chats`,
+  `archive`, `routines`, `groups` (whenever `sync_sidebar_layout` is on) and
+  `browser-logins` (when `sync_browser_logins` and
+  `restart_for_browser_logins` are on).
+
+When the account change follows, the watcher keeps Claude open if that sync
+finished for the account just left with no reason left, and records
+`restart_skipped=synced-while-signed-out`. Otherwise it asks Claude to quit
+normally, runs `switch <profile> --after-account-switch --json` with Claude
+closed, and reopens Claude, as before. A failed sync still reopens Claude and
+reports why. A failed restart check leaves Claude open. Signing in again to
+the account just left, or quitting Claude, drops the sync's result.
+
+Groups need the restart because the Code sidebar is the claude.ai web view: an
+account change there merges that account's server copy into its slot and
+clears the pending-upload flag, so only a copy written while Claude is closed
+wins. Browser logins need it because the built-in browser's cookie database is
+open while Claude runs. With `restart_for_browser_logins` off, they come back
+at the next quit instead.
+
+A sync with nothing to do read 46,000 chat files in 9 to 14 seconds on a busy
+Mac, and the last five sign-ins on the development Mac came 14 to 37 seconds
+after the sign-out. A faster sign-in only costs the restart, as before.
 
 Each sync reads every login line at the end of Claude's `main.log` and records
 each account's first login on this Mac in the private chat state, so a rotated

@@ -131,6 +131,7 @@ class RoutineReceipt:
     manifest_count: int
     task_count: int
     write_count: int
+    reason: str | None = None
 
 
 def _canonical(value: Any) -> bytes:
@@ -557,10 +558,14 @@ class RoutineSynchronizer:
         *,
         task_root: Path | None = None,
         process_probe: Callable[..., Any] = managed_processes,
+        read_only_accounts: frozenset[str] = frozenset(),
     ) -> None:
         self.config = config
         self.task_root = task_root or Path.home() / ".claude" / "scheduled-tasks"
         self.process_probe = process_probe
+        # Accounts whose manifests Claude may still write. A run that would
+        # change one writes nothing and waits for a closed Claude.
+        self.read_only_accounts = read_only_accounts
 
     def probe(self) -> dict[str, Any]:
         """Validate current source data without creating state or restoring files."""
@@ -626,6 +631,20 @@ class RoutineSynchronizer:
                 if sample.document != transform.documents[sample.target]
             }
             manifest_writes = len(replacements)
+            if any(
+                sample.target[1] in self.read_only_accounts
+                for sample in samples
+                if sample.path in replacements
+            ):
+                return RoutineReceipt(
+                    "deferred",
+                    len(self.config.profiles),
+                    len(targets),
+                    sum(sample.exists for sample in samples),
+                    transform.task_count,
+                    0,
+                    "account-still-open",
+                )
             current[snapshot_path] = snapshot_before
             snapshot_after = _canonical(transform.snapshot.as_dict()) + b"\n"
             if snapshot_after != snapshot_before:

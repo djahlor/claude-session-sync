@@ -16,6 +16,7 @@ from typing import Callable, Optional
 from .archive import (
     ArchiveReport,
     preview_archive_state,
+    read_only_folders,
     remember_archive_state,
     spread_archive_state,
 )
@@ -38,6 +39,8 @@ class ChatRun:
     recovered_runs: int = 0
     # Copies whose archive state changed to match the newest archive or unarchive.
     archive: Optional[ArchiveReport] = None
+    # The archive pass waited: it would have changed a read-only account.
+    archive_waiting: bool = False
 
 
 def plan_chat_sync(
@@ -56,7 +59,10 @@ def plan_chat_sync(
     run = _summary(plan)
     if getattr(config, "sync_archive_state", False) and not plan.invalid_replicas:
         run.archive = preview_archive_state(
-            config.state_dir, plan.context.targets, skip=_archive_skips(plan)
+            config.state_dir,
+            plan.context.targets,
+            skip=_archive_skips(plan),
+            scanned=plan.context.replicas,
         )
     return run
 
@@ -69,7 +75,13 @@ def run_chat_sync(
     prefer: Optional[str] = None,
     prefer_session: Optional[str] = None,
     clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
+    read_only_accounts: frozenset[str] = frozenset(),
 ) -> ChatRun:
+    """read_only_accounts are accounts whose folders Claude may still write.
+
+    The engine must leave them alone, and their archive flags are not
+    remembered, so the next run still spreads an archive made there.
+    """
     path = state_path(config.state_dir)
     state = _load(config)
     on_disk = encode_state(state)
@@ -92,10 +104,17 @@ def run_chat_sync(
         on_disk = encode_state(state)
 
     archive = None
+    archive_waiting = False
     if getattr(config, "sync_archive_state", False):
         archive, applied = spread_archive_state(
-            config.state_dir, context.targets, engine, skip=_archive_skips(plan)
+            config.state_dir,
+            context.targets,
+            engine,
+            skip=_archive_skips(plan),
+            read_only_accounts=read_only_accounts,
+            scanned=context.replicas,
         )
+        archive_waiting = archive is None
         if applied:
             _remember_archive_writes(state, context, applied)
             if encode_state(state) != on_disk:
@@ -126,11 +145,16 @@ def run_chat_sync(
     if encode_state(state) != on_disk:
         save_state(path, state)
     if archive is not None:
-        remember_archive_state(config.state_dir, context.targets)
+        remember_archive_state(
+            config.state_dir,
+            context.targets,
+            keep=read_only_folders(context.targets, read_only_accounts),
+        )
     run = _summary(plan)
     run.receipt = receipt
     run.recovered_runs = recovered_runs
     run.archive = archive
+    run.archive_waiting = archive_waiting
     return run
 
 

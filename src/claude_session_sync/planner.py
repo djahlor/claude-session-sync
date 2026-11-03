@@ -54,6 +54,8 @@ class PlanContext:
     snapshots: list[Snapshot]
     newly_enrolled: list[str] = field(default_factory=list)
     rescan: Optional[Callable[[], list[Snapshot]]] = None
+    # Each folder's chat files as planned: {folder: {session: Replica}}.
+    replicas: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class Planner:
@@ -189,6 +191,7 @@ class Planner:
             snapshots=snapshots,
             newly_enrolled=list(newly),
             rescan=rescan,
+            replicas={key: entry["records"] for key, entry in index.items()},
         )
         return Plan(
             operations,
