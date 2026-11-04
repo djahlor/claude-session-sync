@@ -28,8 +28,37 @@ private struct RestartReceipt: Codable {
 private enum Limits {
   // restart-check prints one short JSON line.
   static let restartCheckOutputBytes = 4_096
-  // The CLI's bounded process probe plus interpreter startup time.
-  static let restartCheckSeconds = 10.0
+  // The CLI's budget for one check of running Claude processes: the same
+  // number as PROCESS_PROBE_TIMEOUT_SECONDS in processes.py, which a test
+  // compares with this line. restart-check gets that plus interpreter
+  // startup before it is stopped; 10 seconds against 15 until 0.8.1 stopped
+  // a slow `ps` before it could answer.
+  static let processProbeSeconds = 15.0
+  static let interpreterStartupSeconds = 10.0
+  static let restartCheckSeconds = processProbeSeconds + interpreterStartupSeconds
+  // A restart check stopped as too slow is tried again: quickly at first,
+  // then every 30 seconds, before the restart is given up as needing attention.
+  static let restartCheckQuickAttempts = 3
+  static let restartCheckAttempts = 10
+  static let restartCheckQuickRetrySeconds = 2.0
+  static let restartCheckBusyRetrySeconds = 30.0
+  // The helper's tests shorten these timings; nothing else sets the variables.
+  static var restartCheckLimit: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_RESTART_CHECK_SECONDS") ?? restartCheckSeconds
+  }
+  static var restartCheckQuickRetry: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_QUICK_RETRY_SECONDS") ?? restartCheckQuickRetrySeconds
+  }
+  static var restartCheckBusyRetry: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_BUSY_RETRY_SECONDS") ?? restartCheckBusyRetrySeconds
+  }
+  private static func testSeconds(_ name: String) -> Double? {
+    guard let text = ProcessInfo.processInfo.environment[name], let value = Double(text),
+      value > 0, value < restartCheckSeconds else { return nil }
+    return value
+  }
+  // A switch whose sync stopped because Claude opened is restarted again.
+  static let reopenRetries = 2
   // How much of a sync result the status file keeps.
   static let syncOutputBytes = 65_536
   static let readChunkBytes = 4_096
@@ -180,6 +209,10 @@ private final class SessionSyncWatcher: NSObject {
   private var restartPending = false
   private var pendingRestartMode: String?
   private var restartMode: String?
+  // The try a restart that waited for a running sync goes on from.
+  private var pendingRestartAttempt = 1
+  // Restarts asked for again because Claude opened during the switch's sync.
+  private var reopenRetries = 0
   private var lastFailureKey: String?
   // Whether Claude was signed in at the last check. A sign-out while it runs
   // starts a sync of every folder but the account just left.
@@ -191,8 +224,6 @@ private final class SessionSyncWatcher: NSObject {
   private var signedOutResult: SignedOutResult?
   // A switch waits for this check before it decides on the restart.
   private var groupsChecking = false
-  // Claude quit during that check: the quit sync still copies the groups.
-  private var switchAfterQuit = false
   private var statusItem: NSStatusItem?
   private let notice = StatusNotice()
   // Present when the status window is turned off in the Sync menu.
@@ -333,7 +364,7 @@ private final class SessionSyncWatcher: NSObject {
     else { return .blocked }
     do {
       try process.run()
-      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Limits.restartCheckSeconds) {
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Limits.restartCheckLimit) {
         if process.isRunning { process.terminate() }
       }
       let data = pipe.fileHandleForReading.readData(ofLength: Limits.restartCheckOutputBytes + 1)
@@ -357,6 +388,7 @@ private final class SessionSyncWatcher: NSObject {
   }
 
   private func tick() {
+    if switchSyncing() { quitClaudeOpenedDuringSwitch() }
     if restartRequested && restartPhase == "quitting" {
       let attempt = restartAttempt
       // Quit notifications can omit the executable URL. Also observe actual exit.
@@ -510,6 +542,7 @@ private final class SessionSyncWatcher: NSObject {
     accountHash = hash
     candidateHash = nil
     candidateSince = nil
+    reopenRetries = 0
     if restartPhase != "needs-attention" { restartPhase = "ready" }
     let signedOut = signedOutResult
     signedOutResult = nil
@@ -595,11 +628,9 @@ private final class SessionSyncWatcher: NSObject {
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
     let reason = result?["reason"] as? String ?? ""
     let keepOpen = exitStatus == 0 && result?["restart"] as? Bool == false
-    if quits != quitCount || reason == "claude-closed" {
-      // Claude quit during the check. Its sync still copies the groups the
-      // restart would have, unless they already matched. The switch command
-      // waits for Claude to be closed before it writes anything.
-      switchAfterQuit = !keepOpen
+    if (quits != quitCount || reason == "claude-closed") && keepOpen {
+      // Claude quit during the check and the groups already matched: the
+      // quit sync is enough.
       do { try saveRestartState() } catch {
         restartFailed("Could not save account-switch status.")
         return
@@ -619,6 +650,8 @@ private final class SessionSyncWatcher: NSObject {
     // Anything else restarts as before, even a sign-out during the check: the
     // switch's copy still needs Claude closed, and skipping it could leave the
     // account signed in to with old groups if the next sign-in is to it again.
+    // A Claude that quit during the check takes the same restart: one found
+    // closed syncs as the restart's own sync and opens again after it.
     restartAfterGroupsCheck()
   }
 
@@ -655,6 +688,7 @@ private final class SessionSyncWatcher: NSObject {
     if running {
       restartPending = true
       if mode != nil { pendingRestartMode = mode }
+      pendingRestartAttempt = max(pendingRestartAttempt, attempt)
       return
     }
     DispatchQueue.main.async { [weak self] in
@@ -667,6 +701,7 @@ private final class SessionSyncWatcher: NSObject {
         if self.running {
           self.restartPending = true
           if mode != nil { self.pendingRestartMode = mode }
+          self.pendingRestartAttempt = max(self.pendingRestartAttempt, attempt)
           return
         }
         guard !applications.isEmpty else {
@@ -676,8 +711,25 @@ private final class SessionSyncWatcher: NSObject {
             }
             return
           }
+          if mode == "after-account-switch" {
+            // Claude closed during the switch: on 04-11-2026 it quit to
+            // install an update at the sign-in, and opened again two minutes
+            // later. The switch's sync is still owed. It runs as this
+            // restart's own sync, so a Claude that opens meanwhile is asked
+            // to quit, and Claude opens when the sync is done.
+            self.restartPhase = "quitting"
+            self.restartRequested = true
+            self.pending = false
+            self.restartMode = mode
+            self.restartAttempt = UUID()
+            self.quittingPIDs = []
+            self.showStatus("Account changed while Claude was closed. Syncing, then opening Claude.")
+            self.startAutoIfNeeded()
+            return
+          }
           self.noteRestartSkipped("claude-not-open")
           self.showStatus("Claude is not open, so it was not restarted.", banner: true)
+          self.runPendingIfNeeded()
           return
         }
         let approvedPIDs: Set<pid_t>
@@ -685,17 +737,26 @@ private final class SessionSyncWatcher: NSObject {
         case .ready(let pids):
           approvedPIDs = pids
         case .retryable:
-          if attempt < 3 {
-            self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+          // A sync that waited for the restart runs meanwhile; the restart
+          // then waits for it in turn.
+          self.runPendingIfNeeded()
+          if attempt < Limits.restartCheckAttempts {
+            let quick = attempt < Limits.restartCheckQuickAttempts
+            if !quick && attempt == Limits.restartCheckQuickAttempts {
+              self.showStatus("Mac is busy. The restart tries again in 30 seconds.")
+            }
+            let delay = quick ? Limits.restartCheckQuickRetry : Limits.restartCheckBusyRetry
+            self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
               self?.beginRestart(attempt: attempt + 1, mode: mode)
             }
             return
           }
-          self.noteRestartSkipped("process-check-busy")
-          self.showStatus("Mac is busy. Try the restart again in a moment.", banner: true)
+          self.restartFailed("The Mac stayed too busy to restart Claude. Quit Claude to sync.",
+            reason: "process-check-busy")
           return
         case .blocked:
           self.restartFailed("Could not confirm the default Claude profile. Claude was left open.")
+          self.runPendingIfNeeded()
           return
         }
         let targets = applications.filter { approvedPIDs.contains($0.processIdentifier) }
@@ -709,6 +770,8 @@ private final class SessionSyncWatcher: NSObject {
           return
         }
         self.restartRequested = true
+        // The switch syncs everything itself, so a queued sync is not needed.
+        self.pending = false
         self.restartMode = mode
         let attempt = UUID()
         self.restartAttempt = attempt
@@ -733,13 +796,26 @@ private final class SessionSyncWatcher: NSObject {
     writeStatus(exitStatus: 0, output: data, launchFailed: false)
   }
 
-  private func restartFailed(_ message: String, reason: String = "restart-failed") {
+  private func restartFailed(_ message: String, reason: String = "restart-failed",
+                             steps: [String: String] = [:]) {
     restartRequested = false
     restartPhase = "needs-attention"
     try? saveRestartState()
-    let data = (try? JSONSerialization.data(withJSONObject: ["progress": "needs-attention", "reason": reason])) ?? Data()
+    var document: [String: Any] = ["progress": "needs-attention", "reason": reason]
+    if !steps.isEmpty { document["steps"] = steps }
+    let data = (try? JSONSerialization.data(withJSONObject: document)) ?? Data()
     writeStatus(exitStatus: 1, output: data, launchFailed: false)
     notify("Sync needs attention. " + message)
+  }
+
+  // Each part of a switch's sync that did not finish, with its reason, as
+  // the sync tool lists it. The status then says what to look at instead of
+  // only that a restart failed. A result that stopped before any part ran
+  // gives its own reason.
+  private func syncSteps(_ result: [String: Any]?) -> [String: String] {
+    if let steps = result?["steps"] as? [String: String], !steps.isEmpty { return steps }
+    guard let reason = (result?["reason"] ?? result?["state"]) as? String else { return [:] }
+    return ["sync": reason]
   }
 
   func requestAuto(afterQuit: Bool = false) {
@@ -772,12 +848,7 @@ private final class SessionSyncWatcher: NSObject {
       if let mode = restartMode { arguments.append("--" + mode) }
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"syncing\"}".utf8), launchFailed: false)
       showStatus("Syncing, then reopening Claude")
-    } else if switchAfterQuit, let profile = profile {
-      // The groups the switch's restart would have copied, with Claude left closed.
-      arguments = ["switch", profile, "--wait-for-exit", "30", "--after-account-switch",
-                   "--no-launch", "--json"]
     }
-    switchAfterQuit = false
     guard let task = cliProcess(arguments, output: output) else {
       running = false
       return
@@ -824,18 +895,39 @@ private final class SessionSyncWatcher: NSObject {
     let reason = result?["reason"] as? String
     let progress = result?["progress"] as? String
     running = false
+    let finishedMode = restartMode
     if restarting {
       restartRequested = false
       restartMode = nil
     }
+    if restarting && (reason == "claude-open" || reason == "app-running")
+      && reopenRetries < Limits.reopenRetries {
+      // Claude opened before or during the sync and did not close in time,
+      // as after the update on 04-11-2026. The sync is still owed: restart
+      // again, now that Claude is open to be asked to quit.
+      reopenRetries += 1
+      restartPhase = "ready"
+      writeStatus(exitStatus: 0, output: output, launchFailed: false)
+      showStatus("Claude opened during the sync. Restarting it once more.", banner: true)
+      restartPending = true
+      pendingRestartMode = finishedMode
+      runQueuedWork(restarting: false)
+      return
+    }
     if restarting && (exitStatus != 0 || progress != "finished") {
-      // The switch command reopens Claude even when its sync fails.
-      restartFailed(result?["launch"] as? String == "started"
+      // The switch command reopens Claude even when its sync fails. Then the
+      // restart worked and only part of the sync did not.
+      let reopened = result?["launch"] as? String == "started"
+      reopenRetries = 0
+      restartFailed(reopened
         ? "Sync needs attention. Claude is reopening."
-        : "Sync needs attention. Claude was not reopened.")
+        : "Sync needs attention. Claude was not reopened.",
+        reason: reopened ? "sync-incomplete" : "restart-failed",
+        steps: syncSteps(result))
       runPendingIfNeeded()
       return
     }
+    if restarting { reopenRetries = 0 }
     if exitStatus == 0 && progress == "finished" {
       restartPhase = "finished"
       if restarting, let hash = readAccountHash() { accountHash = hash }
@@ -885,11 +977,14 @@ private final class SessionSyncWatcher: NSObject {
   // a queued sync is not needed.
   private func runQueuedWork(restarting: Bool) {
     if restartPending && !restarting {
+      // A queued sync stays queued until Claude is asked to quit: a restart
+      // that finds Claude closed still runs it.
       restartPending = false
-      pending = false
       let mode = pendingRestartMode
       pendingRestartMode = nil
-      beginRestart(mode: mode)
+      let attempt = pendingRestartAttempt
+      pendingRestartAttempt = 1
+      beginRestart(attempt: attempt, mode: mode)
       return
     }
     runPendingIfNeeded()
@@ -1006,6 +1101,25 @@ private final class SessionSyncWatcher: NSObject {
   private func switchSyncing() -> Bool {
     restartRequested && restartPhase == "syncing"
       && FileManager.default.fileExists(atPath: switchGuardURL.path)
+  }
+
+  // The notice that an app opened can be missed, so while a switch syncs the
+  // helper also looks for an open Claude every second and asks it to quit.
+  private func quitClaudeOpenedDuringSwitch() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      let opened = NSWorkspace.shared.runningApplications.filter {
+        !$0.isTerminated && $0.executableURL?.standardizedFileURL.path == self.claudeExecutable
+      }
+      guard !opened.isEmpty else { return }
+      self.queue.async {
+        // The switch removes its guard before it opens Claude itself.
+        guard self.switchSyncing() else { return }
+        DispatchQueue.main.async {
+          for application in opened where !application.isTerminated { _ = application.terminate() }
+        }
+      }
+    }
   }
 
   // A Claude still starting up can refuse a quit, so it is asked again.

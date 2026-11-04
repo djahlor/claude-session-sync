@@ -479,3 +479,88 @@ class TransactionEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WriteGuardTests(unittest.TestCase):
+    """A run the write guard ends early is reported as cut short, never as committed."""
+
+    def test_a_guard_that_trips_before_staging_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, folder = root / "source", root / "signed-in-account"
+            folder.mkdir()
+            destination = folder / "destination"
+            source.write_bytes(b"new")
+            destination.write_bytes(b"old")
+            engine = TransactionEngine(
+                root / "state", process_probe=lambda: False, write_guard=lambda: True
+            )
+
+            receipt = engine.apply(make_plan(source, destination, b"old"))
+
+            self.assertEqual("interrupted", receipt.status)
+            self.assertEqual(0, receipt.operation_count)
+            # Not even a staged copy went into the folder Claude may hold.
+            self.assertEqual(["destination"], os.listdir(folder))
+            self.assertEqual(b"old", destination.read_bytes())
+            self.assertFalse((root / "state" / "runs").exists())
+
+    def test_a_run_stopped_at_its_first_write_is_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new")
+            destination.write_bytes(b"old")
+            checks = iter((False, True))
+            engine = TransactionEngine(
+                root / "state",
+                process_probe=lambda: False,
+                write_guard=lambda: next(checks),
+            )
+
+            receipt = engine.apply(make_plan(source, destination, b"old"))
+
+            self.assertEqual("interrupted", receipt.status)
+            self.assertEqual(0, receipt.operation_count)
+            self.assertEqual(b"old", destination.read_bytes())
+            manifest = json.loads(
+                (root / "state" / "runs" / receipt.run_id / "manifest.json").read_text()
+            )
+            # Terminal, so the next run needs no recovery, but says what happened.
+            self.assertEqual("COMMITTED", manifest["phase"])
+            self.assertEqual("interrupted", manifest["receipt"]["status"])
+            self.assertEqual(1, manifest["receipt"]["planned_count"])
+            self.assertEqual(pending_recovery_runs(root / "state"), [])
+
+    def test_a_claude_that_started_during_the_writes_makes_the_run_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new")
+            # Before the journal, before the first write, after the last write.
+            probes = iter((False, False, True))
+            engine = TransactionEngine(
+                root / "state",
+                process_probe=lambda: next(probes),
+                write_guard=lambda: False,
+            )
+
+            receipt = engine.apply(make_plan(source, destination, None))
+
+            self.assertEqual("interrupted", receipt.status)
+            self.assertEqual(1, receipt.operation_count)
+            self.assertEqual(b"new", destination.read_bytes())
+
+    def test_a_guard_that_never_trips_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new")
+            engine = TransactionEngine(
+                root / "state", process_probe=lambda: False, write_guard=lambda: False
+            )
+
+            receipt = engine.apply(make_plan(source, destination, None))
+
+            self.assertEqual("committed", receipt.status)
+            self.assertEqual(b"new", destination.read_bytes())

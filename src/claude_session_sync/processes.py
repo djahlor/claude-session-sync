@@ -15,6 +15,10 @@ from .filesystem import normalized_path
 
 Runner = Callable[..., subprocess.CompletedProcess]
 DEFAULT_CLAUDE_EXECUTABLE = Path("/Applications/Claude.app/Contents/MacOS/Claude")
+# Every check for a running Claude shares this budget. On a busy Mac `ps`
+# took longer than the 2.8 seconds a 5 second budget left for its retry
+# (04-11-2026): routines were skipped as unsafe and the switch failed.
+PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)

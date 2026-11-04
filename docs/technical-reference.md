@@ -534,8 +534,8 @@ the watcher runs `signed-out-sync <profile> --json`:
   signed out (`signed-in`), the account just left is unknown
   (`account-unknown`), another writer runs (`busy`), or
   `sync_while_signed_out` is `false` (`disabled`).
-- It waits one second, then syncs chats, archive state, sent pictures and
-  routines. Every folder of the account just left is read but never written:
+- It waits one second, then syncs chats, archive state and routines, and
+  last, while Claude is still signed out, sent pictures. Every folder of the account just left is read but never written:
   those copies are counted as `held_back` and follow at the next quit. Their
   archive flags are not remembered, so an archive made there still spreads
   then. An archive that came from elsewhere and that account must take makes
@@ -543,11 +543,26 @@ the watcher runs `signed-out-sync <profile> --json`:
   manifest together, so they wait whole when that account's manifest would
   change (`deferred`, `account-still-open`) or an unfinished routine run
   waits for recovery (`deferred`, `recovery-pending`).
-- Before every file it writes, it checks that `windowSizeWasSignedIn` is
-  still `false` and `lastKnownAccountUuid` still names the account just left.
-  At the first sign of a sign-in it ends the run and keeps what it wrote,
-  like a run cut short. A sign-in before the first write reports
-  `state=waiting`, `reason=signed-in`.
+- Before it stages any copy and before every file it writes, it checks that
+  `windowSizeWasSignedIn` is still `false` and `lastKnownAccountUuid` still
+  names the account just left. At the first sign of a sign-in it checks
+  whether a Claude runs. If one does, it ends the run and keeps what it
+  wrote, reported as `state=interrupted` with `operations` and `planned`
+  counts, so the restart copies the rest. If none does, as when Claude quits
+  to install an update at the sign-in, no folder is in use and the writes go
+  on, like a sync after a quit, with a new process check at most once a
+  second after the last one returned. A failed check ends the run. After the
+  last write the process check runs once more; a Claude found then also
+  makes the run `interrupted`. A sign-in with Claude open before the
+  journal reports `state=waiting`, `reason=signed-in`. An archive pass cut
+  short is not remembered, so the next run still spreads it
+  (`archive=waiting`), and the chat plan after it is not started.
+- The picture scan runs only when the chats synced and Claude is still
+  signed out. It stops at a sign-in or after 30 seconds, also while it reads
+  the chat records, and keeps how far it read. Otherwise the report says
+  `pictures` `deferred` with `signed-in` or `chats-not-synced`, and the
+  restart after the switch scans them. So a sign-in ends the sync soon and
+  the restart can start.
 - It checks again at the end and reports `signed_in_during_sync`, then
   `restart` and `restart_reasons`: `signed-in-during-sync`, `chats`,
   `archive`, `routines`, `groups` (whenever `sync_sidebar_layout` is on) and
@@ -557,8 +572,25 @@ When the account change follows, the watcher keeps Claude open if that sync
 finished for the account just left with no reason left, and records
 `restart_skipped=synced-while-signed-out`. Otherwise it asks Claude to quit
 normally, runs `switch <profile> --after-account-switch --json` with Claude
-closed, and reopens Claude, as before. A failed sync still reopens Claude and
-reports why. A failed restart check leaves Claude open. Signing in again to
+closed, and reopens Claude, as before. A restart asked for while the sync at
+sign-out still runs waits for it. When Claude is closed by then, for example
+quitting to install an update at the sign-in, the switch's sync runs anyway
+as the restart's own sync: a Claude that opens meanwhile is asked to quit,
+and Claude opens when the sync is done. While a switch syncs the helper also
+looks for an open Claude every second, because the notice that an app
+opened can be missed. A switch that stops because Claude
+opened (`claude-open` or `app-running`) restarts again, up to twice per
+account change. A failed sync still reopens Claude and reports why: the
+status has `reason=sync-incomplete` when Claude reopened, or
+`restart-failed` when it did not, and `steps`, each part that did not finish
+with its reason as `switch` lists it, such as `{"routines": "unsafe-routines"}`.
+
+The helper stops `restart-check` after 25 seconds: the CLI's 15 second
+process check plus interpreter startup. A check stopped as too slow is tried
+again twice after 2 seconds, then every 30 seconds up to 10 tries in all,
+before the restart needs attention (`reason=process-check-busy`). A restart
+that waits for a running sync keeps its count of tries. A sync that waited
+for the restart runs meanwhile. A failed restart check leaves Claude open. Signing in again to
 the account just left, or quitting Claude, drops the sync's result. A
 `needs-attention` state from before stays until a sync clears it.
 
@@ -607,10 +639,12 @@ left, the watcher runs `signed-in-groups <profile> --json` before it decides:
 While the check runs, the watcher keeps the account just left in its restart
 receipt, so a helper restarted meanwhile sees the switch again and restarts.
 A sign-out during the check is picked up when the check ends. When Claude
-quits during the check, or the check finds it closed, its quit sync runs
-`switch <profile> --after-account-switch --no-launch --json` instead of
-`auto`, so the groups are still copied and Claude stays closed. A restart
-asked for during the check runs once, in its own mode.
+quits during the check, or the check finds it closed, the switch restarts as
+any other: found closed, its sync runs as the restart's own sync, so the
+groups are still copied, a Claude that opens meanwhile is asked to quit, and
+Claude opens when the sync is done. When the groups already matched, the
+quit sync alone runs. A restart asked for during the check runs once, in its
+own mode.
 
 With browser logins on, `browser-logins` stays a reason, so the check does
 not run and every switch still restarts once.
@@ -722,11 +756,18 @@ same moment is not lost. The original id stays in the line; renaming the key
 back undoes it. A line still being written waits for the next switch. Each
 transcript is read once: `chat-pictures-offsets.json` in the state folder keeps
 how far it was read, and a replaced transcript is read again from the start.
+That length is saved also when a scan stops early, so a long scan is never
+started over. A transcript that cannot be opened is passed over and tried
+again next time, and one deleted during the scan is skipped. The transcripts of every synced chat held 10.9 GB on 4
+November 2026. On the restart after a switch the scan runs once Claude has
+reopened: each rewrite keeps the line's length, so Claude can append
+meanwhile. A scan stopped at a time limit (`pictures` `stopped`) goes on at
+the next sync, within 30 seconds.
 The last result is in `chat-pictures-status.json`, and a sync report shows a
 `pictures` field only when it changed a picture or failed.
 
-It runs only after a switch, so it reaches the pictures sent before it, which
-went to another account. Pictures sent after the switch keep their upload until
+It runs after a switch, on the restart and at the sign-out before it, so it
+reaches the pictures sent before the switch, which went to another account. Pictures sent after the switch keep their upload until
 the next switch. Claude's web and phone views cannot read files on the Mac: they
 show a file tile instead of a picture whose upload id was renamed, the same as
 they show a picture uploaded to another account. A picture whose file was moved

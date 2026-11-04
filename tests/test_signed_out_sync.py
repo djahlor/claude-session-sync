@@ -152,8 +152,10 @@ class SignedOutSyncTests(ChatCliFixture):
 
         def guard_then_sign_in(config, holds, signed_in_again):
             def again():
+                # The first check comes before staging, the second before the
+                # first write.
                 checks.append(True)
-                if len(checks) == 2:
+                if len(checks) == 3:
                     self.sign_in(B_ACCOUNT)
                 return signed_in_again()
 
@@ -161,12 +163,14 @@ class SignedOutSyncTests(ChatCliFixture):
 
         payload = self.signed_out_sync(live_engine_factory=guard_then_sign_in)
 
-        # The run ends at the sign-in and keeps the copy written before it.
-        self.assertEqual("committed", payload["state"])
+        # The run ends at the sign-in and keeps the copy written before it,
+        # and says the plan was cut short.
+        self.assertEqual("interrupted", payload["state"])
         self.assertEqual(1, payload["counts"]["operations"])
         written = [self.read(self.b, X), self.read(self.b, Y)]
         self.assertEqual(1, sum(copy is not None for copy in written))
         self.assertIn("signed-in-during-sync", payload["restart_reasons"])
+        self.assertIn("chats", payload["restart_reasons"])
         # The next sync writes the rest, with no recovery left to do.
         self.running = False
         self.assertEqual(0, self.cli("sync", "--json")[0])

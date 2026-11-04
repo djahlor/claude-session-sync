@@ -107,7 +107,8 @@ class TransactionEngine:
         self.retention = retention
         # Checked before every write, cheaper than process_probe. True ends the
         # run there and keeps what it wrote, as a run cut short: a rollback
-        # would need Claude closed.
+        # would need Claude closed. The receipt then says "interrupted", never
+        # "committed", so a caller cannot take part of a plan for all of it.
         self.write_guard = write_guard
 
     def apply(self, plan: Any) -> RunReceipt:
@@ -131,7 +132,10 @@ class TransactionEngine:
                     f"{len(pending)} run(s) require recovery before apply"
                 )
             receipt = self._apply_locked(plan)
-            if self.retention is not None and receipt.status == "committed":
+            if self.retention is not None and receipt.status in (
+                "committed",
+                "interrupted",
+            ):
                 prune_terminal_runs(self.state_root, self.retention)
             return receipt
 
@@ -195,6 +199,16 @@ class TransactionEngine:
         self._ensure_apps_stopped()
         if not records:
             return self._noop_receipt(plan.plan_id)
+        if self.write_guard is not None and self.write_guard():
+            # Staging already writes a temporary copy beside each destination,
+            # so a run the guard would stop puts nothing into those folders.
+            return RunReceipt(
+                run_id=None,
+                status="interrupted",
+                plan_id=plan.plan_id,
+                operation_count=0,
+                bytes_copied=0,
+            )
 
         run_id = uuid.uuid4().hex
         journal: RunJournal | None = None
@@ -232,8 +246,10 @@ class TransactionEngine:
             self._transition(journal, "COMMITTING")
             self._verify_destinations_unchanged(journal.records)
             self._ensure_apps_stopped()
+            stopped = False
             for record in journal.records:
                 if self.write_guard is not None and self.write_guard():
+                    stopped = True
                     break
                 destination = Path(record["destination"])
                 kind = record["kind"]
@@ -248,6 +264,11 @@ class TransactionEngine:
                     commit_staged(staged[record["index"]], destination)
                 journal.mark_applied(record["index"])
                 applied.append(record)
+            if self.write_guard is not None and not stopped and self._claude_holds():
+                # The guard may trust a closed Claude for a moment. One that
+                # started meanwhile could have listed a folder mid-run, so the
+                # run is never reported as a whole commit.
+                stopped = True
 
             self._transition(journal, "VERIFYING")
             for record in applied:
@@ -265,7 +286,7 @@ class TransactionEngine:
                     )
             receipt = RunReceipt(
                 run_id=run_id,
-                status="committed",
+                status="interrupted" if stopped else "committed",
                 plan_id=plan.plan_id,
                 operation_count=len(applied),
                 bytes_copied=sum(
@@ -283,6 +304,7 @@ class TransactionEngine:
                     "status": receipt.status,
                     "plan_id": receipt.plan_id,
                     "operation_count": receipt.operation_count,
+                    "planned_count": len(journal.records),
                     "bytes_copied": receipt.bytes_copied,
                 },
             )
@@ -596,6 +618,14 @@ class TransactionEngine:
         except OSError:
             return False
         return metadata.st_dev == staged_device and metadata.st_ino == staged_inode
+
+    def _claude_holds(self) -> bool:
+        """A fresh process check. A check that fails counts as a running Claude."""
+
+        try:
+            return bool(self.process_probe())
+        except Exception:
+            return True
 
     def _ensure_apps_stopped(self) -> None:
         if self.process_probe():

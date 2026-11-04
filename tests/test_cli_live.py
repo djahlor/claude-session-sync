@@ -939,6 +939,90 @@ class SwitchTests(ChatCliFixture):
                 self.assertEqual(runs, len(calls))
                 self.assertEqual(bool(runs), "pictures" in json.loads(out))
 
+    def test_the_picture_scan_runs_after_claude_reopens(self):
+        """A full scan read 10.9 GB on 04-11-2026: Claude must not wait for it."""
+        from claude_session_sync.pictures import PictureReceipt
+
+        events = []
+
+        class Fixer:
+            def sync(self):
+                events.append("pictures")
+                return PictureReceipt("noop", 0, 0)
+
+        code, _out, errors = self.cli(
+            "switch",
+            "Work",
+            "--json",
+            "--after-account-switch",
+            launcher=FakeLauncher(events),
+            picture_factory=lambda _config: Fixer(),
+        )
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual(
+            ["launch", "pictures"],
+            [event if isinstance(event, str) else event[0] for event in events],
+        )
+
+    def test_a_switch_lists_each_part_that_did_not_finish(self):
+        code, out, _errors = self.cli(
+            "switch",
+            "Work",
+            "--json",
+            launcher=FakeLauncher([]),
+            engine_factory=lambda _config: self.fail_engine(),
+        )
+
+        payload = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual({"chats": payload["reason"]}, payload["steps"])
+
+    def fail_engine(self):
+        class Broken:
+            def apply(self, _plan):
+                raise RuntimeError("disk")
+
+            def close_interrupted_runs(self):
+                return 0
+
+        return Broken()
+
+    def test_a_stopped_picture_scan_goes_on_at_the_next_sync(self):
+        from claude_session_sync.adapters import save_status
+        from claude_session_sync.pictures import PictureReceipt
+
+        calls = []
+
+        class Fixer:
+            def sync(self, should_stop=None):
+                calls.append(should_stop)
+                return PictureReceipt("noop", 0, 0)
+
+        self.write(self.a, X)
+        code, out, errors = self.cli(
+            "sync", "--json", picture_factory=lambda _config: Fixer()
+        )
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual([], calls, "nothing to go on with")
+
+        save_status(
+            self.config.state_dir,
+            "chat-pictures-status.json",
+            {"state": "stopped", "files": 0, "pictures": 0},
+        )
+        code, out, errors = self.cli(
+            "sync", "--json", picture_factory=lambda _config: Fixer()
+        )
+
+        self.assertEqual((0, ""), (code, errors))
+        self.assertEqual(1, len(calls))
+        self.assertIsNotNone(calls[0], "the resumed scan has a time limit")
+        status = json.loads(
+            (self.config.state_dir / "chat-pictures-status.json").read_text()
+        )
+        self.assertEqual("noop", status["state"])
+
     def test_a_switch_waits_for_claude_to_finish_quitting(self):
         probe = SequencedProcessProbe(((object(),), (object(),), ()))
         clock = ManualClock()

@@ -25,28 +25,45 @@ def record_progress(config, state: str, **fields) -> dict:
     return payload
 
 
+# States in which a part of a sync did all it had to do.
+DONE_STATES = ("committed", "synced", "noop", "disabled", "per-account")
+# States in which a part waits for Claude: unfinished, but no fault. An
+# "interrupted" run was cut short by a sign-in; the switch restart copies the rest.
+WAITING_STATES = ("deferred", "waiting", "interrupted")
+# The parts unfinished_steps reports, besides the chats.
+STEP_PARTS = ("routines", "layout", "pictures")
+
+
+def unfinished_steps(payload: dict) -> dict:
+    """Each part of a sync result that did not finish, with its reason.
+
+    The one list the menu-bar helper shows when a switch's sync falls short.
+    """
+
+    steps = {}
+    parts = [("chats", payload)] + [
+        (name, payload[name])
+        for name in STEP_PARTS
+        if isinstance(payload.get(name), dict)
+    ]
+    for name, part in parts:
+        state = part.get("state")
+        if isinstance(state, str) and state not in DONE_STATES:
+            reason = part.get("reason")
+            steps[name] = reason if isinstance(reason, str) else state
+    return steps
+
+
 def finish_progress(config, payload: dict) -> str:
     """Record how a sync ended. A component deferred because Claude reopened is unfinished."""
 
     adapters = [payload[key] for key in ("routines", "layout") if key in payload]
     outcomes = [payload.get("state")] + [adapter.get("state") for adapter in adapters]
-    attention = any(
-        value
-        not in (
-            "committed",
-            "synced",
-            "noop",
-            "disabled",
-            "deferred",
-            "per-account",
-            "waiting",
-        )
-        for value in outcomes
-    )
+    attention = any(value not in DONE_STATES + WAITING_STATES for value in outcomes)
     attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
     if attention:
         state = "needs-attention"
-    elif payload.get("state") == "waiting" or any(
+    elif payload.get("state") in ("waiting", "interrupted") or any(
         adapter.get("state") == "deferred" for adapter in adapters
     ):
         state = "waiting-for-Claude"

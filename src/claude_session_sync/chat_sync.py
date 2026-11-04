@@ -114,7 +114,22 @@ def run_chat_sync(
             read_only_accounts=read_only_accounts,
             scanned=context.replicas,
         )
-        archive_waiting = archive is None
+        # A pass cut short is not remembered either: its flags would then look
+        # settled, and the archive it did not finish would never spread.
+        archive_waiting = archive is None or archive.interrupted
+        if archive is not None and archive.interrupted:
+            # The engine stopped for a sign-in: the chat plan would stop too,
+            # after staging copies into folders Claude may now hold.
+            if applied:
+                _remember_archive_writes(state, context, applied)
+                if encode_state(state) != on_disk:
+                    save_state(path, state)
+            run = _summary(plan)
+            run.receipt = RunReceipt(None, "interrupted", plan.plan_id, 0, 0)
+            run.recovered_runs = recovered_runs
+            run.archive = archive
+            run.archive_waiting = True
+            return run
         if applied:
             _remember_archive_writes(state, context, applied)
             if encode_state(state) != on_disk:
@@ -144,7 +159,7 @@ def run_chat_sync(
         state.last_success_ms = clock_ms()
     if encode_state(state) != on_disk:
         save_state(path, state)
-    if archive is not None:
+    if archive is not None and not archive_waiting:
         remember_archive_state(
             config.state_dir,
             context.targets,
