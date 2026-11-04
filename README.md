@@ -22,14 +22,14 @@ Open Claude Code on your Mac, for example the **Code** tab in the Claude app, an
 Install Claude Session Sync from github.com/djahlor/claude-session-sync. Follow its INSTALL.md, and tell me what it does before you run anything.
 ```
 
-Your own Claude does the rest, and you see each step:
+Your own Claude does the rest, and nothing is installed until you say yes:
 
-1. It downloads the code to a temporary folder and reads it first. It checks that nothing in it goes online.
+1. It downloads the code to a temporary folder and reads it. It checks that nothing in it goes online.
 2. It tells you what it will add and where.
-3. It asks two questions: whether to [stop the artifact warnings](#artifact-warnings), which has a cost, and whether to add the [share-artifacts skill](#artifact-pages-on-your-other-accounts).
-4. After your yes, it installs, checks that it runs, and tells you how to switch accounts.
+3. It asks you two things. Stop the red "didn't resume" [artifact warnings](#artifact-warnings)? The cost is that Claude stops answering comments on your artifact pages by itself, so the default is no. Add the [share-artifacts skill](#artifact-pages-on-your-other-accounts), which helps you open your artifact pages from your other accounts? The default is yes. You can change both later.
+4. After your yes, it installs, checks that it runs, and tells you how to switch accounts. Building the helper takes a minute or two.
 
-Claude never quits or changes the Claude app, so your chat stays open. [INSTALL.md](INSTALL.md) is the guide Claude follows, with every command in it. To update, paste the same sentence again.
+The install never quits or changes the Claude app, so your chat stays open. [INSTALL.md](INSTALL.md) is the guide Claude follows, with every command in it. To update, paste the same sentence again.
 
 ### What it puts on your Mac
 
@@ -40,9 +40,12 @@ Claude never quits or changes the Claude app, so your chat stays open. [INSTALL.
 | A login item that starts the background helper and the **Sync** menu-bar item | `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist` |
 | The share-artifacts skill, if you say yes | `~/.claude/skills/share-artifacts` |
 
-It has no account, no server and no tracking. Nothing leaves your Mac. It needs macOS, the [Claude desktop app](https://claude.ai/download) and Apple's Command Line Tools, which macOS offers to install when they are missing.
+- It copies Claude Code's chats, groups and routines between your accounts' folders on this Mac, so each account sees the same chats. It keeps recovery backups of what it changes.
+- It never reads your passwords, your Keychain or your Claude login. It has no account, no server and no tracking. Nothing leaves your Mac.
+- It needs no Mac password. macOS may show a note that a background item was added. That is the Sync helper.
+- It needs macOS, the [Claude desktop app](https://claude.ai/download) and Apple's Command Line Tools, which build the helper on your Mac. macOS offers to install them when they are missing.
 
-To remove it, paste this into Claude Code:
+To remove it, paste this into Claude Code. Your history and backups stay unless you ask Claude to delete them.
 
 ```text
 Remove Claude Session Sync from my Mac. Follow INSTALL.md at github.com/djahlor/claude-session-sync.
@@ -54,7 +57,7 @@ Remove Claude Session Sync from my Mac. Follow INSTALL.md at github.com/djahlor/
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
 ```
 
-It does the same install and asks the same two questions in Terminal. Press Enter to keep the warnings and to add the skill. When your accounts have different groups on an older Claude version, it also asks which account is the main one. An update keeps your answers and does not ask again. To answer up front, put the options after a dash:
+It does the same install and asks the same two questions in Terminal. Press Enter to keep the warnings and to add the skill. On older Claude versions it can also ask which account is the main one. An update keeps your answers and does not ask again. To answer up front, put the options after a dash:
 
 ```sh
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill

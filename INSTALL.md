@@ -22,7 +22,8 @@ Tell the person this in your own words before step 5:
 - **What it does.** When they switch accounts in the Claude desktop app, their Claude Code chats, archived state, groups and routines come along to the other account.
 - **What it adds.** A small background helper that starts at login, with a **Sync** item in the menu bar. It runs only when Claude closes or signs out, and never while they work.
 - **Where.** The tool, its backups and its history go in `~/Library/Application Support/ClaudeSessionSync`. Its settings go in `~/.config/claude-session-sync`. The login item is `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist`. If they want the skill, it goes in `~/.claude/skills/share-artifacts`.
-- **What it never does.** It never changes or quits the Claude app in `/Applications`. It never reads or sends their Claude login. It has no account, no server and no tracking: nothing leaves their Mac. Step 3 checks that in the code.
+- **What it never does.** It never changes or quits the Claude app in `/Applications`. It never reads their passwords, their Keychain or their Claude login. It has no account, no server and no tracking: nothing leaves their Mac. Step 3 checks that in the code.
+- **What they will see.** No Mac password prompt. macOS may show a note that a background item was added: that is the Sync helper.
 - **How to remove it.** Ask Claude to remove it, with the sentence in [Remove](#remove). That takes off the helper, the menu-bar item and the login item.
 
 ## 1. Check the Mac
@@ -47,10 +48,10 @@ It prints the folder. Then read `INSTALL.md` in that folder with your Read tool,
 
 1. Read `install.sh` in the folder. It is the script step 6 runs.
 2. Read the version in `src/claude_session_sync/__init__.py`.
-3. Check that the code makes no network calls:
+3. Check that the code makes no network calls and does not read the Keychain:
 
    ```sh
-   grep -rnE "import requests|urlopen|urllib|http\.client|import socket|URLSession|NSURL|curl " "<folder>/src" "<folder>/install.sh"
+   grep -rnE "import requests|urlopen|urllib|http\.client|import socket|URLSession|NSURL|curl |SecItem|find-generic-password|/usr/bin/security" "<folder>/src" "<folder>/install.sh"
    ```
 
    No output means none were found. If anything shows, or the code does something [What it installs](#what-it-installs) does not list, tell the person and stop.
