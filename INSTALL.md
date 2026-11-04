@@ -91,7 +91,7 @@ Use your question tool if you have one, so the person can click an answer. Other
 
 ## 6. Install
 
-Run this in the foreground with a 10-minute timeout. Building the helper takes a minute or two.
+Run this in the foreground with a 10-minute timeout. Building the helper takes under a minute on a recent Mac.
 
 ```sh
 cd "<folder>" && ./install.sh --automatic-targets --sync-layout --sync-routines <answers>

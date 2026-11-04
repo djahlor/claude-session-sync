@@ -27,7 +27,7 @@ Your own Claude does the rest, and nothing is installed until you say yes:
 1. It downloads the code to a temporary folder and reads it. It checks that nothing in it goes online.
 2. It tells you what it will add and where.
 3. It asks you two things. Stop the red "didn't resume" [artifact warnings](#artifact-warnings)? The cost is that Claude stops answering comments on your artifact pages by itself, so the default is no. Add the [share-artifacts skill](#artifact-pages-on-your-other-accounts), which helps you open your artifact pages from your other accounts? The default is yes. You can change both later.
-4. After your yes, it installs, checks that it runs, and tells you how to switch accounts. Building the helper takes a minute or two.
+4. After your yes, it installs, checks that it runs, and tells you how to switch accounts. Building the helper takes under a minute on a recent Mac.
 
 The install never quits or changes the Claude app, so your chat stays open. [INSTALL.md](INSTALL.md) is the guide Claude follows, with every command in it. To update, paste the same sentence again.
 
