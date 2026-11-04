@@ -376,6 +376,21 @@ class InterruptedScanTests(unittest.TestCase):
         self.assertIn(b'"orig_uuid"', good.read_bytes())
         self.assertNotIn(str(bad), self.offsets())
 
+    def test_a_transcript_deleted_after_it_was_listed_is_passed_over(self):
+        from unittest import mock
+
+        good = self.chat(SESSION, sent(self.picture))
+        gone = self.projects / f"{OTHER}.jsonl"
+
+        with mock.patch.object(
+            self.fixer, "_transcripts", lambda _stop=None: iter([gone, good])
+        ):
+            receipt = self.fixer.sync()
+
+        self.assertEqual("synced", receipt.state)
+        self.assertIn(b'"orig_uuid"', good.read_bytes())
+        self.assertNotIn(str(gone), self.offsets())
+
     def test_a_stop_while_chat_records_are_read_keeps_the_saved_lengths(self):
         from claude_session_sync import pictures
 

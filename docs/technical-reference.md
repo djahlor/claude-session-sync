@@ -588,8 +588,9 @@ with its reason as `switch` lists it, such as `{"routines": "unsafe-routines"}`.
 The helper stops `restart-check` after 25 seconds: the CLI's 15 second
 process check plus interpreter startup. A check stopped as too slow is tried
 again twice after 2 seconds, then every 30 seconds up to 10 tries in all,
-before the restart needs attention. A sync that waited for the restart runs
-meanwhile. A failed restart check leaves Claude open. Signing in again to
+before the restart needs attention (`reason=process-check-busy`). A restart
+that waits for a running sync keeps its count of tries. A sync that waited
+for the restart runs meanwhile. A failed restart check leaves Claude open. Signing in again to
 the account just left, or quitting Claude, drops the sync's result. A
 `needs-attention` state from before stays until a sync clears it.
 
@@ -638,10 +639,12 @@ left, the watcher runs `signed-in-groups <profile> --json` before it decides:
 While the check runs, the watcher keeps the account just left in its restart
 receipt, so a helper restarted meanwhile sees the switch again and restarts.
 A sign-out during the check is picked up when the check ends. When Claude
-quits during the check, or the check finds it closed, its quit sync runs
-`switch <profile> --after-account-switch --no-launch --json` instead of
-`auto`, so the groups are still copied and Claude stays closed. A restart
-asked for during the check runs once, in its own mode.
+quits during the check, or the check finds it closed, the switch restarts as
+any other: found closed, its sync runs as the restart's own sync, so the
+groups are still copied, a Claude that opens meanwhile is asked to quit, and
+Claude opens when the sync is done. When the groups already matched, the
+quit sync alone runs. A restart asked for during the check runs once, in its
+own mode.
 
 With browser logins on, `browser-logins` stays a reason, so the check does
 not run and every switch still restarts once.
@@ -754,8 +757,8 @@ back undoes it. A line still being written waits for the next switch. Each
 transcript is read once: `chat-pictures-offsets.json` in the state folder keeps
 how far it was read, and a replaced transcript is read again from the start.
 That length is saved also when a scan stops early, so a long scan is never
-started over, and a transcript that cannot be opened is passed over and tried
-again next time. The transcripts of every synced chat held 10.9 GB on 4
+started over. A transcript that cannot be opened is passed over and tried
+again next time, and one deleted during the scan is skipped. The transcripts of every synced chat held 10.9 GB on 4
 November 2026. On the restart after a switch the scan runs once Claude has
 reopened: each rewrite keeps the line's length, so Claude can append
 meanwhile. A scan stopped at a time limit (`pictures` `stopped`) goes on at

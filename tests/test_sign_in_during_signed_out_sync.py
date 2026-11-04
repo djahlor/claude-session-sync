@@ -169,6 +169,39 @@ class SignInDuringSignedOutSyncTests(ChatCliFixture):
         self.assertEqual("interrupted", run.receipt.status)
         self.assertIsNone(self.read(self.b, Y))
 
+    def test_a_sign_in_during_the_archive_pass_skips_the_chat_plan(self):
+        """The real command and engine: the archive pass is the only apply."""
+        # Archived in A, the account just left: the pass would write B.
+        self.write(self.a, X, isArchived=True)
+        self.write(self.b, X, isArchived=False)
+        self.write(self.a, Y)
+        applies = []
+
+        def engine(config, holds, guard):
+            def sign_in_at_the_first_check():
+                # Inside the archive pass, after its process check, with
+                # Claude still open.
+                self.sign_in(B_ACCOUNT)
+                return guard()
+
+            inner = self.live_engine(config, holds, sign_in_at_the_first_check)
+            apply = inner.apply
+
+            def counted(plan):
+                applies.append(plan)
+                return apply(plan)
+
+            inner.apply = counted
+            return inner
+
+        payload = self.signed_out_sync(live_engine_factory=engine)
+
+        self.assertEqual(1, len(applies), "only the archive pass reached the engine")
+        self.assertIsNone(self.read(self.b, Y), "the chat plan never started")
+        self.assertFalse(self.read(self.b, X)["isArchived"])
+        self.assertEqual("waiting", payload["archive"])
+        self.assertIn("chats", payload["restart_reasons"])
+
     def test_an_archive_change_cut_short_is_not_remembered(self):
         from claude_session_sync.chat_sync import run_chat_sync
         from claude_session_sync.model import RunReceipt

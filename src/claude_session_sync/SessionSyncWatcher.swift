@@ -40,7 +40,23 @@ private enum Limits {
   // then every 30 seconds, before the restart is given up as needing attention.
   static let restartCheckQuickAttempts = 3
   static let restartCheckAttempts = 10
+  static let restartCheckQuickRetrySeconds = 2.0
   static let restartCheckBusyRetrySeconds = 30.0
+  // The helper's tests shorten these timings; nothing else sets the variables.
+  static var restartCheckLimit: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_RESTART_CHECK_SECONDS") ?? restartCheckSeconds
+  }
+  static var restartCheckQuickRetry: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_QUICK_RETRY_SECONDS") ?? restartCheckQuickRetrySeconds
+  }
+  static var restartCheckBusyRetry: Double {
+    testSeconds("CLAUDE_SESSION_SYNC_TEST_BUSY_RETRY_SECONDS") ?? restartCheckBusyRetrySeconds
+  }
+  private static func testSeconds(_ name: String) -> Double? {
+    guard let text = ProcessInfo.processInfo.environment[name], let value = Double(text),
+      value > 0, value < restartCheckSeconds else { return nil }
+    return value
+  }
   // A switch whose sync stopped because Claude opened is restarted again.
   static let reopenRetries = 2
   // How much of a sync result the status file keeps.
@@ -193,6 +209,8 @@ private final class SessionSyncWatcher: NSObject {
   private var restartPending = false
   private var pendingRestartMode: String?
   private var restartMode: String?
+  // The try a restart that waited for a running sync goes on from.
+  private var pendingRestartAttempt = 1
   // Restarts asked for again because Claude opened during the switch's sync.
   private var reopenRetries = 0
   private var lastFailureKey: String?
@@ -206,8 +224,6 @@ private final class SessionSyncWatcher: NSObject {
   private var signedOutResult: SignedOutResult?
   // A switch waits for this check before it decides on the restart.
   private var groupsChecking = false
-  // Claude quit during that check: the quit sync still copies the groups.
-  private var switchAfterQuit = false
   private var statusItem: NSStatusItem?
   private let notice = StatusNotice()
   // Present when the status window is turned off in the Sync menu.
@@ -348,7 +364,7 @@ private final class SessionSyncWatcher: NSObject {
     else { return .blocked }
     do {
       try process.run()
-      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Limits.restartCheckSeconds) {
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Limits.restartCheckLimit) {
         if process.isRunning { process.terminate() }
       }
       let data = pipe.fileHandleForReading.readData(ofLength: Limits.restartCheckOutputBytes + 1)
@@ -612,11 +628,9 @@ private final class SessionSyncWatcher: NSObject {
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
     let reason = result?["reason"] as? String ?? ""
     let keepOpen = exitStatus == 0 && result?["restart"] as? Bool == false
-    if quits != quitCount || reason == "claude-closed" {
-      // Claude quit during the check. Its sync still copies the groups the
-      // restart would have, unless they already matched. The switch command
-      // waits for Claude to be closed before it writes anything.
-      switchAfterQuit = !keepOpen
+    if (quits != quitCount || reason == "claude-closed") && keepOpen {
+      // Claude quit during the check and the groups already matched: the
+      // quit sync is enough.
       do { try saveRestartState() } catch {
         restartFailed("Could not save account-switch status.")
         return
@@ -636,6 +650,8 @@ private final class SessionSyncWatcher: NSObject {
     // Anything else restarts as before, even a sign-out during the check: the
     // switch's copy still needs Claude closed, and skipping it could leave the
     // account signed in to with old groups if the next sign-in is to it again.
+    // A Claude that quit during the check takes the same restart: one found
+    // closed syncs as the restart's own sync and opens again after it.
     restartAfterGroupsCheck()
   }
 
@@ -672,6 +688,7 @@ private final class SessionSyncWatcher: NSObject {
     if running {
       restartPending = true
       if mode != nil { pendingRestartMode = mode }
+      pendingRestartAttempt = max(pendingRestartAttempt, attempt)
       return
     }
     DispatchQueue.main.async { [weak self] in
@@ -684,6 +701,7 @@ private final class SessionSyncWatcher: NSObject {
         if self.running {
           self.restartPending = true
           if mode != nil { self.pendingRestartMode = mode }
+          self.pendingRestartAttempt = max(self.pendingRestartAttempt, attempt)
           return
         }
         guard !applications.isEmpty else {
@@ -727,7 +745,7 @@ private final class SessionSyncWatcher: NSObject {
             if !quick && attempt == Limits.restartCheckQuickAttempts {
               self.showStatus("Mac is busy. The restart tries again in 30 seconds.")
             }
-            let delay = quick ? 2.0 : Limits.restartCheckBusyRetrySeconds
+            let delay = quick ? Limits.restartCheckQuickRetry : Limits.restartCheckBusyRetry
             self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
               self?.beginRestart(attempt: attempt + 1, mode: mode)
             }
@@ -830,12 +848,7 @@ private final class SessionSyncWatcher: NSObject {
       if let mode = restartMode { arguments.append("--" + mode) }
       writeStatus(exitStatus: 0, output: Data("{\"progress\":\"syncing\"}".utf8), launchFailed: false)
       showStatus("Syncing, then reopening Claude")
-    } else if switchAfterQuit, let profile = profile {
-      // The groups the switch's restart would have copied, with Claude left closed.
-      arguments = ["switch", profile, "--wait-for-exit", "30", "--after-account-switch",
-                   "--no-launch", "--json"]
     }
-    switchAfterQuit = false
     guard let task = cliProcess(arguments, output: output) else {
       running = false
       return
@@ -969,7 +982,9 @@ private final class SessionSyncWatcher: NSObject {
       restartPending = false
       let mode = pendingRestartMode
       pendingRestartMode = nil
-      beginRestart(mode: mode)
+      let attempt = pendingRestartAttempt
+      pendingRestartAttempt = 1
+      beginRestart(attempt: attempt, mode: mode)
       return
     }
     runPendingIfNeeded()

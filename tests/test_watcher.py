@@ -396,6 +396,23 @@ class WatcherTests(unittest.TestCase):
             sign_out=True, signed_out_restart=True, quit_during_check=True
         )
 
+    def test_a_claude_that_reopens_after_a_quit_during_the_groups_check_is_quit(self):
+        self.live_scenario(
+            sign_out=True,
+            signed_out_restart=True,
+            quit_during_check=True,
+            relaunch_during_switch=True,
+        )
+
+    def test_a_busy_restart_check_is_retried_on_schedule_then_needs_attention(self):
+        """Stopped each time: 2 quick retries, then the slow ones, 10 tries in all."""
+        self.live_scenario(request_restart=True, busy_restart_check=True)
+
+    def test_a_busy_restart_that_waits_for_a_sync_keeps_its_count_of_tries(self):
+        self.live_scenario(
+            request_restart=True, busy_restart_check=True, sign_out_while_busy=True
+        )
+
     def test_a_switch_whose_claude_closed_during_the_sign_out_sync_still_syncs(self):
         """Claude quit to update at the sign-in, during the sync (04-11-2026)."""
         self.live_scenario(
@@ -480,6 +497,8 @@ class WatcherTests(unittest.TestCase):
         relaunch_during_switch=False,
         switch_claude_open_once=False,
         slow_restart_check=False,
+        busy_restart_check=False,
+        sign_out_while_busy=False,
     ):
         from claude_session_sync.processes import PROCESS_PROBE_TIMEOUT_SECONDS
 
@@ -499,6 +518,9 @@ class WatcherTests(unittest.TestCase):
                 "if sys.argv[1] == 'restart-check':\n"
                 f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
                 f" if {slow_restart_check!r}: time.sleep({PROCESS_PROBE_TIMEOUT_SECONDS!r})\n"
+                f" if {busy_restart_check!r}:\n"
+                f"  with pathlib.Path({str(root / 'restart-checks')!r}).open('a') as out: out.write(str(time.time()) + '\\n')\n"
+                "  time.sleep(30)\n"
                 f" result = subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], text=True, capture_output=True)\n"
                 " print(json.dumps({'state': 'ready', 'pids': [int(pid) for pid in result.stdout.split()]})); raise SystemExit(0)\n"
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -522,6 +544,7 @@ class WatcherTests(unittest.TestCase):
                 " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
                 "elif sys.argv[1] == 'signed-out-sync':\n"
                 f" if {quit_while_signed_out!r}: time.sleep(4)\n"
+                f" if {sign_out_while_busy!r}: time.sleep(12)\n"
                 f" restart = {signed_out_restart!r}\n"
                 f" reasons = {list(restart_reasons)!r} if restart else []\n"
                 " print(json.dumps({'state': 'committed', 'progress': 'finished', 'restart': restart, 'restart_reasons': reasons}))\n"
@@ -539,6 +562,14 @@ class WatcherTests(unittest.TestCase):
             subprocess.run(["/usr/bin/open", str(app)], check=True)
             status = root / "watcher-status.json"
             env = dict(os.environ, CLAUDE_SESSION_SYNC_DISABLE_NOTIFICATIONS="1")
+            if busy_restart_check:
+                # The schedule shortened: a 3 s limit (time for the stand-in to
+                # start and note its try), then 1 s and 6 s retries.
+                env.update(
+                    CLAUDE_SESSION_SYNC_TEST_RESTART_CHECK_SECONDS="3",
+                    CLAUDE_SESSION_SYNC_TEST_QUICK_RETRY_SECONDS="1",
+                    CLAUDE_SESSION_SYNC_TEST_BUSY_RETRY_SECONDS="6",
+                )
             watcher_command = [
                 str(self.binary),
                 "--claude-executable",
@@ -697,20 +728,18 @@ class WatcherTests(unittest.TestCase):
                     if quit_during_check:
                         self.assertTrue(
                             wait_for(lambda: switches(), 30),
-                            "the quit sync must still copy the groups",
+                            "the switch must still copy the groups",
                         )
                         self.assertIn("--after-account-switch", switches()[0])
-                        self.assertIn("--no-launch", switches()[0])
+                        # The restart's own sync: Claude opens again after it.
+                        self.assertNotIn("--no-launch", switches()[0])
+                        if relaunch_during_switch:
+                            self.assertTrue(
+                                wait_for((root / "chats-arrived").exists, 40),
+                                "a Claude opened mid-sync must be quit so the sync ends",
+                            )
+                        self.assertTrue(wait_for(app_running, 30), "Claude must reopen")
                         time.sleep(4)
-                        # pgrep -f would also match the helper's own arguments.
-                        self.assertEqual(
-                            1,
-                            subprocess.run(
-                                ["/usr/bin/pgrep", "-x", executable.name],
-                                stdout=subprocess.DEVNULL,
-                            ).returncode,
-                            "a quit Claude stays closed",
-                        )
                         self.assertEqual(1, len(switches()), "no restart loop")
                         self.assertEqual(
                             "finished", json.loads(status.read_text())["restart_phase"]
@@ -763,6 +792,74 @@ class WatcherTests(unittest.TestCase):
                     self.assertFalse(
                         status.exists(), "the start-up sync must still be running"
                     )
+                if busy_restart_check:
+                    if sign_out_while_busy:
+                        account.write_text(
+                            json.dumps(
+                                {
+                                    "lastKnownAccountUuid": first_account,
+                                    "windowSizeWasSignedIn": True,
+                                }
+                            )
+                        )
+                        time.sleep(2)
+                    (root / "restart-request").write_text("")
+                    checks = root / "restart-checks"
+
+                    def stamps():
+                        return (
+                            [float(line) for line in checks.read_text().split()]
+                            if checks.exists()
+                            else []
+                        )
+
+                    if sign_out_while_busy:
+                        # A sign-out sync starts between two tries; the next
+                        # try waits for it and must not count from 1 again.
+                        self.assertTrue(wait_for(lambda: len(stamps()) >= 4, 30))
+                        account.write_text(
+                            json.dumps(
+                                {
+                                    "lastKnownAccountUuid": first_account,
+                                    "windowSizeWasSignedIn": False,
+                                }
+                            )
+                        )
+                        self.assertTrue(
+                            wait_for(
+                                lambda: any(
+                                    i[0] == "signed-out-sync" for i in entries()
+                                ),
+                                10,
+                            )
+                        )
+                    self.assertTrue(
+                        wait_for(
+                            lambda: (
+                                status.exists()
+                                and json.loads(status.read_text()).get("restart_phase")
+                                == "needs-attention"
+                            ),
+                            180,
+                        ),
+                        f"a busy Mac must end in needs-attention: {stamps()}",
+                    )
+                    times = stamps()
+                    self.assertEqual(10, len(times), "10 tries in all")
+                    gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+                    if not sign_out_while_busy:
+                        # Each try: the 3 s limit, then 1 s twice, then 6 s.
+                        for gap in gaps[:2]:
+                            self.assertLess(gap, 7.0, gaps)
+                        for gap in gaps[2:]:
+                            self.assertGreaterEqual(gap, 8.5, gaps)
+                    time.sleep(5)
+                    self.assertEqual(10, len(stamps()), "no try after the last")
+                    saved = json.loads(json.loads(status.read_text())["output"])
+                    self.assertEqual("process-check-busy", saved["reason"])
+                    self.assertEqual([], switches(), "Claude was never quit")
+                    self.assertTrue(app_running(), "a busy Mac leaves Claude open")
+                    return
                 if request_restart:
                     (root / "restart-request").write_text(request_text)
                     finished = wait_for(

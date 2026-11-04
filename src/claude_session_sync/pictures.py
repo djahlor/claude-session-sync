@@ -330,8 +330,17 @@ class PictureFixer:
             for path in transcripts:
                 if should_stop is not None and should_stop():
                     return PictureReceipt("stopped", files, pictures)
-                metadata = path.stat()
                 previous = offsets.get(str(path))
+                try:
+                    metadata = path.stat()
+                except FileNotFoundError:
+                    # Deleted since it was listed: nothing left to fix.
+                    continue
+                except OSError:
+                    failed += 1
+                    if previous is not None:
+                        kept[str(path)] = previous
+                    continue
                 start = 0
                 if (
                     previous is not None
