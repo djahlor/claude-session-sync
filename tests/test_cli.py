@@ -926,6 +926,56 @@ class CliInstallTests(unittest.TestCase):
         )
         self.assertNotIn("private", out.getvalue())
 
+    def run_uninstall(self, config_path: Path, state_dir: Path) -> str:
+        class FakeInstaller:
+            def uninstall(self, *, dry_run):
+                return InstallReport("uninstalled", ())
+
+        out = io.StringIO()
+        code = run(
+            ["--config", str(config_path), "uninstall", "--apply"],
+            dependencies=CliDependencies(
+                config_loader=lambda path: SimpleNamespace(state_dir=state_dir),
+                installer_factory=lambda path: FakeInstaller(),
+            ),
+            stdout=out,
+            stderr=io.StringIO(),
+        )
+        self.assertEqual(0, code)
+        return out.getvalue()
+
+    def test_uninstall_takes_out_the_artifact_warning_switch_sync_put_in(self):
+        from claude_session_sync.artifact_warnings import SWITCH, ensure_switch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text("{}")
+            state = root / "state"
+            state.mkdir()
+            settings = root / "settings.json"
+            settings.write_text('{\n  "model": "opus"\n}\n')
+            self.assertEqual("added", ensure_switch(state, settings))
+            self.assertIn(SWITCH, settings.read_text())
+
+            printed = self.run_uninstall(config_path, state)
+
+            self.assertNotIn(SWITCH, settings.read_text())
+            self.assertIn('"model": "opus"', settings.read_text())
+            self.assertIn("Took the artifact warning switch out", printed)
+
+    def test_uninstall_leaves_settings_alone_when_sync_put_no_switch_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text("{}")
+            state = root / "state"
+            state.mkdir()
+
+            printed = self.run_uninstall(config_path, state)
+
+            self.assertNotIn("switch", printed)
+
     def test_install_requires_exactly_one_mode(self):
         error = io.StringIO()
 

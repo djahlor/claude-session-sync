@@ -154,6 +154,48 @@ class InstallMenuTests(unittest.TestCase):
         self.assertNotIn("--ask-artifact-warnings", arguments)
         self.assertIn("'didn't resume' warnings stop", result.stdout)
 
+    def test_a_no_to_the_warnings_is_saved_instead_of_asked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sync-install-") as directory:
+            result = self.run_install(Path(directory), "--no-stop-artifact-warnings")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = re.findall(r"PY_ARG=([^\r\n]*)", result.stdout)
+        self.assertIn("--no-stop-artifact-warnings", arguments)
+        self.assertNotIn("--ask-artifact-warnings", arguments)
+        self.assertNotIn("--stop-artifact-warnings", arguments)
+        self.assertNotIn("'didn't resume' warnings stop", result.stdout)
+
+    def test_a_no_to_the_skill_is_remembered_for_the_next_terminal_run(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sync-install-") as directory:
+            root = Path(directory)
+            skill = root / "home/.claude/skills/share-artifacts/SKILL.md"
+
+            declined = self.run_install(root, "--no-share-skill")
+            self.assertEqual(declined.returncode, 0, declined.stderr)
+            self.assertFalse(skill.exists())
+
+            later = self.run_install(root, typed="\n")
+            self.assertEqual(later.returncode, 0, later.stderr)
+            self.assertNotIn("Add the share-artifacts skill", later.stdout)
+            self.assertFalse(skill.exists())
+
+    def test_a_no_to_the_skill_leaves_an_added_skill_alone(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sync-install-") as directory:
+            root = Path(directory)
+            skill = root / "home/.claude/skills/share-artifacts/SKILL.md"
+            self.run_install(root, "--share-skill")
+            self.assertTrue(skill.exists())
+
+            result = self.run_install(root, "--no-share-skill")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(skill.exists())
+            self.assertFalse(
+                (
+                    root
+                    / "home/Library/Application Support/ClaudeSessionSync"
+                    / "share-skill-skipped"
+                ).exists()
+            )
+
     def test_without_a_terminal_the_skill_is_added_only_when_asked_for(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sync-install-") as directory:
             root = Path(directory)

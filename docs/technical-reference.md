@@ -157,7 +157,14 @@ start from inside a Claude chat, where it would stop when Claude quits.
 
 ## Install
 
-For the easiest install, download the repository, double-click
+The easiest install is from Claude Code: paste the sentence at the top of the
+[README](../README.md#install). Claude follows [INSTALL.md](../INSTALL.md): it
+downloads the repository to a temporary folder, reads `install.sh` and checks
+the code for network calls, asks the two questions below in chat, runs
+`install.sh` with the answers as options, and checks `--version`, `status` and
+the LaunchAgent. It never quits Claude.
+
+Without Claude Code, download the repository, double-click
 `Install Claude Session Sync.command`, and choose option 1. It uses the normal
 Claude app, trusts future logins inside that app's existing data root, and
 syncs chats, Code routines, pins, and groups when the account changes or Claude
@@ -185,13 +192,17 @@ terminal:
   `false`, so an update with the key present never asks again. The end of
   input leaves the key out and asks next time. `install.sh` passes it unless
   `--stop-artifact-warnings` already turns the option on.
+  `--no-stop-artifact-warnings` saves `false` with no question, but only while
+  the key is missing, so it never turns off an earlier yes.
 - `install.sh` asks whether to add the share-artifacts skill
   ([Artifact pages on other accounts](#artifact-pages-on-other-accounts)).
   Enter means yes: it copies `skills/share-artifacts/SKILL.md` to
   `~/.claude/skills/share-artifacts/`. An update refreshes that file when it is
   there and leaves `accounts.txt` beside it alone. A skip writes
   `share-skill-skipped` in the support folder, so an update does not ask again.
-  `--share-skill` adds it with no question, and `--no-share-skill` skips it.
+  `--share-skill` adds it with no question. `--no-share-skill` skips it and
+  writes `share-skill-skipped` when the skill is not there, so a later run on
+  a terminal does not ask either. It never removes an added skill.
 
 `get.sh` passes every option after a dash to `install.sh`:
 
@@ -199,10 +210,9 @@ terminal:
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
 ```
 
-An AI agent can run either command for you. Setup asks its questions only when
-a person sits at a terminal. Without one it keeps the account already chosen
-and leaves the warning fix and the skill as they were, unless the options turn
-them on. Setup replaces the helpers and restarts the watcher. It
+Setup asks its questions only when a person sits at a terminal. Without one,
+as in a Claude Code chat, it keeps the account already chosen and leaves the
+warning fix and the skill as they were, unless the options answer them. Setup replaces the helpers and restarts the watcher. It
 never quits Claude. The restarted watcher quits Claude only when the signed-in
 account differs from the one it last saw, which is the normal switch restart.
 The same command installs and updates, so when something needs attention,
@@ -1098,9 +1108,9 @@ claude-session-sync uninstall --apply
 Uninstall removes only the generated runtime, watcher, sidebar helper, and
 LaunchAgent by moving them into the tool's backup area. It preserves the
 private config, transaction state, and the original Claude application for
-recovery. It also leaves the [artifact warnings](#artifact-warnings) switch in
-`settings.json`. To take it out, set `"stop_artifact_warnings": false` and let
-Claude close once before you uninstall, or delete the line yourself.
+recovery. It also takes the [artifact warnings](#artifact-warnings) switch out
+of `settings.json` when a sync put it there, because nothing syncs afterwards to
+take it out later. A switch you put in yourself stays.
 
 ## Development
 
