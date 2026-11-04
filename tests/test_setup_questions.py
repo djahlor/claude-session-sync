@@ -131,6 +131,51 @@ class ArtifactWarningsQuestionTests(unittest.TestCase):
         self.assertNotIn("stop_artifact_warnings", desired)
         self.assertNotIn("didn't resume", printed)
 
+    # A no given in a Claude Code chat is saved the way Enter is.
+
+    def test_the_no_option_records_the_answer_without_a_question(self):
+        desired, printed = self.setup_with(
+            "y\n", "--no-stop-artifact-warnings", "--ask-artifact-warnings", "--apply"
+        )
+        self.assertIs(False, desired["stop_artifact_warnings"])
+        self.assertNotIn("didn't resume", printed)
+
+    def test_the_no_option_works_without_a_terminal(self):
+        desired, _printed = self.setup_with(
+            None, "--no-stop-artifact-warnings", "--apply"
+        )
+        self.assertIs(False, desired["stop_artifact_warnings"])
+
+    def test_the_no_option_never_turns_off_an_earlier_yes(self):
+        existing = dict(self.document, stop_artifact_warnings=True)
+        desired, _printed = self.setup_with(
+            None, "--no-stop-artifact-warnings", "--apply", existing=existing
+        )
+        self.assertIs(True, desired["stop_artifact_warnings"])
+
+    def test_a_dry_run_records_nothing(self):
+        desired, _printed = self.setup_with(
+            None, "--no-stop-artifact-warnings", "--dry-run"
+        )
+        self.assertNotIn("stop_artifact_warnings", desired)
+
+    def test_yes_and_no_together_are_refused(self):
+        errors = io.StringIO()
+        code = run(
+            [
+                "--config",
+                str(self.config_path),
+                "setup",
+                "--stop-artifact-warnings",
+                "--no-stop-artifact-warnings",
+                "--apply",
+            ],
+            stdout=io.StringIO(),
+            stderr=errors,
+        )
+        self.assertNotEqual(0, code)
+        self.assertIn("not allowed with", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

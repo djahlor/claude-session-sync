@@ -6,7 +6,8 @@ automatic_targets=false
 sync_layout=false
 sync_routines=false
 sync_browser_logins=false
-stop_artifact_warnings=false
+# ask, yes or no: whether to stop the artifact "didn't resume" warnings.
+stop_artifact_warnings=ask
 # ask, yes or no: whether to add the share-artifacts skill to Claude Code.
 share_skill=ask
 
@@ -25,7 +26,10 @@ for argument in "$@"; do
       sync_browser_logins=true
       ;;
     --stop-artifact-warnings)
-      stop_artifact_warnings=true
+      stop_artifact_warnings=yes
+      ;;
+    --no-stop-artifact-warnings)
+      stop_artifact_warnings=no
       ;;
     --share-skill)
       share_skill=yes
@@ -35,7 +39,7 @@ for argument in "$@"; do
       ;;
     *)
       echo "Unknown option: $argument" >&2
-      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins] [--stop-artifact-warnings] [--share-skill | --no-share-skill]" >&2
+      echo "Use: ./install.sh [--automatic-targets] [--sync-layout] [--sync-routines] [--sync-browser-logins] [--stop-artifact-warnings | --no-stop-artifact-warnings] [--share-skill | --no-share-skill]" >&2
       exit 2
       ;;
   esac
@@ -89,8 +93,11 @@ fi
 if [[ "$sync_browser_logins" == true ]]; then
   setup_args+=(--sync-browser-logins)
 fi
-if [[ "$stop_artifact_warnings" == true ]]; then
+if [[ "$stop_artifact_warnings" == yes ]]; then
   setup_args+=(--stop-artifact-warnings)
+elif [[ "$stop_artifact_warnings" == no ]]; then
+  # A no given in a Claude Code chat, saved like Enter at the question.
+  setup_args+=(--no-stop-artifact-warnings)
 else
   # On a terminal, setup asks once whether to stop the artifact warnings.
   setup_args+=(--ask-artifact-warnings)
@@ -103,6 +110,10 @@ run_source_cli setup "${setup_args[@]}" --apply
 skill_source="$script_dir/skills/share-artifacts/SKILL.md"
 skill_dir="$HOME/.claude/skills/share-artifacts"
 skill_skipped="$support_dir/share-skill-skipped"
+if [[ "$share_skill" == no && ! -f "$skill_dir/SKILL.md" ]]; then
+  # A no given in a Claude Code chat, remembered like n at the question.
+  : > "$skill_skipped"
+fi
 if [[ "$share_skill" == ask && -f "$skill_dir/SKILL.md" ]]; then
   share_skill=yes
 elif [[ "$share_skill" == ask && -f "$skill_skipped" ]]; then
@@ -154,7 +165,7 @@ fi
 if [[ "$sync_browser_logins" == true ]]; then
   echo "The built-in browser's site logins come back after an account switch."
 fi
-if [[ "$stop_artifact_warnings" == true ]]; then
+if [[ "$stop_artifact_warnings" == yes ]]; then
   echo "Claude no longer answers artifact comments by itself, so its 'didn't resume' warnings stop."
 fi
 if [[ "$skill_added" == true ]]; then

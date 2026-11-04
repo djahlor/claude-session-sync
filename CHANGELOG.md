@@ -2,7 +2,18 @@
 
 All notable changes to Claude Session Sync, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version numbers follow [Semantic Versioning](https://semver.org/).
 
-To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
+To update, paste the install sentence from the [README](README.md#install) into Claude Code again, or run its Terminal command. Check your version with `claude-session-sync --version`.
+
+## [0.9.0] - 2026-11-04
+
+### Added
+
+- Install from Claude Code. Paste one sentence into a Claude Code chat: "Install Claude Session Sync from github.com/djahlor/claude-session-sync. Follow its INSTALL.md, and tell me what it does before you run anything." Claude follows the new [INSTALL.md](INSTALL.md): it downloads the code to a temporary folder, reads `install.sh`, checks the code for network calls, says what it adds and where, asks the two install questions in chat, installs after a yes, and checks the version, the status and the login item. It never quits Claude. A second sentence removes it. The README now leads with this route, with a table of every file it puts on the Mac.
+- `--no-stop-artifact-warnings` and a remembered `--no-share-skill` for `install.sh` and `get.sh`. A no given in a chat is saved the way Enter or `n` is at the Terminal questions, so a later update from Terminal does not ask again. Neither undoes an earlier yes.
+
+### Changed
+
+- `uninstall --apply` also takes the artifact warning switch out of `~/.claude/settings.json` when a sync put it there. Before, you had to turn the option off and let Claude close once before uninstalling. A switch you put in yourself stays.
 
 ## [0.8.1] - 2026-11-04
 

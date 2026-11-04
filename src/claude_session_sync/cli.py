@@ -448,7 +448,13 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--sync-layout", action="store_true")
     setup.add_argument("--sync-routines", action="store_true")
     setup.add_argument("--sync-browser-logins", action="store_true")
-    setup.add_argument("--stop-artifact-warnings", action="store_true")
+    warnings_answer = setup.add_mutually_exclusive_group()
+    warnings_answer.add_argument("--stop-artifact-warnings", action="store_true")
+    warnings_answer.add_argument(
+        "--no-stop-artifact-warnings",
+        action="store_true",
+        help="record a no to the artifact warnings question, for an install with no terminal",
+    )
     setup.add_argument(
         "--ask-artifact-warnings",
         action="store_true",
@@ -1271,6 +1277,20 @@ def _ask_artifact_warnings(source: bytes, stdin: TextIO, output: TextIO) -> byte
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def _record_artifact_warnings_no(source: bytes) -> bytes:
+    """Save a no given outside a terminal, for example in a Claude Code chat.
+
+    Like Enter at the question, it is saved only while the config holds no
+    answer, so it never turns off a fix someone chose before.
+    """
+
+    document = json.loads(source.decode("utf-8"))
+    if not isinstance(document, dict) or "stop_artifact_warnings" in document:
+        return source
+    document["stop_artifact_warnings"] = False
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def _discard_typeahead(stdin: TextIO) -> None:
     """Drop keys pressed while setup compiled, so they cannot answer the question."""
 
@@ -1558,7 +1578,34 @@ def _cmd_install(
     else:
         report = installer.uninstall(dry_run=arguments.dry_run)
     _write(_install_report(report), as_json=False, stream=output)
+    if arguments.command == "uninstall" and not arguments.dry_run:
+        _release_artifact_switch(arguments.config, deps, output)
     return 0
+
+
+def _release_artifact_switch(
+    config_path: Path, deps: CliDependencies, output: TextIO
+) -> None:
+    """At uninstall, take out the artifact warning switch a sync put in.
+
+    Nothing syncs after an uninstall, so a switch left in settings.json would
+    keep Claude from answering artifact comments with nothing left to undo it.
+    A switch the person put in themselves stays.
+    """
+
+    from .artifact_warnings import release_switch
+
+    if not config_path.exists():
+        return
+    try:
+        switch = release_switch(deps.config_loader(config_path).state_dir)
+    except Exception as error:
+        output.write(f"The artifact warning switch stays in settings.json: {error}\n")
+        return
+    if switch == "removed":
+        output.write(
+            "Took the artifact warning switch out of ~/.claude/settings.json.\n"
+        )
 
 
 def _cmd_setup(
@@ -1569,7 +1616,9 @@ def _cmd_setup(
         source = arguments.config.read_bytes()
     else:
         source = installer.default_config_data()
-    if (
+    if arguments.no_stop_artifact_warnings and arguments.apply:
+        source = _record_artifact_warnings_no(source)
+    elif (
         arguments.ask_artifact_warnings
         and arguments.apply
         and not arguments.stop_artifact_warnings

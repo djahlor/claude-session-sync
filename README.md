@@ -14,6 +14,60 @@ For people with more than one Claude account on one Mac, for example a work acco
 > [!WARNING]
 > Experimental and unofficial. Claude updates can break parts of it. Only use it with accounts whose histories you are allowed to combine.
 
+## Install
+
+Open Claude Code on your Mac, for example the **Code** tab in the Claude app, and paste this:
+
+```text
+Install Claude Session Sync from github.com/djahlor/claude-session-sync. Follow its INSTALL.md, and tell me what it does before you run anything.
+```
+
+Your own Claude does the rest, and you see each step:
+
+1. It downloads the code to a temporary folder and reads it first. It checks that nothing in it goes online.
+2. It tells you what it will add and where.
+3. It asks two questions: whether to [stop the artifact warnings](#artifact-warnings), which has a cost, and whether to add the [share-artifacts skill](#artifact-pages-on-your-other-accounts).
+4. After your yes, it installs, checks that it runs, and tells you how to switch accounts.
+
+Claude never quits or changes the Claude app, so your chat stays open. [INSTALL.md](INSTALL.md) is the guide Claude follows, with every command in it. To update, paste the same sentence again.
+
+### What it puts on your Mac
+
+| What | Where |
+|---|---|
+| The tool, its backups and its history | `~/Library/Application Support/ClaudeSessionSync` |
+| Its settings | `~/.config/claude-session-sync` |
+| A login item that starts the background helper and the **Sync** menu-bar item | `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist` |
+| The share-artifacts skill, if you say yes | `~/.claude/skills/share-artifacts` |
+
+It has no account, no server and no tracking. Nothing leaves your Mac. It needs macOS, the [Claude desktop app](https://claude.ai/download) and Apple's Command Line Tools, which macOS offers to install when they are missing.
+
+To remove it, paste this into Claude Code:
+
+```text
+Remove Claude Session Sync from my Mac. Follow INSTALL.md at github.com/djahlor/claude-session-sync.
+```
+
+### In Terminal
+
+```sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
+```
+
+It does the same install and asks the same two questions in Terminal. Press Enter to keep the warnings and to add the skill. When your accounts have different groups on an older Claude version, it also asks which account is the main one. An update keeps your answers and does not ask again. To answer up front, put the options after a dash:
+
+```sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
+```
+
+`--no-stop-artifact-warnings` and `--no-share-skill` answer no, and are saved the same way.
+
+### Without Terminal
+
+1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
+2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open System Settings, then Privacy & Security, and click **Open Anyway**.
+3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
+
 ## What it syncs
 
 | What | When | Standard install |
@@ -28,43 +82,6 @@ For people with more than one Claude account on one Mac, for example a work acco
 | Artifact pages on your other accounts, with a Claude skill | When you ask Claude | Asked at install, [how](#artifact-pages-on-your-other-accounts) |
 
 It does not sync past routine runs, Claude web chats, your Claude logins, Cowork routines, or anything between Macs. Pins sync only on older Claude versions. A routine in bypass mode also needs bypass turned on in each account. A routine saved with no mode runs in manual on every account; `routine_mode_when_unset` in the config gives such routines a mode ([how](docs/technical-reference.md#claude-code-routines)).
-
-## Requirements
-
-- macOS with [Claude Desktop](https://claude.ai/download).
-- Apple's Command Line Tools. The installer asks macOS to install them if they are missing.
-
-## Install
-
-Paste this into Terminal:
-
-```sh
-zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
-```
-
-It downloads the latest version, builds its helpers, and adds a background helper with a small **Sync** item in the menu bar. It never replaces or quits the Claude app. The same command updates it.
-
-It asks up to three questions, each once:
-
-1. Whether to [stop the artifact warnings](#artifact-warnings). Press Enter to skip.
-2. Which account is the main one, only when your accounts have different groups.
-3. Whether to add the [share-artifacts skill](#artifact-pages-on-your-other-accounts) to Claude Code. Press Enter to add it.
-
-An update keeps your answers and does not ask again. To answer up front, with no questions, put the options after a dash:
-
-```sh
-zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
-```
-
-### Without Terminal
-
-1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
-2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open System Settings, then Privacy & Security, and click **Open Anyway**.
-3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
-
-### With an AI agent
-
-Ask your agent: "Install or update Claude Session Sync from github.com/djahlor/claude-session-sync, then check it." The install command needs no keyboard. Without a terminal it asks nothing: it keeps the account already chosen, and the warning fix and the skill stay as they were unless the agent passes `--stop-artifact-warnings` or `--share-skill`. The agent can check the result with `--version` and `status` from [Commands](#commands). A fix shows in `status` only after Claude has closed once, and quitting Claude ends every open chat, so the agent should ask you before it quits Claude.
 
 ## Switch accounts
 
@@ -152,19 +169,19 @@ css="$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync
 | `"$css" configure --sync-browser-logins --apply` | Turns on browser logins |
 | `"$css" browser-logins status --json` | Shows the saved browser copy, counts only |
 | `"$css" configure --stop-artifact-warnings --apply` | Stops the artifact "didn't resume" warnings ([cost](#artifact-warnings)) |
-| `"$css" uninstall --apply` | Removes the background helper and menu-bar item |
+| `"$css" uninstall --apply` | Removes the background helper and menu-bar item, and the artifact warning switch sync put in |
 
 All commands and recovery steps are in the [technical reference](docs/technical-reference.md).
 
 ## Update and uninstall
 
-Run the install command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
+Paste the install sentence into Claude Code again, or run the Terminal command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
 
-To remove it, run `"$css" uninstall --apply`. If you turned on [artifact warnings](#artifact-warnings), turn that off and quit Claude once first, or the switch stays in `settings.json`. The skill stays in `~/.claude/skills/share-artifacts`; delete that folder to remove it.
+To remove it, paste the remove sentence from [Install](#install) into Claude Code, or run `"$css" uninstall --apply`. That also takes the [artifact warning](#artifact-warnings) switch out of `settings.json` if sync put it there. Your history and backups stay in `~/Library/Application Support/ClaudeSessionSync`, and the skill stays in `~/.claude/skills/share-artifacts`; delete those folders to remove them too.
 
 ## If something goes wrong
 
-1. Update first, with the install command. Most problems are fixed in a newer version, and an update keeps your history and backups.
+1. Update first, with the install sentence or the Terminal command. Most problems are fixed in a newer version, and an update keeps your history and backups.
 2. Quit Claude once, at a moment when no chat is working, so sync runs again.
 3. Run `"$css" status`. If it needs attention, run `"$css" doctor`.
 
