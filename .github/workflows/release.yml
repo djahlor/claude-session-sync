@@ -1,0 +1,47 @@
+name: Release
+
+# Publishes each new version as a GitHub release, with the ZIP that the
+# README's Download for Mac button points to. get.sh installs the newest
+# release, and the Homebrew tap follows it, so every merged version reaches
+# every install route without a manual step.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Publish a release when the version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/claude_session_sync/__init__.py)"
+          tag="v$version"
+          if [ -z "$version" ]; then
+            echo "No version found." >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag is already released."
+            exit 0
+          fi
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          git archive --format=zip --prefix="Claude Session Sync/" -o Claude-Session-Sync.zip HEAD
+          gh release create "$tag" Claude-Session-Sync.zip \
+            --target "$GITHUB_SHA" --title "$version" --notes-file notes.md
