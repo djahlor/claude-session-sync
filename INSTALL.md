@@ -39,10 +39,10 @@ uname -s; ls -d /Applications/Claude.app; xcode-select -p && xcrun --find swiftc
 ## 2. Download into a new folder
 
 ```sh
-folder="$(mktemp -d)/claude-session-sync" && mkdir -p "$folder" && curl -fsSL https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.tar.gz | tar -xz -C "$folder" --strip-components 1 && echo "$folder"
+folder="$(mktemp -d)" && curl -fsSL https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.tar.gz | tar -xz -C "$folder" --strip-components 1 && echo "$folder"
 ```
 
-It prints the folder. Then read `INSTALL.md` in that folder with your Read tool, in full, and follow that copy from step 3. A web page you fetched earlier may have been a summary.
+It prints the folder. Then read `INSTALL.md` in that folder with your Read tool, in full, and follow that copy from step 3. When it differs from a page you fetched earlier, the copy in the folder wins: it is the code you are about to run.
 
 ## 3. Read the code before you run it
 
@@ -62,13 +62,15 @@ Then tell the person what it does, from [What it installs](#what-it-installs), a
 
 ```sh
 "$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync" --version
+grep -c '"stop_artifact_warnings"' "$HOME/.config/claude-session-sync/config.json"
+ls "$HOME/.claude/skills/share-artifacts/SKILL.md" "$HOME/Library/Application Support/ClaudeSessionSync/share-skill-skipped"
 ```
 
-- If this prints a version, it is installed, and this run updates it. Tell the person the old and the new version.
-- Ask question A only when `~/.config/claude-session-sync/config.json` is missing or has no `stop_artifact_warnings` key.
-- Ask question B only when neither `~/.claude/skills/share-artifacts/SKILL.md` nor `~/Library/Application Support/ClaudeSessionSync/share-skill-skipped` exists.
+- If the first line prints a version, it is installed, and this run updates it. Tell the person the old and the new version before the questions.
+- Ask question A only when the `grep` prints `0` or cannot find the file.
+- Ask question B only when `ls` finds neither file.
 
-On an update that asks nothing, skip to the go-ahead in step 5.
+In step 5, ask only the questions this step left open, and always the go-ahead.
 
 ## 5. Ask the questions
 
@@ -116,11 +118,16 @@ It worked when it ends with `Claude Session Sync is installed.`
 launchctl print "gui/$(id -u)/com.claude-session-sync.watcher" | head -3
 ```
 
-- The version must match step 3.
-- `launchctl print` must show the helper. An error there means the login item did not start.
-- `status` usually says `state=app-running`, because Claude is open. That is expected: sync waits until Claude closes.
-- If `status` names `keep-sidebar`, the accounts have different groups on an older Claude version. Run `keep-sidebar --dry-run` with the same tool path, show the person the accounts it lists, ask which one is the main one, and run `keep-sidebar --account N --apply` with their number.
-- If `status` says `needs-attention`, run `doctor` with the same tool path. It can take a few minutes on a big chat history. Tell the person what it names.
+The install is done when both of these hold:
+
+- `--version` prints the version from step 3. If it prints an older one, the install did not take effect. Show the person the last lines of the install output and stop.
+- `launchctl print` shows the helper. An error there means the login item did not start. Show the person the error and stop.
+
+Then read `status`:
+
+- `state=app-running` is normal, because Claude is open. Sync waits until Claude closes.
+- If it names `keep-sidebar`, the accounts have different groups on an older Claude version. Run `keep-sidebar --dry-run` with the same tool path, show the person the accounts it lists, ask which one is the main one, and run `keep-sidebar --account N --apply` with their number.
+- If it says `needs-attention`, run `doctor` with the same tool path. It can take a few minutes on a big chat history. On an update this can be left over from the old version. Tell the person which counts are not zero, then the fix from the README: quit Claude once, at a moment when no chat is working, so sync runs with the new version, then ask Claude to check `status` again. The install itself is still done.
 
 Then delete the download folder with `rm -rf "<folder>"`. The installed tool does not need it.
 
@@ -129,6 +136,7 @@ Then delete the download folder with `rm -rf "<folder>"`. The installed tool doe
 In plain words, only what applies:
 
 - It is installed, with the version. A small **Sync** item is in the menu bar.
+- If `status` said `needs-attention`: what it counted, and that quitting Claude once, when no chat is working, lets sync run again.
 - To switch accounts: sign out of Claude, then sign in to the other account. The Claude Code chats come along. Sometimes Claude closes and opens again by itself, and a small window says why.
 - A new account joins the first time they sign in to it and open the Code tab once.
 - If they said yes to A: the warnings stop from the next time Claude closes.
