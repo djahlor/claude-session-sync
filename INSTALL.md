@@ -9,11 +9,11 @@ Follow the steps in order. The same steps update it, and [Remove](#remove) takes
 ## Rules for Claude
 
 - Talk to the person in plain, short sentences. Explain what each step is for before you run it.
-- Install nothing until the person says yes in step 5. Downloading into a temporary folder and reading the code changes nothing.
+- Install nothing until the person says yes in step 5. Steps 1 to 4 only check, download into a temporary folder and read, which changes nothing. Say that in one line before step 1, then explain the tool in full after step 3.
 - Never quit, restart or reinstall the Claude app. Quitting Claude ends every open chat, this one too. Sync starts working the next time the person closes Claude themselves.
 - Shell variables do not carry over between your commands. Write the folder path from step 2 out in full in each later command.
 - If a sandbox blocks a step, such as writing to `~/Library` or running `launchctl`, ask the person to approve that one command outside the sandbox.
-- If something fails, show the person the last lines of the output and stop. Do not try other ways to install it.
+- If something fails, stop: show the person the last lines of the output, say the Claude app was not changed, delete the download folder, and point them to "If something goes wrong" in the README. Do not try other ways to install it.
 
 ## What it installs
 
@@ -69,6 +69,7 @@ ls "$HOME/.claude/skills/share-artifacts/SKILL.md" "$HOME/Library/Application Su
 - If the first line prints a version, it is installed, and this run updates it. Tell the person the old and the new version before the questions.
 - Ask question A only when the `grep` prints `0` or cannot find the file.
 - Ask question B only when `ls` finds neither file.
+- On a first install all three report missing files and exit with an error. That is expected, not a failure.
 
 In step 5, ask only the questions this step left open, and always the go-ahead.
 
@@ -120,8 +121,8 @@ launchctl print "gui/$(id -u)/com.claude-session-sync.watcher" | head -3
 
 The install is done when both of these hold:
 
-- `--version` prints the version from step 3. If it prints an older one, the install did not take effect. Show the person the last lines of the install output and stop.
-- `launchctl print` shows the helper. An error there means the login item did not start. Show the person the error and stop.
+- `--version` prints the version from step 3. If it prints an older one, the install did not take effect: stop, as the rules say.
+- `launchctl print` shows the helper. An error there means the login item did not start: stop, as the rules say.
 
 Then read `status`:
 
