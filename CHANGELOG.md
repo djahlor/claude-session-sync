@@ -4,6 +4,18 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, paste the install sentence from the [README](README.md#install) into Claude Code again, or run its Terminal command. Check your version with `claude-session-sync --version`.
 
+## [0.9.1] - 2026-11-04
+
+### Added
+
+- Install with Homebrew: `brew install djahlor/tap/claude-session-sync`, then `claude-session-sync install`. The second line runs the same installer, with the same questions and options, as the Terminal command. With Homebrew, every command also works as plain `claude-session-sync`, for example `claude-session-sync status`. The tap follows the newest release by itself.
+- A **Download for Mac** button in the README. It gets `Claude-Session-Sync.zip` from the newest release, instead of a ZIP of the whole main branch.
+- Each new version is now published as a GitHub release, with its notes from this changelog and the ZIP attached. The Terminal command already installs the newest release, so it now gets each version as soon as it is merged.
+
+### Changed
+
+- The README starts with one plain line, an "Is it safe?" section with who made it, and a "Remove it" section. The install section lists, in order: ask Claude to install it, download for Mac, and Terminal with one command or Homebrew, folded.
+
 ## [0.9.0] - 2026-11-04
 
 ### Added

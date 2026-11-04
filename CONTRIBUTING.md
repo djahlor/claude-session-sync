@@ -31,4 +31,8 @@ CI runs the same checks on Python 3.9, 3.12 and 3.13. The wall-clock benchmark r
 - Sync must stop on a format it does not know. Do not make it guess.
 - Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
 
+## Releases
+
+A merge to `main` that raises `__version__` in `src/claude_session_sync/__init__.py` publishes that version as a GitHub release, with its `## [version]` section of the changelog as the notes and `Claude-Session-Sync.zip` attached ([workflow](.github/workflows/release.yml)). The Terminal command installs the newest release, and the [Homebrew tap](https://github.com/djahlor/homebrew-tap) points at it within six hours.
+
 Report a security problem privately, as [SECURITY.md](SECURITY.md) says.

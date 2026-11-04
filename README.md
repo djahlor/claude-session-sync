@@ -1,20 +1,31 @@
 # Claude Session Sync
 
-[![Test](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Test](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/djahlor/claude-session-sync/actions/workflows/ci.yml) [![Latest release](https://img.shields.io/github/v/release/djahlor/claude-session-sync?label=release)](https://github.com/djahlor/claude-session-sync/releases/latest) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Keep your Claude Code chats, groups, routines and browser logins when you switch accounts in the Claude Desktop app on a Mac, and stop the artifact warnings that switching leaves behind.
+**Switch Claude accounts on your Mac without losing your chats.**
+
+For people with more than one Claude account on one Mac, for example a work account and a personal one. When you switch accounts in the Claude desktop app, your Claude Code chats come along, so each account shows all of them. The groups you sort them into and your scheduled routines come too. You keep using the normal Claude app.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
   <img alt="You switch accounts, Claude closes, sync copies chats, groups, routines and logins, Claude opens again" src="docs/images/how-it-works-light.svg">
 </picture>
 
-For people with more than one Claude account on one Mac, for example a work account and a personal one. You keep using the normal Claude app. Everything runs on your Mac and nothing leaves it.
+## Is it safe?
+
+- **It stays on your Mac.** It has no account, no server and no tracking, and its code makes no network calls. A test checks that on every change, and your Claude checks it again before it installs ([how](INSTALL.md)).
+- **It never reads your passwords.** It never reads your Keychain or your Claude login. It copies the site logins of Claude's built-in browser only if you [turn that on](#browser-logins), still encrypted.
+- **It keeps backups.** It copies chats between your accounts' folders on this Mac, and keeps a backup of everything it changes.
+- **It stays out of your way.** It never changes the Claude app, and it writes only while Claude is closed or signed out.
+- **You can remove it with one sentence.** See [Remove it](#remove-it).
+- **Who made it.** [Djahlor Andrews](https://github.com/djahlor), who uses it with his own Claude accounts. The code is open, under the [MIT license](LICENSE). To report a security problem, see [SECURITY.md](SECURITY.md).
 
 > [!WARNING]
-> Experimental and unofficial. Claude updates can break parts of it. Only use it with accounts whose histories you are allowed to combine.
+> Experimental and unofficial. Claude updates can break parts of it, and [Limits](#limits) says which Claude versions were last tested. Only use it with accounts whose histories you are allowed to combine.
 
 ## Install
+
+### Ask Claude to install it
 
 Open Claude Code on your Mac, for example the **Code** tab in the Claude app, and paste this:
 
@@ -31,27 +42,18 @@ Your own Claude does the rest, and nothing is installed until you say yes:
 
 The install never quits or changes the Claude app, so your chat stays open. [INSTALL.md](INSTALL.md) is the guide Claude follows, with every command in it. To update, paste the same sentence again.
 
-### What it puts on your Mac
+### Download for Mac
 
-| What | Where |
-|---|---|
-| The tool, its backups and its history | `~/Library/Application Support/ClaudeSessionSync` |
-| Its settings | `~/.config/claude-session-sync` |
-| A login item that starts the background helper and the **Sync** menu-bar item | `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist` |
-| The share-artifacts skill, if you say yes | `~/.claude/skills/share-artifacts` |
+[![Download for Mac](https://img.shields.io/badge/Download_for_Mac-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/djahlor/claude-session-sync/releases/latest/download/Claude-Session-Sync.zip)
 
-- It copies Claude Code's chats, groups and routines between your accounts' folders on this Mac, so each account sees the same chats. It keeps recovery backups of what it changes.
-- It never reads your passwords, your Keychain or your Claude login. It has no account, no server and no tracking. Nothing leaves your Mac.
-- It needs no Mac password. macOS may show a note that a background item was added. That is the Sync helper.
-- It needs macOS, the [Claude desktop app](https://claude.ai/download) and Apple's Command Line Tools, which build the helper on your Mac. macOS offers to install them when they are missing.
+1. Click the button, then open the ZIP in your Downloads folder.
+2. Double-click `Install Claude Session Sync.command`. macOS says it cannot check the file, as it does for any download Apple has not reviewed. Open System Settings, then **Privacy & Security**, scroll down and click **Open Anyway** ([Apple's guide](https://support.apple.com/en-us/102445)).
+3. Choose **1**, recommended: every account you sign in to joins by itself. Choose **2** to approve each new account yourself.
 
-To remove it, paste this into Claude Code. Your history and backups stay unless you ask Claude to delete them.
+<details>
+<summary><b>In Terminal</b>, with one command or with Homebrew</summary>
 
-```text
-Remove Claude Session Sync from my Mac. Follow INSTALL.md at github.com/djahlor/claude-session-sync.
-```
-
-### In Terminal
+#### One command
 
 ```sh
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)"
@@ -63,13 +65,32 @@ It does the same install and asks the same two questions in Terminal. Press Ente
 zsh -c "$(curl -fsSL https://raw.githubusercontent.com/djahlor/claude-session-sync/main/get.sh)" - --stop-artifact-warnings --share-skill
 ```
 
-`--no-stop-artifact-warnings` and `--no-share-skill` answer no, and are saved the same way.
+`--no-stop-artifact-warnings` and `--no-share-skill` answer no, and are saved the same way. The same command updates it.
 
-### Without Terminal
+#### Homebrew
 
-1. [Download the ZIP](https://github.com/djahlor/claude-session-sync/archive/refs/heads/main.zip) and unzip it.
-2. Double-click `Install Claude Session Sync.command`. If macOS blocks it, open System Settings, then Privacy & Security, and click **Open Anyway**.
-3. Choose **1** for automatic sync, or **2** to approve each new account yourself.
+If you already use [Homebrew](https://brew.sh):
+
+```sh
+brew install djahlor/tap/claude-session-sync
+claude-session-sync install
+```
+
+The second line builds the background helper and asks the same questions. It takes the same options after `install`. To update, run `brew upgrade claude-session-sync`, then `claude-session-sync install` again. With Homebrew, the [commands](#commands) work as plain `claude-session-sync`, for example `claude-session-sync status`.
+
+</details>
+
+### What it puts on your Mac
+
+| What | Where |
+|---|---|
+| The tool, its backups and its history | `~/Library/Application Support/ClaudeSessionSync` |
+| Its settings | `~/.config/claude-session-sync` |
+| A login item that starts the background helper and the **Sync** menu-bar item | `~/Library/LaunchAgents/com.claude-session-sync.watcher.plist` |
+| The share-artifacts skill, if you say yes | `~/.claude/skills/share-artifacts` |
+
+- It needs no Mac password. macOS may show a note that a background item was added. That is the Sync helper.
+- It needs macOS, the [Claude desktop app](https://claude.ai/download) and Apple's Command Line Tools, which build the helper on your Mac. macOS offers to install them when they are missing.
 
 ## What it syncs
 
@@ -176,11 +197,21 @@ css="$HOME/Library/Application Support/ClaudeSessionSync/bin/claude-session-sync
 
 All commands and recovery steps are in the [technical reference](docs/technical-reference.md).
 
-## Update and uninstall
+## Update
 
-Paste the install sentence into Claude Code again, or run the Terminal command again. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
+Paste the install sentence into Claude Code again, or run the Terminal command again. With Homebrew, run `brew upgrade claude-session-sync`, then `claude-session-sync install`. Your sync history, backups and main account stay as they are, and Claude stays open. Pulling the repository alone does not update the installed helper. [CHANGELOG.md](CHANGELOG.md) lists what each version changed, and [Releases](https://github.com/djahlor/claude-session-sync/releases) has each version to download.
 
-To remove it, paste the remove sentence from [Install](#install) into Claude Code, or run `"$css" uninstall --apply`. That also takes the [artifact warning](#artifact-warnings) switch out of `settings.json` if sync put it there. Your history and backups stay in `~/Library/Application Support/ClaudeSessionSync`, and the skill stays in `~/.claude/skills/share-artifacts`; delete those folders to remove them too.
+## Remove it
+
+Paste this into Claude Code:
+
+```text
+Remove Claude Session Sync from my Mac. Follow INSTALL.md at github.com/djahlor/claude-session-sync.
+```
+
+In Terminal, run `"$css" uninstall --apply` from [Commands](#commands). With Homebrew, run `claude-session-sync uninstall --apply`, then `brew uninstall claude-session-sync`.
+
+It removes the background helper and the **Sync** menu-bar item. It also takes the [artifact warning](#artifact-warnings) switch out of `settings.json` if sync put it there. The chats it copied stay in each account. Its history and backups stay in `~/Library/Application Support/ClaudeSessionSync`, and the skill stays in `~/.claude/skills/share-artifacts`, unless you ask Claude to delete them or delete those folders yourself.
 
 ## If something goes wrong
 
