@@ -93,7 +93,7 @@ from .layout_records import (  # noqa: F401  the module's public names stay impo
     transform_layout_records,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
-from .processes import managed_processes
+from .processes import PROCESS_PROBE_TIMEOUT_SECONDS, managed_processes
 from .record_journal import (
     RecordJournal,
     RecordJournalError,
@@ -179,7 +179,9 @@ class LayoutSynchronizer:
         self.helper = Path(helper or config.state_dir.parent / "bin" / "layoutdb")
         self.process_probe = process_probe or (
             lambda: managed_processes(
-                config.profiles, executable=config.claude_executable, timeout=5
+                config.profiles,
+                executable=config.claude_executable,
+                timeout=PROCESS_PROBE_TIMEOUT_SECONDS,
             )
         )
 

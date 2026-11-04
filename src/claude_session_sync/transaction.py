@@ -107,7 +107,8 @@ class TransactionEngine:
         self.retention = retention
         # Checked before every write, cheaper than process_probe. True ends the
         # run there and keeps what it wrote, as a run cut short: a rollback
-        # would need Claude closed.
+        # would need Claude closed. The receipt then says "interrupted", never
+        # "committed", so a caller cannot take part of a plan for all of it.
         self.write_guard = write_guard
 
     def apply(self, plan: Any) -> RunReceipt:
@@ -131,7 +132,10 @@ class TransactionEngine:
                     f"{len(pending)} run(s) require recovery before apply"
                 )
             receipt = self._apply_locked(plan)
-            if self.retention is not None and receipt.status == "committed":
+            if self.retention is not None and receipt.status in (
+                "committed",
+                "interrupted",
+            ):
                 prune_terminal_runs(self.state_root, self.retention)
             return receipt
 
@@ -232,8 +236,10 @@ class TransactionEngine:
             self._transition(journal, "COMMITTING")
             self._verify_destinations_unchanged(journal.records)
             self._ensure_apps_stopped()
+            stopped = False
             for record in journal.records:
                 if self.write_guard is not None and self.write_guard():
+                    stopped = True
                     break
                 destination = Path(record["destination"])
                 kind = record["kind"]
@@ -265,7 +271,7 @@ class TransactionEngine:
                     )
             receipt = RunReceipt(
                 run_id=run_id,
-                status="committed",
+                status="interrupted" if stopped else "committed",
                 plan_id=plan.plan_id,
                 operation_count=len(applied),
                 bytes_copied=sum(
@@ -283,6 +289,7 @@ class TransactionEngine:
                     "status": receipt.status,
                     "plan_id": receipt.plan_id,
                     "operation_count": receipt.operation_count,
+                    "planned_count": len(journal.records),
                     "bytes_copied": receipt.bytes_copied,
                 },
             )

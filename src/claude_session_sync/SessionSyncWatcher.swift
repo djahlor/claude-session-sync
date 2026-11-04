@@ -676,8 +676,23 @@ private final class SessionSyncWatcher: NSObject {
             }
             return
           }
+          if mode == "after-account-switch" {
+            // Claude closed during the switch: on 04-11-2026 it quit to
+            // install an update at the sign-in. The switch's sync is still
+            // owed, so it runs now and leaves Claude as it is.
+            self.switchAfterQuit = true
+            self.pending = false
+            do { try self.saveRestartState() } catch {
+              self.restartFailed("Could not save account-switch status.")
+              return
+            }
+            self.showStatus("Account changed while Claude was closed. Syncing it now.")
+            self.startAutoIfNeeded()
+            return
+          }
           self.noteRestartSkipped("claude-not-open")
           self.showStatus("Claude is not open, so it was not restarted.", banner: true)
+          self.runPendingIfNeeded()
           return
         }
         let approvedPIDs: Set<pid_t>
@@ -709,6 +724,8 @@ private final class SessionSyncWatcher: NSObject {
           return
         }
         self.restartRequested = true
+        // The switch syncs everything itself, so a queued sync is not needed.
+        self.pending = false
         self.restartMode = mode
         let attempt = UUID()
         self.restartAttempt = attempt
@@ -733,13 +750,34 @@ private final class SessionSyncWatcher: NSObject {
     writeStatus(exitStatus: 0, output: data, launchFailed: false)
   }
 
-  private func restartFailed(_ message: String, reason: String = "restart-failed") {
+  private func restartFailed(_ message: String, reason: String = "restart-failed",
+                             steps: [String: String] = [:]) {
     restartRequested = false
     restartPhase = "needs-attention"
     try? saveRestartState()
-    let data = (try? JSONSerialization.data(withJSONObject: ["progress": "needs-attention", "reason": reason])) ?? Data()
+    var document: [String: Any] = ["progress": "needs-attention", "reason": reason]
+    if !steps.isEmpty { document["steps"] = steps }
+    let data = (try? JSONSerialization.data(withJSONObject: document)) ?? Data()
     writeStatus(exitStatus: 1, output: data, launchFailed: false)
     notify("Sync needs attention. " + message)
+  }
+
+  // Each part of a sync result that did not finish, with its reason. The
+  // status then says what to look at instead of only that a restart failed.
+  private func unfinishedSteps(_ result: [String: Any]?) -> [String: String] {
+    guard let result = result else { return [:] }
+    let finished: Set<String> = ["committed", "noop", "synced", "disabled", "per-account",
+                                 "done", "ok", "saved", "restored", "cleared", "not-needed"]
+    var steps: [String: String] = [:]
+    if let state = result["state"] as? String, !finished.contains(state) {
+      steps["chats"] = result["reason"] as? String ?? state
+    }
+    for (name, value) in result {
+      guard let part = value as? [String: Any], let state = part["state"] as? String,
+        !finished.contains(state) else { continue }
+      steps[name] = part["reason"] as? String ?? state
+    }
+    return steps
   }
 
   func requestAuto(afterQuit: Bool = false) {
@@ -829,10 +867,14 @@ private final class SessionSyncWatcher: NSObject {
       restartMode = nil
     }
     if restarting && (exitStatus != 0 || progress != "finished") {
-      // The switch command reopens Claude even when its sync fails.
-      restartFailed(result?["launch"] as? String == "started"
+      // The switch command reopens Claude even when its sync fails. Then the
+      // restart worked and only part of the sync did not.
+      let reopened = result?["launch"] as? String == "started"
+      restartFailed(reopened
         ? "Sync needs attention. Claude is reopening."
-        : "Sync needs attention. Claude was not reopened.")
+        : "Sync needs attention. Claude was not reopened.",
+        reason: reopened ? "sync-incomplete" : "restart-failed",
+        steps: unfinishedSteps(result))
       runPendingIfNeeded()
       return
     }
@@ -885,8 +927,9 @@ private final class SessionSyncWatcher: NSObject {
   // a queued sync is not needed.
   private func runQueuedWork(restarting: Bool) {
     if restartPending && !restarting {
+      // A queued sync stays queued until Claude is asked to quit: a restart
+      // that finds Claude closed still runs it.
       restartPending = false
-      pending = false
       let mode = pendingRestartMode
       pendingRestartMode = nil
       beginRestart(mode: mode)

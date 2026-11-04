@@ -29,6 +29,7 @@ from .config_commands import (
 from .filesystem import normalized_path
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
 from .model import Plan
+from .processes import PROCESS_PROBE_TIMEOUT_SECONDS
 from .progress import current_progress, finish_progress, record_progress
 
 ConfigLoader = Callable[[Path], Config]
@@ -38,7 +39,6 @@ InstallerFactory = Callable[[Path], Any]
 LayoutFactory = Callable[[Config], Any]
 RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
-PROCESS_PROBE_TIMEOUT_SECONDS = 15.0
 SWITCH_WRITER_WAIT_SECONDS = 15.0
 # While this file exists the Sync helper quits a Claude opened mid-switch.
 SWITCH_GUARD_NAME = "switch-guard"
@@ -127,21 +127,31 @@ def _default_picture_factory(config: Config) -> Any:
     return PictureFixer(config)
 
 
-def _fix_chat_pictures(config: Config, deps: CliDependencies, payload: dict) -> None:
+def _fix_chat_pictures(
+    config: Config,
+    deps: CliDependencies,
+    payload: dict,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
     """Point sent pictures at their copy on this Mac. Reported only when it acts or fails.
 
-    It runs only on the restart after an account switch, so it reaches the
-    pictures sent before the switch: those were uploaded to another account.
-    Pictures sent later keep their upload, which Claude's phone and web views
-    need, until the next switch. It never blocks the chat sync: a failure is
-    reported and the sync goes on.
+    It runs on the restart after an account switch, and at a sign-out while
+    Claude stays signed out, so it reaches the pictures sent before the
+    switch: those were uploaded to another account. Pictures sent later keep
+    their upload, which Claude's phone and web views need, until the next
+    switch. It never blocks the chat sync: a failure is reported and the sync
+    goes on. should_stop ends the scan early; the next one goes on from there.
     """
     if not config.fix_chat_pictures:
         return
     from .adapters import save_status
 
     try:
-        receipt = deps.picture_factory(config).sync()
+        fixer = deps.picture_factory(config)
+        receipt = (
+            fixer.sync() if should_stop is None else fixer.sync(should_stop=should_stop)
+        )
         result = {
             "state": receipt.state,
             "files": receipt.file_count,
@@ -718,12 +728,18 @@ def _run_signed_out(
     then needs no restart for them. The account just left stays untouched,
     because Claude still saves its chats. The report says whether the switch
     still needs one restart, and why.
+
+    A sign-in ends it quickly, so the restart that copies what is left can
+    start: no picture scan runs after one. Claude closed at the sign-in, as
+    when it quits to install an update, holds no folder, so the writes go on.
     """
 
     from .chat_sync import ChatStateError, run_chat_sync
     from .live import (
+        SIGNED_OUT_PICTURES_SECONDS,
         SIGNED_OUT_SETTLE_SECONDS,
         KeepAccountsUnchanged,
+        StopWhenClaudeHolds,
         holds_folders,
         restart_reasons,
         signed_in_again,
@@ -777,7 +793,12 @@ def _run_signed_out(
         record_progress(config, "syncing")
         syncing = True
         engine = KeepAccountsUnchanged(
-            dependencies.live_engine_factory(config, holds, again), read_only
+            dependencies.live_engine_factory(
+                config,
+                holds,
+                StopWhenClaudeHolds(again, holds, dependencies.monotonic),
+            ),
+            read_only,
         )
         started = dependencies.clock()
         chat_run = None
@@ -808,7 +829,7 @@ def _run_signed_out(
             payload.setdefault("counts", {})["held_back"] = engine.held_back
         if chat_run is not None and chat_run.archive_waiting:
             payload["archive"] = "waiting"
-        _fix_chat_pictures(config, dependencies, payload)
+        # Claude reads routines at the next sign-in, so they go before pictures.
         payload.update(
             run_adapters(
                 config,
@@ -824,6 +845,23 @@ def _run_signed_out(
                 names=("routines",),
             )
         )
+        if payload.get("state") in ("committed", "noop") and not again():
+            # Pictures matter only to a switch with no restart, which then
+            # needs every chat synced. A sign-in or a time limit stops the
+            # scan; the next one goes on where it ended.
+            deadline = dependencies.monotonic() + SIGNED_OUT_PICTURES_SECONDS
+            _fix_chat_pictures(
+                config,
+                dependencies,
+                payload,
+                should_stop=lambda: again() or dependencies.monotonic() >= deadline,
+            )
+        elif config.fix_chat_pictures:
+            # The restart after the switch scans them, with Claude closed.
+            payload["pictures"] = {
+                "state": "deferred",
+                "reason": "signed-in" if again() else "chats-not-synced",
+            }
         payload["signed_in_during_sync"] = again()
         payload["progress"] = finish_progress(config, payload)
         reasons = restart_reasons(config, payload)

@@ -40,13 +40,15 @@ def finish_progress(config, payload: dict) -> str:
             "deferred",
             "per-account",
             "waiting",
+            # Cut short by a sign-in: the switch restart copies the rest.
+            "interrupted",
         )
         for value in outcomes
     )
     attention = attention or any(adapter.get("reporting_error") for adapter in adapters)
     if attention:
         state = "needs-attention"
-    elif payload.get("state") == "waiting" or any(
+    elif payload.get("state") in ("waiting", "interrupted") or any(
         adapter.get("state") == "deferred" for adapter in adapters
     ):
         state = "waiting-for-Claude"

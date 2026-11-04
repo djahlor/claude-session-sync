@@ -79,6 +79,9 @@ class ArchiveReport:
     archived: int = 0
     opened: int = 0
     skipped: int = 0
+    # The engine stopped before every copy was written: a sign-in during a
+    # signed-out sync. What it wrote stays; the rest waits for the next run.
+    interrupted: bool = False
 
     @property
     def copies(self) -> int:
@@ -393,7 +396,12 @@ def spread_archive_state(
         for loser in losers
     }
     archived = sum(1 for op in applied if op.destination in archiving)
-    return ArchiveReport(archived=archived, opened=len(applied) - archived), applied
+    report = ArchiveReport(
+        archived=archived,
+        opened=len(applied) - archived,
+        interrupted=receipt.status == "interrupted",
+    )
+    return report, applied
 
 
 def preview_archive_state(

@@ -4,6 +4,16 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, run the install command in the [README](README.md#install) again. Check your version with `claude-session-sync --version`.
 
+## [0.8.1] - 2026-11-04
+
+### Fixed
+
+- A switch copied no chats when Claude quit to install an update at the sign-in. The sync at sign-out saw the new account in Claude's config and stopped before its first write, though Claude was closed and no folder was in use. It then recorded the run as committed with 0 of 37 changes written. On 04-11-2026 the next account opened without 42 of its chats, and 145 more missed their newest messages. A sign-in now stops the writes only while a Claude runs, and a run stopped early reports `interrupted`, never `committed`.
+- The sync at sign-out kept running for about 10 minutes after the sign-in, scanning 10.9 GB of chat transcripts for sent pictures, and the restart for the switch waited for it. The picture scan now runs last, only while Claude is still signed out and after the chats synced. It stops at a sign-in or after 30 seconds, and saves how far it read, also when it stops or fails, so the next scan goes on from there.
+- A restart that found Claude closed did nothing. The restart for a switch waited for the sync at sign-out, Claude had closed meanwhile, so the restart was skipped and the sync queued after the quit was dropped. The switch's sync now runs with Claude closed and leaves Claude closed.
+- Routines were skipped as unsafe on a busy Mac, and the switch reported a failed restart. The check for a running Claude gave `ps` 2 seconds and one retry within 5 seconds in all; it took longer. Every such check now has 15 seconds.
+- A switch whose sync partly failed showed only `restart-failed`. The status now says `sync-incomplete` when Claude reopened, and lists each part that did not finish with its reason.
+
 ## [0.8.0] - 2026-11-03
 
 ### Added

@@ -396,6 +396,12 @@ class WatcherTests(unittest.TestCase):
             sign_out=True, signed_out_restart=True, quit_during_check=True
         )
 
+    def test_a_switch_whose_claude_closed_during_the_sign_out_sync_still_syncs(self):
+        """Claude quit to update at the sign-in, during the sync (04-11-2026)."""
+        self.live_scenario(
+            sign_out=True, signed_out_restart=True, quit_while_signed_out=True
+        )
+
     def test_groups_are_checked_only_when_they_are_the_last_restart_reason(self):
         self.live_scenario(
             sign_out=True,
@@ -454,6 +460,7 @@ class WatcherTests(unittest.TestCase):
         groups_match=False,
         restart_reasons=("groups",),
         quit_during_check=False,
+        quit_while_signed_out=False,
     ):
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
@@ -479,6 +486,7 @@ class WatcherTests(unittest.TestCase):
                 f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started'}})); raise SystemExit(1)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
                 "elif sys.argv[1] == 'signed-out-sync':\n"
+                f" if {quit_while_signed_out!r}: time.sleep(4)\n"
                 f" restart = {signed_out_restart!r}\n"
                 f" reasons = {list(restart_reasons)!r} if restart else []\n"
                 " print(json.dumps({'state': 'committed', 'progress': 'finished', 'restart': restart, 'restart_reasons': reasons}))\n"
@@ -610,6 +618,22 @@ class WatcherTests(unittest.TestCase):
                         ["signed-out-sync", "Work", "--json"], entries()[1]
                     )
                     self.assertTrue(app_running(), "a sign-out must never quit Claude")
+                    if quit_while_signed_out:
+                        # Signed in, and Claude quits to update, while it syncs.
+                        claude_config(str(uuid.uuid4()), True)
+                        subprocess.run(["/usr/bin/pkill", "-x", executable.name])
+                        self.assertTrue(
+                            wait_for(lambda: switches(), 30),
+                            "the switch's sync is still owed with Claude closed",
+                        )
+                        self.assertIn("--after-account-switch", switches()[0])
+                        self.assertIn("--no-launch", switches()[0])
+                        time.sleep(4)
+                        self.assertEqual(1, len(switches()), "no restart loop")
+                        self.assertEqual(
+                            "finished", json.loads(status.read_text())["restart_phase"]
+                        )
+                        return
                     time.sleep(2)
                     claude_config(str(uuid.uuid4()), True)
 
@@ -742,12 +766,12 @@ class WatcherTests(unittest.TestCase):
                             "Claude must reopen, even after a failed sync",
                         )
                     if fail_sync:
-                        self.assertEqual(
-                            "needs-attention",
-                            json.loads(json.loads(status.read_text())["output"])[
-                                "progress"
-                            ],
-                        )
+                        saved = json.loads(json.loads(status.read_text())["output"])
+                        self.assertEqual("needs-attention", saved["progress"])
+                        # Claude reopened: the sync, not the restart, is what
+                        # failed, and the status keeps which part did.
+                        self.assertEqual("sync-incomplete", saved["reason"])
+                        self.assertEqual({"chats": "blocked_invalid"}, saved["steps"])
                 self.assertTrue(
                     all(item[0] != "switch" for item in entries())
                     or request_restart

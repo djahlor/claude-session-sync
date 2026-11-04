@@ -27,6 +27,12 @@ from .logins import last_known_account, signed_in
 # Claude retires sessions parked for other accounts at sign-out. Their last
 # saves land within a second, so the pass waits this long before it plans.
 SIGNED_OUT_SETTLE_SECONDS = 1.0
+# The picture scan at a sign-out stops after this long. A scan from the start
+# read 10.9 GB of transcripts and ran for minutes on 04-11-2026.
+SIGNED_OUT_PICTURES_SECONDS = 30.0
+# While signed in again with Claude closed, a finding that no Claude runs is
+# trusted for this long before the next process check.
+CLOSED_RECHECK_SECONDS = 1.0
 
 # Claude's web view merges the new account's groups a few seconds after the
 # sign-in, and Chromium saves them to disk a few seconds after that.
@@ -65,6 +71,45 @@ def holds_folders(processes: Iterable[Any], data_root: Path, departing: str) -> 
     if any(normalized_path(process.user_data_dir) != root for process in processes):
         return True
     return signed_in_again(data_root, departing)
+
+
+class StopWhenClaudeHolds:
+    """The write guard of a signed-out sync: True once Claude may hold a folder.
+
+    A sign-in alone is not enough. On 04-11-2026 Claude quit to install an
+    update the moment the next account signed in and stayed closed for two
+    minutes. A guard that read only the sign-in stopped the sync before its
+    first write, with no Claude to protect the folders from. So after a
+    sign-in the guard asks whether a Claude runs, and the writes go on while
+    none does, as in a sync after a quit. A check that fails stops them.
+    """
+
+    def __init__(
+        self,
+        signed_in_again: Callable[[], bool],
+        holds: Callable[[], bool],
+        clock: Callable[[], float],
+    ) -> None:
+        self.signed_in_again = signed_in_again
+        self.holds = holds
+        self.clock = clock
+        self._closed_at: Optional[float] = None
+
+    def __call__(self) -> bool:
+        if not self.signed_in_again():
+            return False
+        now = self.clock()
+        if (
+            self._closed_at is not None
+            and now - self._closed_at < CLOSED_RECHECK_SECONDS
+        ):
+            return False
+        try:
+            held = self.holds()
+        except Exception:
+            return True
+        self._closed_at = None if held else now
+        return held
 
 
 class KeepAccountsUnchanged:

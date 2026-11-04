@@ -15,6 +15,11 @@ original id stays in the line, so the change can be undone by renaming the key
 back. Only transcripts of the Code chats this tool syncs are read, found by
 the `cliSessionId` in each chat record, and each line is read once: the
 scanned length of each transcript is kept in the state folder.
+
+The transcripts of every synced chat came to 10.9 GB on 04-11-2026, so a scan
+from the start takes minutes. A caller can stop it between lines, and the
+length scanned so far is saved when it stops or fails, so the next scan goes
+on from there instead of starting over.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from __future__ import annotations
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +49,8 @@ CLI_SESSION_ID = re.compile(
     rb'"cliSessionId"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"'
 )
 RECORD_HEAD_BYTES = 64 * 1024
+# How often a stop is checked inside one transcript.
+STOP_CHECK_BYTES = 1024 * 1024
 
 
 class PictureError(RuntimeError):
@@ -52,9 +59,19 @@ class PictureError(RuntimeError):
 
 @dataclass(frozen=True)
 class PictureReceipt:
+    # "synced", "noop", or "stopped" when should_stop ended the scan early.
     state: str
     file_count: int
     picture_count: int
+
+
+class _Stopped(Exception):
+    """should_stop asked the scan to end. Carries how far the file was read."""
+
+    def __init__(self, offset: int, pictures: int) -> None:
+        super().__init__("stopped")
+        self.offset = offset
+        self.pictures = pictures
 
 
 def claude_config_dir() -> Path:
@@ -224,8 +241,16 @@ class PictureFixer:
                 ):
                     yield path
 
-    def _fix_file(self, path: Path, start: int) -> tuple[int, int]:
-        """Rewrite qualifying lines from START. Returns (scanned length, pictures)."""
+    def _fix_file(
+        self,
+        path: Path,
+        start: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> tuple[int, int]:
+        """Rewrite qualifying lines from START. Returns (scanned length, pictures).
+
+        Raises _Stopped at a line boundary when should_stop says so.
+        """
 
         pictures = 0
         try:
@@ -236,7 +261,14 @@ class PictureFixer:
             with os.fdopen(os.dup(descriptor), "rb") as reader:
                 reader.seek(start)
                 offset = start
+                next_check = start + STOP_CHECK_BYTES
                 while True:
+                    if should_stop is not None and offset >= next_check:
+                        next_check = offset + STOP_CHECK_BYTES
+                        if should_stop():
+                            if pictures:
+                                os.fsync(descriptor)
+                            raise _Stopped(offset, pictures)
                     line = reader.readline(MAX_LINE_BYTES + 1)
                     if not line or not line.endswith(b"\n"):
                         # A line still being written waits for the next run.
@@ -258,33 +290,57 @@ class PictureFixer:
         finally:
             os.close(descriptor)
 
-    def sync(self) -> PictureReceipt:
+    def sync(self, should_stop: Callable[[], bool] | None = None) -> PictureReceipt:
+        """Scan every synced chat's transcript from where the last scan ended.
+
+        should_stop is asked before each transcript and every
+        STOP_CHECK_BYTES inside one. Whatever ends the scan early, a stop or
+        an error, the lengths read so far are saved first.
+        """
+
         offsets = self._load_offsets()
         kept: dict[str, dict[str, int]] = {}
         files = pictures = 0
-        for path in self._transcripts():
-            metadata = path.stat()
-            previous = offsets.get(str(path))
-            start = 0
-            if (
-                previous is not None
-                and previous["dev"] == metadata.st_dev
-                and previous["ino"] == metadata.st_ino
-                and previous["scanned"] <= metadata.st_size
-            ):
-                start = previous["scanned"]
-            scanned, fixed = start, 0
-            if start < metadata.st_size:
-                scanned, fixed = self._fix_file(path, start)
-            kept[str(path)] = {
-                "dev": metadata.st_dev,
-                "ino": metadata.st_ino,
-                "scanned": scanned,
-            }
-            if fixed:
-                files += 1
-                pictures += fixed
-        self._save_offsets(kept)
+        finished = False
+        try:
+            for path in self._transcripts():
+                if should_stop is not None and should_stop():
+                    return PictureReceipt("stopped", files, pictures)
+                metadata = path.stat()
+                previous = offsets.get(str(path))
+                start = 0
+                if (
+                    previous is not None
+                    and previous["dev"] == metadata.st_dev
+                    and previous["ino"] == metadata.st_ino
+                    and previous["scanned"] <= metadata.st_size
+                ):
+                    start = previous["scanned"]
+                scanned, fixed = start, 0
+                stopped = None
+                if start < metadata.st_size:
+                    try:
+                        scanned, fixed = self._fix_file(path, start, should_stop)
+                    except _Stopped as stop:
+                        stopped = stop
+                        scanned, fixed = stop.offset, stop.pictures
+                kept[str(path)] = {
+                    "dev": metadata.st_dev,
+                    "ino": metadata.st_ino,
+                    "scanned": scanned,
+                }
+                if fixed:
+                    files += 1
+                    pictures += fixed
+                if stopped is not None:
+                    return PictureReceipt("stopped", files, pictures)
+            finished = True
+        finally:
+            if not finished:
+                # Transcripts not reached keep the length read last time.
+                for key, value in offsets.items():
+                    kept.setdefault(key, value)
+            self._save_offsets(kept)
         return PictureReceipt("synced" if pictures else "noop", files, pictures)
 
     def probe(self) -> dict[str, Any]:

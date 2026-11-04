@@ -32,7 +32,7 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
 
 - **Into the signed-in account.** Claude keeps showing what it loaded, then overwrites the file from memory at the chat's next save (item 3). This is the old live sync's problem from 26-09.
 - **Into the account just left, while signed out.** Same problem: Claude still saves those chats there until the next sign-in (item 4).
-- **During the sign-in itself.** If a write lands after Claude listed the new folder, Claude keeps the old copy in memory and can save it back, for example when the chat gets focus. That old copy then looks like the newest change: it can undo an archive or a rename made in the account just left. So sync checks before every file it writes, and ends the run at the first sign that Claude signed in. Claude lists the new folder 1 to 5 seconds after the sign-in, and the check reads the same file Claude writes at the sign-in, so every write lands before that listing.
+- **During the sign-in itself.** If a write lands after Claude listed the new folder, Claude keeps the old copy in memory and can save it back, for example when the chat gets focus. That old copy then looks like the newest change: it can undo an archive or a rename made in the account just left. So sync checks before every file it writes, and ends the run at the first sign that Claude signed in while it runs. Claude lists the new folder 1 to 5 seconds after the sign-in, and the check reads the same file Claude writes at the sign-in, so every write lands before that listing.
 - **Routines of the signed-in account.** Claude rewrites the whole list from memory at its next bookkeeping write (item 8).
 - **Groups and browser logins.** Claude holds both databases open (items 10 and 11).
 
@@ -60,6 +60,29 @@ Findings of 3 November 2026, on Claude Desktop 4.4212.0 on Djahlor's Mac. Each c
   - The next closed sync wrote those 48 (44 copies and 4 archives), and the sync after it found nothing to do.
 
 - **Independent review.** A second reviewer read the whole change and found two medium issues and five small ones. All are fixed: the sync skips when another profile's Claude is open; it checks for a sign-in before every file and ends the run there instead of writing on; routines wait while an unfinished routine run needs recovery; a quit during the sync drops its result; an earlier `needs-attention` stays; a sign-in race reports `waiting` instead of a fault; and an option to let browser logins wait for the next quit was dropped, because the 15-minute snapshot could then replace the saved logins.
+
+## The first real switch, 04-11-2026 (0.8.1)
+
+The first switch on his Mac with 0.7.1 copied no chats. What his Mac and Claude's log show:
+
+| Time | What happened | Source |
+|---|---|---|
+| 00:08:11 | Sign-out. The helper starts `signed-out-sync`. | `main.log`: `Login-state transition (loggedOut: false → true …)` |
+| 00:08:48 | Sign-in to the next account, 37 seconds later. Claude quits at once to install an update (4.4212.0 to 4.16336.0). | `main.log`: the next transition, then `beforeQuitForUpdate handler fired` |
+| 00:10:23 | The sync finished planning 48,703 chat files on a busy Mac and wrote its archive run: 37 planned changes, 0 written, recorded as committed. | the run's `manifest.json` in the state folder |
+| 00:10:23 to about 00:19 | The sync scanned chat transcripts for pictures: 1,488 transcripts, 10.9 GB in all. The restart for the switch waited for it. | `ps` at 00:15: a transcript open twice for writing; `chat-pictures-offsets.json` |
+| 00:11:03 | Claude starts again after the update, signed in to the next account, without 42 of its chats. | `main.log`: `Starting app`, `Version changed` |
+| 00:24 | The restart's sync copies 2,882 files. Routines are skipped: `ps` took longer than the 2.8 seconds left of a 5 second check. | `sync-progress.json`, `code-routines-status.json` |
+
+What 0.8.1 changes:
+
+- **The guard looked only at the sign-in.** With Claude closed for the update, the engine's process check passed, then the write guard saw the new account in `config.json` and stopped before the first write. No Claude held a folder then, so the guard now asks whether a Claude runs and the writes go on while none does.
+- **A cut run said committed.** A run the guard stops now reports `interrupted`, and it counts toward the restart as `chats`.
+- **The picture scan ran after the sign-in.** It now runs last, only while Claude is still signed out and after the chats synced, stops at a sign-in or after 30 seconds, and saves how far it read even when it stops or fails.
+- **A restart that found Claude closed did nothing.** The restart waited for the sign-out sync. By then Claude was closed, so the restart was skipped and the quit sync queued behind it was dropped. A switch now runs its sync with Claude closed and leaves Claude closed.
+- **The process check gave up too soon.** Every check for a running Claude now has 15 seconds.
+
+Not confirmed: why the picture scan read so much. A transcript last changed on 25-10 was open for writing at 00:15, which happens only when its saved length is missing or old. The offsets file before that run is gone, so whether it was missing, or lost to an earlier scan that failed (that lost every length read), is not known.
 
 ## Not verified
 

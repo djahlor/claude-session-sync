@@ -279,3 +279,98 @@ class SyncStepTests(unittest.TestCase):
         self.assertEqual("committed", payload["state"])
         self.assertEqual("pictures-error", payload["pictures"]["reason"])
         self.assertEqual("skipped", status["state"])
+
+
+class InterruptedScanTests(unittest.TestCase):
+    """A scan cut short keeps what it read, so the next one goes on from there."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.projects = self.root / "projects" / "-Users-me-repo"
+        self.projects.mkdir(parents=True)
+        self.picture = self.root / "photo.png"
+        self.picture.write_bytes(b"\x89PNG" + b"0" * 96)
+        self.fixer = PictureFixer(config(self.root), root=self.root / "projects")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def chat(self, session_id, *lines):
+        folder = self.root / "Claude" / "claude-code-sessions" / "acct" / "org"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"local_{session_id[:8]}.json").write_text(
+            json.dumps({"sessionId": "local_x", "cliSessionId": session_id})
+        )
+        path = self.projects / f"{session_id}.jsonl"
+        path.write_bytes(b"".join(lines))
+        return path
+
+    def offsets(self):
+        document = json.loads((self.root / "state" / OFFSETS_FILENAME).read_text())
+        return document["files"]
+
+    def test_a_stop_saves_the_part_read_and_the_next_run_finishes(self):
+        first = self.chat(SESSION, sent(self.picture), b'{"type":"x"}\n')
+        second = self.chat(OTHER, sent(self.picture))
+        checks = []
+
+        def stop_after_first_check():
+            checks.append(True)
+            return len(checks) > 1
+
+        receipt = self.fixer.sync(should_stop=stop_after_first_check)
+
+        self.assertEqual("stopped", receipt.state)
+        files = self.offsets()
+        scanned = [path for path in (first, second) if str(path) in files]
+        self.assertEqual(1, len(scanned))
+        done = scanned[0]
+        self.assertEqual(done.stat().st_size, files[str(done)]["scanned"])
+        self.assertIn(b'"orig_uuid"', done.read_bytes())
+
+        rest = self.fixer.sync()
+
+        self.assertEqual("synced", rest.state)
+        self.assertEqual(1, rest.file_count)
+        for path in (first, second):
+            self.assertEqual(path.stat().st_size, self.offsets()[str(path)]["scanned"])
+            self.assertNotIn(b'"file_uuid"', path.read_bytes())
+
+    def test_a_stop_inside_a_long_transcript_ends_at_a_whole_line(self):
+        lines = [sent(self.picture)] + [
+            b'{"type":"x","pad":"' + b"y" * 4096 + b'"}\n'
+        ] * 600
+        path = self.chat(SESSION, *lines)
+        checks = []
+
+        def stop_on_second_check():
+            checks.append(True)
+            return len(checks) >= 2
+
+        self.assertEqual(
+            "stopped", self.fixer.sync(should_stop=stop_on_second_check).state
+        )
+
+        scanned = self.offsets()[str(path)]["scanned"]
+        self.assertGreater(scanned, 0)
+        self.assertLess(scanned, path.stat().st_size)
+        self.assertEqual(b"\n", path.read_bytes()[scanned - 1 : scanned])
+        self.assertEqual("noop", self.fixer.sync().state)
+        self.assertEqual(path.stat().st_size, self.offsets()[str(path)]["scanned"])
+
+    def test_one_transcript_that_cannot_be_opened_keeps_the_others_progress(self):
+        from claude_session_sync.pictures import PictureError
+
+        # Transcripts are read in name order: the good one comes first.
+        good = self.chat(OTHER, sent(self.picture))
+        bad = self.chat(SESSION, sent(self.picture))
+        os.chmod(bad, 0o400)
+        try:
+            with self.assertRaises(PictureError):
+                self.fixer.sync()
+        finally:
+            os.chmod(bad, 0o600)
+
+        self.assertEqual(good.stat().st_size, self.offsets()[str(good)]["scanned"])
+        self.assertNotIn(str(bad), self.offsets())

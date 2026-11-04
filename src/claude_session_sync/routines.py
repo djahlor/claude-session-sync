@@ -24,7 +24,7 @@ from .filesystem import (
     read_bounded_with_stat,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
-from .processes import managed_processes
+from .processes import PROCESS_PROBE_TIMEOUT_SECONDS, managed_processes
 from .record_journal import (
     RecordJournal,
     RecordJournalError,
@@ -595,7 +595,9 @@ class RoutineSynchronizer:
 
     def _assert_stopped(self) -> None:
         if self.process_probe(
-            self.config.profiles, executable=self.config.claude_executable, timeout=5
+            self.config.profiles,
+            executable=self.config.claude_executable,
+            timeout=PROCESS_PROBE_TIMEOUT_SECONDS,
         ):
             raise RoutineBusyError("Claude must be fully quit before syncing routines")
 
