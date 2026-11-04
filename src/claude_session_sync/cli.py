@@ -30,7 +30,12 @@ from .filesystem import normalized_path
 from .health import abandoned_preparation_count, doctor_summary, watcher_failure
 from .model import Plan
 from .processes import PROCESS_PROBE_TIMEOUT_SECONDS
-from .progress import current_progress, finish_progress, record_progress
+from .progress import (
+    current_progress,
+    finish_progress,
+    record_progress,
+    unfinished_steps,
+)
 
 ConfigLoader = Callable[[Path], Config]
 PlannerFactory = Callable[[Config], Any]
@@ -40,6 +45,9 @@ LayoutFactory = Callable[[Config], Any]
 RoutineFactory = Callable[[Config], Any]
 PROCESS_EXIT_POLL_SECONDS = 0.1
 SWITCH_WRITER_WAIT_SECONDS = 15.0
+# A picture scan that may hold up a sync stops after this long and keeps how
+# far it read. A scan from the start read 10.9 GB on 04-11-2026.
+PICTURES_SCAN_SECONDS = 30.0
 # While this file exists the Sync helper quits a Claude opened mid-switch.
 SWITCH_GUARD_NAME = "switch-guard"
 SWITCH_REOPEN_WAIT_SECONDS = 45.0
@@ -165,6 +173,27 @@ def _fix_chat_pictures(
         result["reporting_error"] = "status-write-failed"
     if result["state"] != "noop":
         payload["pictures"] = result
+
+
+def _resume_chat_pictures(config: Config, deps: CliDependencies, payload: dict) -> None:
+    """Go on with a picture scan a time limit or a sign-in stopped.
+
+    A stopped scan is no reason to restart Claude, so the next sync picks it
+    up, within the same time limit, where it ended.
+    """
+
+    from .adapters import read_status
+
+    if not config.fix_chat_pictures:
+        return
+    if read_status(config.state_dir, "chat-pictures-status.json").get("state") != (
+        "stopped"
+    ):
+        return
+    deadline = deps.monotonic() + PICTURES_SCAN_SECONDS
+    _fix_chat_pictures(
+        config, deps, payload, should_stop=lambda: deps.monotonic() >= deadline
+    )
 
 
 def _default_artifact_warnings(config: Config, running: Callable[[], bool]) -> dict:
@@ -674,8 +703,6 @@ def _run_switch(
                 config, dependencies, running, **sidebar_options
             )
             payload = _switch_chat_result(config, dependencies)
-            if getattr(arguments, "after_account_switch", False):
-                _fix_chat_pictures(config, dependencies, payload)
             payload.update(
                 run_adapters(
                     config,
@@ -708,8 +735,15 @@ def _run_switch(
             return 1
         if not arguments.no_launch:
             payload["launch"] = "started"
+        if getattr(arguments, "after_account_switch", False):
+            # After Claude reopened: the scan read 10.9 GB on 04-11-2026, and
+            # its same-length rewrites in place are safe while Claude appends.
+            _fix_chat_pictures(config, dependencies, payload)
         if browser_logins is not None and browser_logins["state"] != "disabled":
             payload["browser_logins"] = browser_logins
+        steps = unfinished_steps(payload)
+        if steps:
+            payload["steps"] = steps
         _write(payload, as_json=as_json, stream=output)
         return 0 if payload["progress"] == "finished" else 1
     finally:
@@ -736,7 +770,6 @@ def _run_signed_out(
 
     from .chat_sync import ChatStateError, run_chat_sync
     from .live import (
-        SIGNED_OUT_PICTURES_SECONDS,
         SIGNED_OUT_SETTLE_SECONDS,
         KeepAccountsUnchanged,
         StopWhenClaudeHolds,
@@ -849,7 +882,7 @@ def _run_signed_out(
             # Pictures matter only to a switch with no restart, which then
             # needs every chat synced. A sign-in or a time limit stops the
             # scan; the next one goes on where it ended.
-            deadline = dependencies.monotonic() + SIGNED_OUT_PICTURES_SECONDS
+            deadline = dependencies.monotonic() + PICTURES_SCAN_SECONDS
             _fix_chat_pictures(
                 config,
                 dependencies,
@@ -1463,6 +1496,7 @@ def _run_sync(arguments, config: Config, deps: CliDependencies, output: TextIO) 
             payload["browser_logins"] = browser_logins
         _report_artifact_warnings(artifact_warnings, payload)
         payload["progress"] = finish_progress(config, payload)
+        _resume_chat_pictures(config, deps, payload)
         _write(payload, as_json=arguments.as_json, stream=output)
         return _exit_code(arguments, payload["progress"])
     except Exception:

@@ -152,8 +152,10 @@ class SignedOutSyncTests(ChatCliFixture):
 
         def guard_then_sign_in(config, holds, signed_in_again):
             def again():
+                # The first check comes before staging, the second before the
+                # first write.
                 checks.append(True)
-                if len(checks) == 2:
+                if len(checks) == 3:
                     self.sign_in(B_ACCOUNT)
                 return signed_in_again()
 

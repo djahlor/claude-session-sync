@@ -79,8 +79,9 @@ class SignInDuringSignedOutSyncTests(ChatCliFixture):
 
         def engine(config, holds, guard):
             def sign_in_at_the_second_write():
+                # Checks: before staging, before write 1, before write 2.
                 checks.append(True)
-                if len(checks) == 2:
+                if len(checks) == 3:
                     self.sign_in(B_ACCOUNT)
                 return guard()
 
@@ -141,6 +142,32 @@ class SignInDuringSignedOutSyncTests(ChatCliFixture):
         self.assertEqual("committed", payload["state"])
         self.assertIsNotNone(self.read(self.b, X))
         self.assertEqual("stopped", payload["pictures"]["state"])
+
+    def test_an_archive_pass_cut_short_skips_the_chat_plan(self):
+        from claude_session_sync.chat_sync import run_chat_sync
+        from claude_session_sync.model import RunReceipt
+        from claude_session_sync.planner import Planner
+
+        self.write(self.a, X, isArchived=True)
+        self.write(self.b, X, isArchived=False)
+        self.write(self.a, Y)
+        plans = []
+
+        class CutAtTheFirstWrite:
+            def apply(_self, plan):
+                plans.append(plan)
+                return RunReceipt(None, "interrupted", plan.plan_id, 0, 0, ())
+
+            def close_interrupted_runs(_self):
+                return 0
+
+        run = run_chat_sync(
+            self.config, Planner(app_log=self.app_log), CutAtTheFirstWrite()
+        )
+
+        self.assertEqual(1, len(plans), "only the archive pass reached the engine")
+        self.assertEqual("interrupted", run.receipt.status)
+        self.assertIsNone(self.read(self.b, Y))
 
     def test_an_archive_change_cut_short_is_not_remembered(self):
         from claude_session_sync.chat_sync import run_chat_sync
@@ -228,10 +255,29 @@ class ProcessCheckOnABusyMacTests(ChatCliFixture):
 
         self.assertGreaterEqual(max(calls), 3.5)
 
-    def test_every_claude_check_shares_one_budget(self):
+    def test_the_helpers_restart_check_outlasts_the_process_check(self):
+        """The helper kills restart-check after Limits.restartCheckSeconds.
+
+        It must outlast the CLI's own process check, or a slow `ps` is killed
+        before it can answer (10 seconds against 15 until 0.8.1).
+        """
+        import re
+
         from claude_session_sync.processes import PROCESS_PROBE_TIMEOUT_SECONDS
 
-        self.assertGreaterEqual(PROCESS_PROBE_TIMEOUT_SECONDS, 15.0)
+        source = (
+            Path(__file__).parents[1]
+            / "src/claude_session_sync/SessionSyncWatcher.swift"
+        ).read_text()
+        probe = re.search(r"static let processProbeSeconds = ([0-9.]+)", source)
+        startup = re.search(r"static let interpreterStartupSeconds = ([0-9.]+)", source)
+        check = re.search(r"static let restartCheckSeconds = (.+)", source)
+        self.assertIsNotNone(probe and startup and check)
+        self.assertEqual(PROCESS_PROBE_TIMEOUT_SECONDS, float(probe.group(1)))
+        self.assertEqual(
+            "processProbeSeconds + interpreterStartupSeconds", check.group(1).strip()
+        )
+        self.assertGreaterEqual(float(startup.group(1)), 5.0)
 
 
 class StopWhenClaudeHoldsTests(unittest.TestCase):
@@ -248,6 +294,19 @@ class StopWhenClaudeHoldsTests(unittest.TestCase):
             return holds()
 
         return StopWhenClaudeHolds(signed_in, counted, lambda: self.now)
+
+    def test_a_slow_process_check_is_trusted_from_when_it_returned(self):
+        def slow_ps_finds_claude_closed():
+            self.now += 3.0
+            return False
+
+        guard = self.guard(lambda: True, slow_ps_finds_claude_closed)
+
+        self.assertFalse(guard())
+        self.assertFalse(guard())
+        self.assertEqual(
+            1, self.checks, "a 3 second ps must not run before every write"
+        )
 
     def test_still_signed_out_it_never_looks_for_claude(self):
         guard = self.guard(lambda: False, lambda: self.fail("no process check"))

@@ -49,8 +49,10 @@ CLI_SESSION_ID = re.compile(
     rb'"cliSessionId"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"'
 )
 RECORD_HEAD_BYTES = 64 * 1024
-# How often a stop is checked inside one transcript.
+# How often a stop is checked inside one transcript, and while chat records
+# are read for their session ids.
 STOP_CHECK_BYTES = 1024 * 1024
+STOP_CHECK_RECORDS = 500
 
 
 class PictureError(RuntimeError):
@@ -205,15 +207,28 @@ class PictureFixer:
         )
         os.chmod(path, 0o600)
 
-    def _synced_chat_ids(self) -> set:
-        """The Claude Code session ids of the chats in every synced account folder."""
+    def _synced_chat_ids(self, should_stop: Callable[[], bool] | None = None) -> set:
+        """The Claude Code session ids of the chats in every synced account folder.
+
+        Reads the head of every chat record, 48,703 files on 04-11-2026, so
+        should_stop is asked every STOP_CHECK_RECORDS records; it raises
+        _Stopped.
+        """
 
         ids, seen = set(), set()
+        listed = 0
         for profile in self.config.profiles:
             sessions = profile.data_root / "claude-code-sessions"
             if sessions.is_symlink() or not sessions.is_dir():
                 continue
             for record in sessions.glob("*/*/local_*.json"):
+                listed += 1
+                if (
+                    should_stop is not None
+                    and listed % STOP_CHECK_RECORDS == 0
+                    and should_stop()
+                ):
+                    raise _Stopped(0, 0)
                 if record.name in seen or record.is_symlink() or not record.is_file():
                     continue
                 seen.add(record.name)
@@ -226,8 +241,10 @@ class PictureFixer:
                     ids.add(match.group(1).decode("ascii").lower())
         return ids
 
-    def _transcripts(self) -> Iterator[Path]:
-        ids = self._synced_chat_ids()
+    def _transcripts(
+        self, should_stop: Callable[[], bool] | None = None
+    ) -> Iterator[Path]:
+        ids = self._synced_chat_ids(should_stop)
         if not ids or self.root.is_symlink() or not self.root.is_dir():
             return
         for project in sorted(self.root.iterdir()):
@@ -293,17 +310,24 @@ class PictureFixer:
     def sync(self, should_stop: Callable[[], bool] | None = None) -> PictureReceipt:
         """Scan every synced chat's transcript from where the last scan ended.
 
-        should_stop is asked before each transcript and every
-        STOP_CHECK_BYTES inside one. Whatever ends the scan early, a stop or
-        an error, the lengths read so far are saved first.
+        should_stop is asked while chat records are read, before each
+        transcript and every STOP_CHECK_BYTES inside one. Whatever ends the
+        scan early, a stop or an error, the lengths read so far are saved
+        first. A transcript that cannot be opened or updated is passed over,
+        so it never holds up the others, and the scan then raises
+        PictureError after saving.
         """
 
         offsets = self._load_offsets()
         kept: dict[str, dict[str, int]] = {}
-        files = pictures = 0
+        files = pictures = failed = 0
         finished = False
         try:
-            for path in self._transcripts():
+            try:
+                transcripts = list(self._transcripts(should_stop))
+            except _Stopped:
+                return PictureReceipt("stopped", files, pictures)
+            for path in transcripts:
                 if should_stop is not None and should_stop():
                     return PictureReceipt("stopped", files, pictures)
                 metadata = path.stat()
@@ -324,6 +348,12 @@ class PictureFixer:
                     except _Stopped as stop:
                         stopped = stop
                         scanned, fixed = stop.offset, stop.pictures
+                    except PictureError:
+                        # Keeps the length read last time; tried again next scan.
+                        failed += 1
+                        if previous is not None:
+                            kept[str(path)] = previous
+                        continue
                 kept[str(path)] = {
                     "dev": metadata.st_dev,
                     "ino": metadata.st_ino,
@@ -341,6 +371,8 @@ class PictureFixer:
                 for key, value in offsets.items():
                     kept.setdefault(key, value)
             self._save_offsets(kept)
+        if failed:
+            raise PictureError(f"{failed} chat transcript(s) could not be updated")
         return PictureReceipt("synced" if pictures else "noop", files, pictures)
 
     def probe(self) -> dict[str, Any]:

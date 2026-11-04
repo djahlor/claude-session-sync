@@ -76,11 +76,11 @@ The first switch on his Mac with 0.7.1 copied no chats. What his Mac and Claude'
 
 What 0.8.1 changes:
 
-- **The guard looked only at the sign-in.** With Claude closed for the update, the engine's process check passed, then the write guard saw the new account in `config.json` and stopped before the first write. No Claude held a folder then, so the guard now asks whether a Claude runs and the writes go on while none does.
+- **The guard looked only at the sign-in.** With Claude closed for the update, the engine's process check passed, then the write guard saw the new account in `config.json` and stopped before the first write. No Claude held a folder then, so the guard now asks whether a Claude runs and the writes go on while none does. It runs before staging too, and once more after the last write.
 - **A cut run said committed.** A run the guard stops now reports `interrupted`, and it counts toward the restart as `chats`.
-- **The picture scan ran after the sign-in.** It now runs last, only while Claude is still signed out and after the chats synced, stops at a sign-in or after 30 seconds, and saves how far it read even when it stops or fails.
-- **A restart that found Claude closed did nothing.** The restart waited for the sign-out sync. By then Claude was closed, so the restart was skipped and the quit sync queued behind it was dropped. A switch now runs its sync with Claude closed and leaves Claude closed.
-- **The process check gave up too soon.** Every check for a running Claude now has 15 seconds.
+- **The picture scan ran after the sign-in.** It now runs last, only while Claude is still signed out and after the chats synced, stops at a sign-in or after 30 seconds, and saves how far it read even when it stops or fails. The scan after a switch runs once Claude has reopened.
+- **A restart that found Claude closed did nothing.** The restart waited for the sign-out sync. By then Claude was closed, so the restart was skipped and the quit sync queued behind it was dropped. The switch's sync now runs as the restart's own sync, so the Claude the updater opened at 00:11:03 would be asked to quit and opened again after the sync.
+- **The process check gave up too soon.** Every check for a running Claude now has 15 seconds, and the helper waits 25 for its restart check instead of 10.
 
 Not confirmed: why the picture scan read so much. A transcript last changed on 25-10 was open for writing at 00:15, which happens only when its saved length is missing or old. The offsets file before that run is gone, so whether it was missing, or lost to an earlier scan that failed (that lost every length read), is not known.
 

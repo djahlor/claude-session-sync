@@ -402,6 +402,22 @@ class WatcherTests(unittest.TestCase):
             sign_out=True, signed_out_restart=True, quit_while_signed_out=True
         )
 
+    def test_a_claude_that_reopens_during_that_sync_is_quit_and_the_chats_arrive(self):
+        """The updater opened Claude again two minutes later, at 00:11:03."""
+        self.live_scenario(
+            sign_out=True,
+            signed_out_restart=True,
+            quit_while_signed_out=True,
+            relaunch_during_switch=True,
+        )
+
+    def test_a_switch_stopped_by_an_open_claude_restarts_again(self):
+        self.live_scenario(request_restart=True, switch_claude_open_once=True)
+
+    def test_a_restart_check_slower_than_the_old_watchdog_still_restarts(self):
+        """`ps` on a busy Mac may use the CLI's whole process check budget."""
+        self.live_scenario(request_restart=True, slow_restart_check=True)
+
     def test_groups_are_checked_only_when_they_are_the_last_restart_reason(self):
         self.live_scenario(
             sign_out=True,
@@ -461,7 +477,12 @@ class WatcherTests(unittest.TestCase):
         restart_reasons=("groups",),
         quit_during_check=False,
         quit_while_signed_out=False,
+        relaunch_during_switch=False,
+        switch_claude_open_once=False,
+        slow_restart_check=False,
     ):
+        from claude_session_sync.processes import PROCESS_PROBE_TIMEOUT_SECONDS
+
         with tempfile.TemporaryDirectory(prefix="account-restart-test-") as directory:
             root = Path(directory)
             app, executable = self.fake_claude(root)
@@ -477,13 +498,27 @@ class WatcherTests(unittest.TestCase):
                 f"calls = pathlib.Path({str(calls)!r})\n"
                 "if sys.argv[1] == 'restart-check':\n"
                 f" if {block_preflight!r}: print('invalid'); raise SystemExit(1)\n"
+                f" if {slow_restart_check!r}: time.sleep({PROCESS_PROBE_TIMEOUT_SECONDS!r})\n"
                 f" result = subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], text=True, capture_output=True)\n"
                 " print(json.dumps({'state': 'ready', 'pids': [int(pid) for pid in result.stdout.split()]})); raise SystemExit(0)\n"
                 "with calls.open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "if sys.argv[1] == 'switch':\n"
                 f" assert subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], stdout=subprocess.DEVNULL).returncode == 1, 'sync ran before app exited'\n"
+                " first = sum(json.loads(line)[0] == 'switch' for line in calls.read_text().splitlines()) == 1\n"
+                f" def running(): return subprocess.run(['/usr/bin/pgrep', '-f', {str(executable)!r}], stdout=subprocess.DEVNULL).returncode == 0\n"
+                f" if {relaunch_during_switch!r} and first:\n"
+                # As the real sync tool: the guard file asks the helper to quit a Claude that opens.
+                f"  guard = pathlib.Path({str(root / 'switch-guard')!r}); guard.write_text('switch')\n"
+                f"  subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
+                "  deadline = time.time() + 25\n"
+                "  while time.time() < deadline and not running(): time.sleep(0.1)\n"
+                "  while time.time() < deadline and running(): time.sleep(0.1)\n"
+                "  guard.unlink()\n"
+                "  if running(): print(json.dumps({'state': 'failed', 'reason': 'claude-open', 'progress': 'needs-attention'})); raise SystemExit(1)\n"
+                f"  pathlib.Path({str(root / 'chats-arrived')!r}).write_text('yes')\n"
                 f" if '--no-launch' not in sys.argv: subprocess.run(['/usr/bin/open', {str(app)!r}], check=True)\n"
-                f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started'}})); raise SystemExit(1)\n"
+                f" if {switch_claude_open_once!r} and first: print(json.dumps({{'state': 'failed', 'reason': 'claude-open', 'progress': 'needs-attention', 'launch': 'started', 'steps': {{'chats': 'claude-open'}}}})); raise SystemExit(1)\n"
+                f" if {fail_sync!r}: print(json.dumps({{'state': 'blocked_invalid', 'progress': 'needs-attention', 'launch': 'started', 'steps': {{'chats': 'blocked_invalid'}}}})); raise SystemExit(1)\n"
                 " print(json.dumps({'state': 'noop', 'progress': 'finished', 'launch': 'started'}))\n"
                 "elif sys.argv[1] == 'signed-out-sync':\n"
                 f" if {quit_while_signed_out!r}: time.sleep(4)\n"
@@ -627,7 +662,14 @@ class WatcherTests(unittest.TestCase):
                             "the switch's sync is still owed with Claude closed",
                         )
                         self.assertIn("--after-account-switch", switches()[0])
-                        self.assertIn("--no-launch", switches()[0])
+                        # Quit, sync, reopen: the user is mid-switch.
+                        self.assertNotIn("--no-launch", switches()[0])
+                        if relaunch_during_switch:
+                            self.assertTrue(
+                                wait_for((root / "chats-arrived").exists, 40),
+                                "a Claude opened mid-sync must be quit so the sync ends",
+                            )
+                        self.assertTrue(wait_for(app_running, 30), "Claude must reopen")
                         time.sleep(4)
                         self.assertEqual(1, len(switches()), "no restart loop")
                         self.assertEqual(
@@ -736,9 +778,13 @@ class WatcherTests(unittest.TestCase):
                     )
                     self.assertTrue(
                         finished,
-                        f"the restart request must be handled: {status.read_text()} {entries()}",
+                        f"the restart request must be handled: {status.read_text() if status.exists() else ''} {entries()}",
                     )
-                    expected = 0 if block_preflight else 1
+                    expected = (
+                        0 if block_preflight else 2 if switch_claude_open_once else 1
+                    )
+                    if switch_claude_open_once:
+                        wait_for(lambda: len(switches()) >= 2, 30)
                     time.sleep(4)
                     self.assertEqual(
                         expected, sum(item[0] == "switch" for item in entries())

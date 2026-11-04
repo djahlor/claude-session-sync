@@ -362,9 +362,9 @@ class InterruptedScanTests(unittest.TestCase):
     def test_one_transcript_that_cannot_be_opened_keeps_the_others_progress(self):
         from claude_session_sync.pictures import PictureError
 
-        # Transcripts are read in name order: the good one comes first.
-        good = self.chat(OTHER, sent(self.picture))
-        bad = self.chat(SESSION, sent(self.picture))
+        # Transcripts are read in name order: the bad one comes first.
+        bad = self.chat(OTHER, sent(self.picture))
+        good = self.chat(SESSION, sent(self.picture))
         os.chmod(bad, 0o400)
         try:
             with self.assertRaises(PictureError):
@@ -373,4 +373,28 @@ class InterruptedScanTests(unittest.TestCase):
             os.chmod(bad, 0o600)
 
         self.assertEqual(good.stat().st_size, self.offsets()[str(good)]["scanned"])
+        self.assertIn(b'"orig_uuid"', good.read_bytes())
         self.assertNotIn(str(bad), self.offsets())
+
+    def test_a_stop_while_chat_records_are_read_keeps_the_saved_lengths(self):
+        from claude_session_sync import pictures
+
+        path = self.chat(SESSION, sent(self.picture))
+        self.assertEqual("synced", self.fixer.sync().state)
+        saved = self.offsets()
+        with open(path, "ab") as stream:
+            stream.write(sent(self.picture))
+        for number in range(pictures.STOP_CHECK_RECORDS + 1):
+            self.chat(f"{number:08d}-0000-4000-8000-000000000000")
+        asked = []
+
+        def stop_while_reading_records():
+            asked.append(True)
+            return True
+
+        receipt = self.fixer.sync(should_stop=stop_while_reading_records)
+
+        self.assertEqual("stopped", receipt.state)
+        self.assertEqual(1, len(asked), "stopped while reading records")
+        self.assertEqual(saved, self.offsets())
+        self.assertIn(b'"file_uuid"', path.read_bytes())

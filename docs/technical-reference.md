@@ -543,23 +543,26 @@ the watcher runs `signed-out-sync <profile> --json`:
   manifest together, so they wait whole when that account's manifest would
   change (`deferred`, `account-still-open`) or an unfinished routine run
   waits for recovery (`deferred`, `recovery-pending`).
-- Before every file it writes, it checks that `windowSizeWasSignedIn` is
-  still `false` and `lastKnownAccountUuid` still names the account just left.
-  At the first sign of a sign-in it checks whether a Claude runs. If one does,
-  it ends the run and keeps what it wrote, reported as `state=interrupted`
-  with `operations` and `planned` counts, so the restart copies the rest. If
-  none does, as when Claude quits to install an update at the sign-in, no
-  folder is in use and the writes go on, like a sync after a quit, with a new
-  process check at most once a second. A failed check ends the run. A
-  sign-in with Claude open before the first write reports `state=waiting`,
-  `reason=signed-in`. An archive pass cut short is not remembered, so the
-  next run still spreads it (`archive=waiting`).
+- Before it stages any copy and before every file it writes, it checks that
+  `windowSizeWasSignedIn` is still `false` and `lastKnownAccountUuid` still
+  names the account just left. At the first sign of a sign-in it checks
+  whether a Claude runs. If one does, it ends the run and keeps what it
+  wrote, reported as `state=interrupted` with `operations` and `planned`
+  counts, so the restart copies the rest. If none does, as when Claude quits
+  to install an update at the sign-in, no folder is in use and the writes go
+  on, like a sync after a quit, with a new process check at most once a
+  second after the last one returned. A failed check ends the run. After the
+  last write the process check runs once more; a Claude found then also
+  makes the run `interrupted`. A sign-in with Claude open before the
+  journal reports `state=waiting`, `reason=signed-in`. An archive pass cut
+  short is not remembered, so the next run still spreads it
+  (`archive=waiting`), and the chat plan after it is not started.
 - The picture scan runs only when the chats synced and Claude is still
-  signed out. It stops at a sign-in or after 30 seconds and keeps how far it
-  read, so the next scan goes on from there. Otherwise the report says
+  signed out. It stops at a sign-in or after 30 seconds, also while it reads
+  the chat records, and keeps how far it read. Otherwise the report says
   `pictures` `deferred` with `signed-in` or `chats-not-synced`, and the
-  restart after the switch scans them with Claude closed. So a sign-in ends
-  the sync soon and the restart can start.
+  restart after the switch scans them. So a sign-in ends the sync soon and
+  the restart can start.
 - It checks again at the end and reports `signed_in_during_sync`, then
   `restart` and `restart_reasons`: `signed-in-during-sync`, `chats`,
   `archive`, `routines`, `groups` (whenever `sync_sidebar_layout` is on) and
@@ -571,12 +574,22 @@ finished for the account just left with no reason left, and records
 normally, runs `switch <profile> --after-account-switch --json` with Claude
 closed, and reopens Claude, as before. A restart asked for while the sync at
 sign-out still runs waits for it. When Claude is closed by then, for example
-quitting to install an update at the sign-in, the switch's sync runs with
-Claude closed as `switch <profile> --after-account-switch --no-launch --json`
-and leaves it closed. A failed sync still reopens Claude and reports why:
-the status has `reason=sync-incomplete` when Claude reopened, or
+quitting to install an update at the sign-in, the switch's sync runs anyway
+as the restart's own sync: a Claude that opens meanwhile is asked to quit,
+and Claude opens when the sync is done. While a switch syncs the helper also
+looks for an open Claude every second, because the notice that an app
+opened can be missed. A switch that stops because Claude
+opened (`claude-open` or `app-running`) restarts again, up to twice per
+account change. A failed sync still reopens Claude and reports why: the
+status has `reason=sync-incomplete` when Claude reopened, or
 `restart-failed` when it did not, and `steps`, each part that did not finish
-with its reason, such as `{"routines": "unsafe-routines"}`. A failed restart check leaves Claude open. Signing in again to
+with its reason as `switch` lists it, such as `{"routines": "unsafe-routines"}`.
+
+The helper stops `restart-check` after 25 seconds: the CLI's 15 second
+process check plus interpreter startup. A check stopped as too slow is tried
+again twice after 2 seconds, then every 30 seconds up to 10 tries in all,
+before the restart needs attention. A sync that waited for the restart runs
+meanwhile. A failed restart check leaves Claude open. Signing in again to
 the account just left, or quitting Claude, drops the sync's result. A
 `needs-attention` state from before stays until a sync clears it.
 
@@ -740,9 +753,13 @@ same moment is not lost. The original id stays in the line; renaming the key
 back undoes it. A line still being written waits for the next switch. Each
 transcript is read once: `chat-pictures-offsets.json` in the state folder keeps
 how far it was read, and a replaced transcript is read again from the start.
-That length is saved also when a scan stops early or one transcript cannot be
-opened, so a long scan is never started over. The transcripts of every synced
-chat held 10.9 GB on 4 November 2026.
+That length is saved also when a scan stops early, so a long scan is never
+started over, and a transcript that cannot be opened is passed over and tried
+again next time. The transcripts of every synced chat held 10.9 GB on 4
+November 2026. On the restart after a switch the scan runs once Claude has
+reopened: each rewrite keeps the line's length, so Claude can append
+meanwhile. A scan stopped at a time limit (`pictures` `stopped`) goes on at
+the next sync, within 30 seconds.
 The last result is in `chat-pictures-status.json`, and a sync report shows a
 `pictures` field only when it changed a picture or failed.
 

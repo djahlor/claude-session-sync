@@ -27,9 +27,6 @@ from .logins import last_known_account, signed_in
 # Claude retires sessions parked for other accounts at sign-out. Their last
 # saves land within a second, so the pass waits this long before it plans.
 SIGNED_OUT_SETTLE_SECONDS = 1.0
-# The picture scan at a sign-out stops after this long. A scan from the start
-# read 10.9 GB of transcripts and ran for minutes on 04-11-2026.
-SIGNED_OUT_PICTURES_SECONDS = 30.0
 # While signed in again with Claude closed, a finding that no Claude runs is
 # trusted for this long before the next process check.
 CLOSED_RECHECK_SECONDS = 1.0
@@ -98,17 +95,18 @@ class StopWhenClaudeHolds:
     def __call__(self) -> bool:
         if not self.signed_in_again():
             return False
-        now = self.clock()
         if (
             self._closed_at is not None
-            and now - self._closed_at < CLOSED_RECHECK_SECONDS
+            and self.clock() - self._closed_at < CLOSED_RECHECK_SECONDS
         ):
             return False
         try:
             held = self.holds()
         except Exception:
             return True
-        self._closed_at = None if held else now
+        # From when the check returned: a slow `ps` must not make every write
+        # check again.
+        self._closed_at = None if held else self.clock()
         return held
 
 

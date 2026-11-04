@@ -199,6 +199,16 @@ class TransactionEngine:
         self._ensure_apps_stopped()
         if not records:
             return self._noop_receipt(plan.plan_id)
+        if self.write_guard is not None and self.write_guard():
+            # Staging already writes a temporary copy beside each destination,
+            # so a run the guard would stop puts nothing into those folders.
+            return RunReceipt(
+                run_id=None,
+                status="interrupted",
+                plan_id=plan.plan_id,
+                operation_count=0,
+                bytes_copied=0,
+            )
 
         run_id = uuid.uuid4().hex
         journal: RunJournal | None = None
@@ -254,6 +264,11 @@ class TransactionEngine:
                     commit_staged(staged[record["index"]], destination)
                 journal.mark_applied(record["index"])
                 applied.append(record)
+            if self.write_guard is not None and not stopped and self._claude_holds():
+                # The guard may trust a closed Claude for a moment. One that
+                # started meanwhile could have listed a folder mid-run, so the
+                # run is never reported as a whole commit.
+                stopped = True
 
             self._transition(journal, "VERIFYING")
             for record in applied:
@@ -603,6 +618,14 @@ class TransactionEngine:
         except OSError:
             return False
         return metadata.st_dev == staged_device and metadata.st_ino == staged_inode
+
+    def _claude_holds(self) -> bool:
+        """A fresh process check. A check that fails counts as a running Claude."""
+
+        try:
+            return bool(self.process_probe())
+        except Exception:
+            return True
 
     def _ensure_apps_stopped(self) -> None:
         if self.process_probe():
