@@ -298,7 +298,18 @@ class ChatSyncTests(ChatSyncFixture):
         (new_folder / "scheduled-tasks.json").write_text("{}", encoding="utf-8")
         self.signed_in = new_account
         self.write_config()
-        self.log_logins((A_ACCOUNT, new_account, 600))
+        # Claude can create the empty folder in the first seconds of a login.
+        # Derive a fixed login time from its birth time, without sleeping.
+        login_time = int(new_folder.stat().st_birthtime) - 1
+        self.app_log.write_text(
+            "{} [info] [account] Login-state transition (loggedOut: true → false, "
+            "uuid: {} → {}), clearing oauth cache\n".format(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(login_time)),
+                A_ACCOUNT,
+                new_account,
+            ),
+            encoding="utf-8",
+        )
         self.write(self.a, X)
         self.write(self.b, Y)
 
