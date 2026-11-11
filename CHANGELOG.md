@@ -4,6 +4,12 @@ All notable changes to Claude Session Sync, newest first. The format follows [Ke
 
 To update, paste the install sentence from the [README](README.md#install) into Claude Code again, or run its Terminal command. Check your version with `claude-session-sync --version`.
 
+## [Unreleased]
+
+### Fixed
+
+- New accounts whose empty session folder is created within five seconds of login now join sync and receive existing chats. Folder creation is compared with the login time; the five-second delay still applies to chat writes, and folders containing chats from before the login stay excluded.
+
 ## [0.9.1] - 2026-11-04
 
 ### Added

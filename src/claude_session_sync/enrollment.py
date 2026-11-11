@@ -85,9 +85,7 @@ def new_login_targets(
             continue
         since_ms = first_login + LOGIN_SETTLE_MS
         folder = Path(target.path)
-        if _written_since(folder, since_ms) or _created_since(
-            folder, since_ms, first_login
-        ):
+        if _written_since(folder, since_ms) or _created_since(folder, first_login):
             found.append(key)
     return sorted(found)
 
@@ -110,12 +108,13 @@ def _written_since(folder: Path, since_ms: int) -> bool:
     return False
 
 
-def _created_since(folder: Path, since_ms: int, first_login_ms: int) -> bool:
+def _created_since(folder: Path, first_login_ms: int) -> bool:
     """A folder Claude made after the login, with no chat that predates it.
 
     A new account has no chat until its first one, so the first folder Claude
     makes for it is empty. A folder with an older chat was copied in from
-    somewhere else.
+    somewhere else. The chat-write settle delay must not apply to the folder's
+    birth time: a folder made just after login would stay excluded forever.
     """
 
     try:
@@ -123,7 +122,7 @@ def _created_since(folder: Path, since_ms: int, first_login_ms: int) -> bool:
         entries = list(os.scandir(str(folder)))
     except (AttributeError, OSError):
         return False
-    if born_ms <= since_ms:
+    if born_ms <= first_login_ms:
         return False
     for entry in entries:
         if not (entry.name.startswith("local_") and entry.name.endswith(".json")):

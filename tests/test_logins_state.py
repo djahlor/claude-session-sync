@@ -7,6 +7,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from claude_session_sync.chat_model import SyncState
 from claude_session_sync.chat_state import (
@@ -285,6 +287,94 @@ class EnrollmentTests(unittest.TestCase):
             )
 
             self.assertEqual([f"Work/{ACCOUNT}/fresh"], joined)
+
+    def test_an_empty_folder_created_just_after_login_joins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = self.target(root, ACCOUNT, "new")
+            config = self.config(root)
+            logins = {str(root): {ACCOUNT: NOW_MS}}
+            for delay_ms in (1, 992, 4_999, 5_000, 5_001):
+                with (
+                    self.subTest(delay_ms=delay_ms),
+                    patch.object(
+                        Path,
+                        "stat",
+                        return_value=SimpleNamespace(
+                            st_birthtime=(NOW_MS + delay_ms) / 1000
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        [f"Work/{ACCOUNT}/new"],
+                        new_login_targets(config, [target], set(), logins),
+                    )
+
+    def test_an_empty_folder_created_at_or_before_login_stays_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = self.target(root, ACCOUNT, "old")
+            config = self.config(root)
+            logins = {str(root): {ACCOUNT: NOW_MS}}
+            for delay_ms in (-1, 0):
+                with (
+                    self.subTest(delay_ms=delay_ms),
+                    patch.object(
+                        Path,
+                        "stat",
+                        return_value=SimpleNamespace(
+                            st_birthtime=(NOW_MS + delay_ms) / 1000
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        [], new_login_targets(config, [target], set(), logins)
+                    )
+
+    def test_a_new_folder_with_a_chat_from_before_login_stays_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = self.target(root, ACCOUNT, "copied")
+            chat = target.path / "local_x.json"
+            chat.write_text("{}", encoding="utf-8")
+            old_ns = (NOW_MS - 1_000) * 1_000_000
+            os.utime(chat, ns=(old_ns, old_ns))
+            config = self.config(root)
+            with patch.object(
+                Path,
+                "stat",
+                return_value=SimpleNamespace(st_birthtime=(NOW_MS + 992) / 1000),
+            ):
+                self.assertEqual(
+                    [],
+                    new_login_targets(
+                        config, [target], set(), {str(root): {ACCOUNT: NOW_MS}}
+                    ),
+                )
+
+    def test_chat_writes_still_need_to_outlast_the_login_settle_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = self.target(root, ACCOUNT, "old")
+            chat = target.path / "local_x.json"
+            chat.write_text("{}", encoding="utf-8")
+            config = self.config(root)
+            logins = {str(root): {ACCOUNT: NOW_MS}}
+            for delay_ms in (1, 4_999, 5_000, 5_001):
+                modified_ns = (NOW_MS + delay_ms) * 1_000_000
+                os.utime(chat, ns=(modified_ns, modified_ns))
+                with (
+                    self.subTest(delay_ms=delay_ms),
+                    patch.object(
+                        Path,
+                        "stat",
+                        return_value=SimpleNamespace(st_birthtime=(NOW_MS - 1) / 1000),
+                    ),
+                ):
+                    expected = [f"Work/{ACCOUNT}/old"] if delay_ms > 5_000 else []
+                    self.assertEqual(
+                        expected, new_login_targets(config, [target], set(), logins)
+                    )
 
     def test_an_account_that_logged_in_earlier_joins_while_another_is_signed_in(self):
         with tempfile.TemporaryDirectory() as directory:
