@@ -19,7 +19,7 @@ from typing import Any, Callable, TextIO
 from . import __version__
 from . import strict_json as json
 from .adapters import adapter_failure, run_adapters, run_layout_first
-from .config import Config, load_config
+from .config import Config, ConfigError, load_config
 from .config_commands import (
     approve_current_targets,
     configure_file,
@@ -1021,11 +1021,13 @@ def _run_workspace_after_switch(
     dependencies: CliDependencies,
     output: TextIO,
 ) -> int:
-    """Whether Claude moved to another workspace of the new account, without the groups.
+    """Whether the account just signed in to still lacks its groups or its chats.
 
     An account can belong to several workspaces. The switch copies the groups
     into the one Claude opened first. When Claude then moves to another one,
-    that one still shows its old groups. This watches for the move for a short
+    that one still shows its old groups. And an account whose chat folder is
+    not part of sync yet, as at its first login on this Mac, opens with only
+    the chats that folder already held. This watches for both for a short
     time after the switch and asks for one more restart only when it is
     certain. Everything unclear keeps Claude open, because a restart ends
     every open chat. When the workspace Claude moved to already shows the
@@ -1034,6 +1036,7 @@ def _run_workspace_after_switch(
     copies of Claude's database, and writes nothing but that main scope.
     """
 
+    from .chat_state import StateUnusable
     from .layout import LayoutBusyError, main_account_blocker, read_pending_adoption
     from .layout_records import LayoutError
     from .live import (
@@ -1052,19 +1055,18 @@ def _run_workspace_after_switch(
         _write(payload, as_json=arguments.as_json, stream=output)
         return 0
 
-    if not config.sync_sidebar_layout:
-        return report("sidebar-sync-off")
-    blocker = main_account_blocker(config)
-    if blocker is not None:
-        return report(blocker)
     account = last_known_account(profile.data_root)
     if account is None or signed_in(profile.data_root) is False:
         return report("not-signed-in")
-    try:
-        if read_pending_adoption(config.state_dir) is not None:
+    # Groups that do not sync, or a main account not chosen yet, leave only
+    # the chat folder to check.
+    groups = config.sync_sidebar_layout and main_account_blocker(config) is None
+    if groups:
+        try:
+            if read_pending_adoption(config.state_dir) is not None:
+                return report("main-account-choice-pending")
+        except LayoutError:
             return report("main-account-choice-pending")
-    except LayoutError:
-        return report("main-account-choice-pending")
     layout = dependencies.layout_factory(config)
     stopped: list[str] = []
     # The workspace with the same groups, its main scope, and when it was first seen.
@@ -1089,7 +1091,20 @@ def _run_workspace_after_switch(
             return
         stopped.append("same-groups")
 
-    def check() -> str | None:
+    joining: dict[str, bool] = {}
+
+    def outside_sync(scope: str) -> bool:
+        """Whether the next closed sync would let this scope's chat folder join."""
+        if scope not in joining:
+            key = f"{profile.name}/{scope}".lower()
+            try:
+                keys = dependencies.planner_factory(config).joining_targets(config)
+            except (StateUnusable, ConfigError, OSError):
+                keys = []
+            joining[scope] = key in {found.lower() for found in keys}
+        return joining[scope]
+
+    def check() -> tuple[str, str] | None:
         if not _running_processes(config, dependencies):
             # Just reopened by the switch, Claude may not be listed yet.
             if dependencies.clock() - started >= WORKSPACE_LAUNCH_SECONDS:
@@ -1102,19 +1117,31 @@ def _run_workspace_after_switch(
             stopped.append("account-changed")
             return None
         try:
-            moved = layout.workspace_after_switch(account)
-            if moved is None:
-                follow()
-            return moved
+            moved = layout.workspace_after_switch(account) if groups else None
+            if moved is not None:
+                return "workspace-changed", moved
+            scope = layout.signed_in_scope(profile.data_root)
         except (LayoutError, OSError, subprocess.SubprocessError):
             # A torn copy or a slow helper proves nothing. The next read may.
             return None
+        if (
+            scope is not None
+            and scope.partition("/")[0].lower() == account
+            and outside_sync(scope)
+        ):
+            return "account-folder-outside-sync", scope
+        if groups:
+            try:
+                follow()
+            except (LayoutError, OSError, subprocess.SubprocessError):
+                pass
+        return None
 
-    scope = wait_for_workspace(
+    found = wait_for_workspace(
         check, lambda: bool(stopped), dependencies.clock, dependencies.sleeper
     )
-    if scope is not None:
-        return report("workspace-changed", restart=True)
+    if found is not None:
+        return report(found[0], restart=True)
     return report(stopped[0] if stopped else "same-workspace")
 
 

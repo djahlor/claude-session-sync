@@ -430,6 +430,36 @@ def plan_account_copy(
     return AccountCopyPlan(active, source=source, target=active)
 
 
+def settled_scope(records: Mapping[bytes, bytes | None]) -> str | None:
+    """The account and workspace Claude shows, once its web view settled on them.
+
+    Claude records the account in ccd-sync-owner and its org in ccd-sync-org
+    only after it loaded that account. Until the sidebar shows that pair, the
+    answer is None.
+    """
+
+    owner = _owner_account(records.get(SYNC_OWNER_KEY))
+    org = _owner_account(records.get(SYNC_ORG_KEY))
+    record = records.get(DFRAME_STORE_KEY)
+    if owner is None or org is None or record is None:
+        return None
+    try:
+        state = _decode_record(record, "dframe store record").get("state")
+    except LayoutError:
+        return None
+    if not isinstance(state, dict):
+        return None
+    scope = f"{owner}/{org}"
+    slots = state.get("codeSidebarByScope")
+    if (
+        not isinstance(slots, dict)
+        or state.get("lastSidebarScopeKey") != scope
+        or scope not in slots
+    ):
+        return None
+    return scope
+
+
 def _same_account_other_workspace(main_scope: object, active: str) -> bool:
     if not _valid_scope(main_scope) or main_scope == active:
         return False

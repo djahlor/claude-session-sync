@@ -2408,6 +2408,24 @@ class PerAccountCopyTests(unittest.TestCase):
             )
             self.assertIn("RECOVERY_REQUIRED", stuck.read_text())
 
+    def test_the_folder_claude_shows_is_read_from_a_copy_of_its_sidebar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(Path(directory))
+            name = config.profiles[0].name
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                # Claude has not recorded the workspace yet.
+                self.assertEqual(
+                    [], layout_module.opened_folders(config, synchronizer.helper)
+                )
+                data[layout_module.SYNC_ORG_KEY] = b"\x01w"
+                self.assertEqual(
+                    [f"{name}/b/w"],
+                    layout_module.opened_folders(config, synchronizer.helper),
+                )
+            self.assertEqual([], writes)
+            # No helper, no answer, and never an error for the chat sync.
+            self.assertEqual([], layout_module.opened_folders(config))
+
     def test_a_switch_copy_follows_claude_to_another_workspace_of_the_account(self):
         # The first copy went to b/first and still waits for its upload.
         # Claude then moved to b/second, the account's other workspace.
