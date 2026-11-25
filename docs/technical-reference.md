@@ -681,6 +681,12 @@ So after every switch, restarted or not, the watcher runs
   says so. A finding the second read does not repeat, as after one torn
   copy, goes back to watching until the time limit. The watcher then restarts Claude once more in the switch's mode,
   and that sync copies the main scope into the new workspace.
+- It also reports `restart: true`, with `reason:
+  account-folder-outside-sync`, when the chat folder of the account and
+  workspace Claude settled on is not part of sync yet and the next closed
+  sync would let it join ([how](#account-switches-and-new-accounts)). That
+  restart's sync brings the account its chats. This part also runs when
+  groups do not sync.
 - Everything else keeps Claude open: `same-workspace` (no move in the time
   limit), `claude-closed` (after 15 seconds, because a Claude the switch
   just reopened is not listed as running at once),
@@ -721,7 +727,11 @@ first time sync sees it. A folder outside sync joins once its account has a
 recorded login and the folder holds a chat Claude saved at least 5 seconds
 after that login. It also joins when Claude created the folder at least 5
 seconds after that login and it holds no chat older than the login, which is
-how a new account's empty folder looks. So a new account joins the next time
+how a new account's empty folder looks. And it joins when Claude shows it:
+`ccd-sync-owner`, `ccd-sync-org` and `lastSidebarScopeKey` in a copy of
+Claude's sidebar records all name that account and workspace. A folder that
+came over from another Mac with old chats would otherwise open with only
+those at the account's first switch here. So a new account joins the next time
 Claude closes after you sign in and open the Code tab once. A folder copied
 from another Mac has no login here and stays out.
 

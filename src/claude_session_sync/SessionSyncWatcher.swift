@@ -630,13 +630,17 @@ private final class SessionSyncWatcher: NSObject {
 
   private func finishWorkspaceCheck(exitStatus: Int32, output: Data, account: String?) {
     let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+    let messages = [
+      "workspace-changed": "Claude opened another workspace. Restarting once more for your groups.",
+      "account-folder-outside-sync":
+        "This account's chats are not here yet. Restarting once more to bring them.",
+    ]
     guard exitStatus == 0, result?["restart"] as? Bool == true,
-      result?["reason"] as? String == "workspace-changed",
+      let message = messages[result?["reason"] as? String ?? ""],
       let checked = account, checked == accountHash, readAccountHash() == checked,
       !restartRequested, !groupsChecking
     else { return }
-    showStatus("Claude opened another workspace. Restarting once more for your groups.",
-      banner: true)
+    showStatus(message, banner: true)
     requestRestart(mode: "after-account-switch")
   }
 

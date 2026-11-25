@@ -3,9 +3,10 @@
 Under the ``logins`` policy only real logins take part: the approved targets,
 plus any folder Claude itself wrote a chat to after its account logged in on
 this Mac, plus a folder Claude created after that login and that holds no chat
-older than it (a brand new account's own folder starts empty). Leftover
-folders from other Macs never had a login here, so they stay out. Whether Claude runs, and which account is signed in now, do not
-matter.
+older than it (a brand new account's own folder starts empty), plus the folder
+of the account and workspace Claude shows right now, when that account logged
+in on this Mac. Leftover folders from other Macs never had a login here, so
+they stay out. Whether Claude runs does not matter.
 """
 
 import os
@@ -66,14 +67,22 @@ def new_login_targets(
     targets: Sequence,
     selected_keys: set[str],
     logins: Logins,
+    opened: Iterable[str] = (),
 ) -> list[str]:
-    """Folders outside sync that Claude wrote for their account after its first login here."""
+    """Folders outside sync that Claude uses for their account since its first login here.
+
+    ``opened`` names the folders Claude shows right now. Such a folder needs
+    no chat written after the login: an account whose folder came over from
+    another Mac would otherwise open with its old chats at the first switch,
+    and get the rest only after a first chat and one more quit.
+    """
 
     if config.target_policy != "logins":
         return []
     roots = {
         profile.name: normalized_path(profile.data_root) for profile in config.profiles
     }
+    shown = {key.lower() for key in opened}
     found = []
     for target in targets:
         key = target_key(target)
@@ -85,7 +94,11 @@ def new_login_targets(
             continue
         since_ms = first_login + LOGIN_SETTLE_MS
         folder = Path(target.path)
-        if _written_since(folder, since_ms) or _created_since(folder, first_login):
+        if (
+            key.lower() in shown
+            or _written_since(folder, since_ms)
+            or _created_since(folder, first_login)
+        ):
             found.append(key)
     return sorted(found)
 

@@ -288,6 +288,45 @@ class EnrollmentTests(unittest.TestCase):
 
             self.assertEqual([f"Work/{ACCOUNT}/fresh"], joined)
 
+    def test_the_folder_claude_shows_joins_without_a_chat_written_after_login(self):
+        # The account's folder came over from another Mac with old chats, and
+        # the account now signed in here for the first time.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shown = self.target(root, ACCOUNT, "shown")
+            other = self.target(root, ACCOUNT, "other")
+            login_ms = int(time.time() * 1000)
+            old = (login_ms - 60_000) / 1000
+            for target in (shown, other):
+                (target.path / "local_x.json").write_text("{}", encoding="utf-8")
+                os.utime(target.path / "local_x.json", (old, old))
+            logins = {str(Path(os.path.abspath(root))): {ACCOUNT: login_ms}}
+
+            joined = new_login_targets(
+                self.config(root),
+                [shown, other],
+                set(),
+                logins,
+                [f"work/{ACCOUNT.upper()}/shown"],
+            )
+
+            self.assertEqual([f"Work/{ACCOUNT}/shown"], joined)
+            self.assertEqual(
+                [], new_login_targets(self.config(root), [shown, other], set(), logins)
+            )
+
+    def test_the_folder_claude_shows_stays_out_without_a_login_here(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shown = self.target(root, ACCOUNT, "shown")
+            (shown.path / "local_x.json").write_text("{}", encoding="utf-8")
+
+            joined = new_login_targets(
+                self.config(root), [shown], set(), {}, [f"Work/{ACCOUNT}/shown"]
+            )
+
+            self.assertEqual([], joined)
+
     def test_an_empty_folder_created_just_after_login_joins(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

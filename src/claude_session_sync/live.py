@@ -188,13 +188,17 @@ def wait_for_groups(
         sleeper(GROUPS_CHECK_INTERVAL)
 
 
+# Why a switch needs one more restart, and the signed-in scope it was found for.
+WorkspaceFound = tuple[str, str]
+
+
 def wait_for_workspace(
-    check: Callable[[], Optional[str]],
+    check: Callable[[], Optional[WorkspaceFound]],
     stopped: Callable[[], bool],
     clock: Callable[[], float],
     sleeper: Callable[[float], None],
-) -> Optional[str]:
-    """Run check until it names a workspace twice. None when stopped or at the time limit.
+) -> Optional[WorkspaceFound]:
+    """Run check until it finds the same reason twice. None when stopped or at the time limit.
 
     Chromium writes Local Storage to disk in delayed batches, so a second copy
     a little later must agree. A finding that does not hold, as after one

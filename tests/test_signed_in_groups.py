@@ -27,6 +27,7 @@ from claude_session_sync.layout_records import (
     SYNC_QUARANTINE_KEY,
     LayoutError,
     groups_after_sign_in,
+    settled_scope,
     workspace_after_switch,
     workspace_with_same_groups,
 )
@@ -241,6 +242,23 @@ class WorkspaceAfterSwitchTests(unittest.TestCase):
                 self.assertIsNone(
                     workspace_after_switch(records, B_ACCOUNT, main_scope)
                 )
+
+
+class SettledScopeTests(unittest.TestCase):
+    def test_the_account_and_workspace_claude_settled_on_are_named(self):
+        self.assertEqual(B_SCOPE, settled_scope(reconciled(MAIN)))
+
+    def test_a_sign_in_claude_has_not_settled_names_nothing(self):
+        for records in (
+            reconciled(MAIN, owner=None),
+            reconciled(MAIN, org=None),
+            reconciled(MAIN, active=A_SCOPE),
+            reconciled(MAIN, slots={A_SCOPE: MAIN}),
+            {SYNC_OWNER_KEY: b"\x01" + B_ACCOUNT.encode()},
+            {},
+        ):
+            with self.subTest(records=sorted(records)):
+                self.assertIsNone(settled_scope(records))
 
 
 class SidebarCommandFixture(ChatCliFixture):
@@ -571,6 +589,9 @@ class WorkspaceAfterSwitchCommandTests(SidebarCommandFixture):
         return json.loads(out)
 
     def timed(self, on_sleep=lambda _seconds: None):
+        return self.timed_with(on_sleep)
+
+    def timed_with(self, on_sleep=lambda _seconds: None, **dependencies):
         now = [0.0]
         waits = []
 
@@ -579,7 +600,8 @@ class WorkspaceAfterSwitchCommandTests(SidebarCommandFixture):
             waits.append(seconds)
             on_sleep(seconds)
 
-        return self.check(clock=lambda: now[0], sleeper=sleeper), waits
+        payload = self.check(clock=lambda: now[0], sleeper=sleeper, **dependencies)
+        return payload, waits
 
     def test_a_move_to_a_workspace_with_other_groups_restarts(self):
         payload, waits = self.timed()
@@ -732,13 +754,73 @@ class WorkspaceAfterSwitchCommandTests(SidebarCommandFixture):
         self.assertFalse(payload["restart"])
         self.assertEqual(1, len(waits))
 
-    def test_groups_that_do_not_sync_are_never_checked(self):
+    def test_groups_that_do_not_sync_leave_only_the_chat_folder_to_check(self):
         self.config = replace(self.config, sync_sidebar_layout=False)
 
-        payload = self.check()
+        payload, _waits = self.timed()
 
         self.assertEqual(
-            {"state": "no-restart", "reason": "sidebar-sync-off", "restart": False},
+            {"state": "no-restart", "reason": "same-workspace", "restart": False},
             payload,
         )
-        self.assertEqual(0, self.reads)
+
+    def joining(self, *keys):
+        class Planner:
+            def joining_targets(self, _config):
+                return list(keys)
+
+        return lambda _config: Planner()
+
+    def test_a_chat_folder_outside_sync_restarts_to_bring_the_chats(self):
+        # Claude stayed in the workspace the groups went to, but that
+        # account's folder is not part of sync yet.
+        self.records = moved(MAIN)
+        self.main.write_text(json.dumps({"version": 1, "main_scope": B_SCOPE}))
+
+        payload, waits = self.timed_with(
+            planner_factory=self.joining(f"Work/{B_ACCOUNT}/{B_ORG}")
+        )
+
+        self.assertEqual(
+            {
+                "state": "restart",
+                "reason": "account-folder-outside-sync",
+                "restart": True,
+            },
+            payload,
+        )
+        self.assertEqual([GROUPS_CONFIRM_SECONDS], waits)
+
+    def test_a_chat_folder_outside_sync_restarts_when_groups_do_not_sync(self):
+        self.config = replace(self.config, sync_sidebar_layout=False)
+
+        payload, _waits = self.timed_with(
+            planner_factory=self.joining(f"Work/{B_ACCOUNT}/{B_ORG}")
+        )
+
+        self.assertEqual("account-folder-outside-sync", payload["reason"])
+        self.assertTrue(payload["restart"])
+
+    def test_another_folder_joining_is_no_reason_to_restart(self):
+        self.records = moved(MAIN)
+
+        payload, _waits = self.timed_with(
+            planner_factory=self.joining(f"Work/{B_ACCOUNT}/{A_ORG}")
+        )
+
+        # The other workspace shows the same groups, so only the main scope follows.
+        self.assertEqual("same-groups", payload["reason"])
+        self.assertFalse(payload["restart"])
+
+    def test_a_chat_state_that_cannot_be_read_keeps_claude_open(self):
+        from claude_session_sync.chat_state import StateUnusable
+
+        class Planner:
+            def joining_targets(self, _config):
+                raise StateUnusable("chat state is unreadable")
+
+        self.records = moved(MAIN)
+
+        payload, _waits = self.timed_with(planner_factory=lambda _config: Planner())
+
+        self.assertFalse(payload["restart"])

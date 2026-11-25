@@ -89,6 +89,7 @@ from .layout_records import (  # noqa: F401  the module's public names stay impo
     plan_account_copy,
     same_recovery_payload,
     scope_sessions,
+    settled_scope,
     sidebar_accounts,
     transform_layout_records,
     workspace_after_switch,
@@ -165,6 +166,28 @@ def clear_pending_adoption(state_dir: Path) -> None:
     path = Path(state_dir) / ADOPT_PENDING_FILENAME
     if os.path.lexists(str(path)):
         durable_unlink(path)
+
+
+def opened_folders(config: Config, helper: Path | None = None) -> list[str]:
+    """The chat folders Claude shows right now, as sync target keys.
+
+    Each profile's Claude names the account and workspace it settled on in its
+    sidebar records. That pair is the folder Claude keeps the account's chats
+    in. A profile whose records are missing or unclear adds nothing.
+    """
+
+    import subprocess
+
+    synchronizer = LayoutSynchronizer(config, helper=helper, process_probe=lambda: ())
+    found = []
+    for profile in config.profiles:
+        try:
+            scope = synchronizer.signed_in_scope(profile.data_root)
+        except (LayoutError, OSError, subprocess.SubprocessError):
+            continue
+        if scope is not None:
+            found.append(f"{profile.name}/{scope}")
+    return found
 
 
 class LayoutSynchronizer:
@@ -475,6 +498,18 @@ class LayoutSynchronizer:
         main_scope = _decode_main_scope(_snapshot_bytes(self._main_scope_path()))
         verdict, scope = groups_after_sign_in(records, account, main_scope)
         return verdict, scope, main_scope
+
+    def signed_in_scope(self, data_root: Path) -> str | None:
+        """The account and workspace that profile's Claude shows, once it settled on them.
+
+        Reads a disposable copy of Claude's database and never the live files.
+        """
+        with self._database_copy(data_root) as database:
+            records = {
+                key: database.get_optional(key)
+                for key in (DFRAME_STORE_KEY, SYNC_OWNER_KEY, SYNC_ORG_KEY)
+            }
+        return settled_scope(records)
 
     def workspace_after_switch(self, account: str) -> str | None:
         """The other workspace of the main account Claude moved to, if its groups differ.

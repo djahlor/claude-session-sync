@@ -437,7 +437,12 @@ class WatcherTests(unittest.TestCase):
         self.live_scenario(request_restart=True, slow_restart_check=True)
 
     def test_a_claude_that_moves_to_another_workspace_is_restarted_once_more(self):
-        self.live_scenario(change_account=True, workspace_moves=True)
+        self.live_scenario(change_account=True, workspace_moves="workspace-changed")
+
+    def test_an_account_whose_chats_are_not_synced_yet_is_restarted_once_more(self):
+        self.live_scenario(
+            change_account=True, workspace_moves="account-folder-outside-sync"
+        )
 
     def test_a_relaunched_helper_still_runs_the_workspace_check_it_owes(self):
         self.live_scenario(request_restart=True, owed_workspace_check=True)
@@ -583,9 +588,9 @@ class WatcherTests(unittest.TestCase):
                 "elif sys.argv[1] == 'workspace-after-switch':\n"
                 " checks = sum(json.loads(line)[0] == 'workspace-after-switch' for line in calls.read_text().splitlines())\n"
                 # Claude moves to the account's other workspace once, after the first restart.
-                f" moved = {workspace_moves!r} and checks == 1\n"
+                f" moved = bool({workspace_moves!r}) and checks == 1\n"
                 " time.sleep(1)\n"
-                " print(json.dumps({'state': 'restart' if moved else 'no-restart', 'reason': 'workspace-changed' if moved else 'same-workspace', 'restart': moved}))\n"
+                f" print(json.dumps({{'state': 'restart' if moved else 'no-restart', 'reason': {workspace_moves!r} if moved else 'same-workspace', 'restart': moved}}))\n"
                 "else:\n"
                 f" if {request_during_sync!r} and len(calls.read_text().splitlines()) == 1: time.sleep(3)\n"
                 f" if {claude_open_waits!r}: print(json.dumps({{'state': 'waiting', 'reason': 'claude-open', 'progress': 'waiting-for-Claude'}})); raise SystemExit(0)\n"

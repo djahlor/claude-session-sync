@@ -341,6 +341,77 @@ class ChatSyncTests(ChatSyncFixture):
         self.assertIsNone(self.read(old_folder, X))
         self.assertIsNone(self.read(self.a, Y))
 
+    def test_that_folder_joins_at_once_when_claude_shows_it(self):
+        # Claude settled on the account and workspace, so the folder is its
+        # own: the first switch brings the chats, with no chat written yet.
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_org = "dddddddd-0000-4000-8000-0000000000d4"
+        old_folder = self.folder(new_account, new_org)
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 30))
+        self.write(old_folder, Y)
+        self.write(self.a, X)
+        planner = Planner(
+            app_log=self.app_log,
+            opened_folders=lambda _config: [f"Work/{new_account}/{new_org}"],
+        )
+        engine = TransactionEngine(
+            self.config.state_dir, process_probe=lambda: self.running
+        )
+
+        run = run_chat_sync(self.config, planner, engine)
+
+        self.assertEqual(1, run.newly_enrolled)
+        self.assertIsNotNone(self.read(old_folder, X))
+        self.assertIsNotNone(self.read(self.a, Y))
+
+    def test_a_chat_deleted_elsewhere_stays_deleted_when_that_folder_joins(self):
+        # The joining folder still holds an old copy of a chat that was
+        # deleted in the synced accounts.
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_org = "dddddddd-0000-4000-8000-0000000000d4"
+        old_folder = self.folder(new_account, new_org)
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 30))
+        self.write(old_folder, X, lastActivityAt=100)
+        for folder in (self.a, self.b):
+            (folder / f"deleted_{X}").write_text(str(NOW_MS - 1_000), encoding="ascii")
+        self.agree(X)
+        planner = Planner(
+            app_log=self.app_log,
+            opened_folders=lambda _config: [f"Work/{new_account}/{new_org}"],
+        )
+        engine = TransactionEngine(
+            self.config.state_dir, process_probe=lambda: self.running
+        )
+
+        run = run_chat_sync(self.config, planner, engine)
+
+        self.assertEqual(1, run.newly_enrolled)
+        self.assertIsNone(self.read(self.a, X))
+        self.assertIsNone(self.read(self.b, X))
+        self.assertIsNone(self.read(old_folder, X))
+
+    def test_the_folder_claude_shows_is_listed_as_joining_before_the_sync(self):
+        new_account = "dddddddd-0000-4000-8000-000000000004"
+        new_org = "dddddddd-0000-4000-8000-0000000000d4"
+        old_folder = self.folder(new_account, new_org)
+        self.signed_in = new_account
+        self.write_config()
+        self.log_logins((A_ACCOUNT, new_account, 30))
+        self.write(old_folder, Y)
+        key = f"Work/{new_account}/{new_org}"
+
+        shown = Planner(app_log=self.app_log, opened_folders=lambda _config: [key])
+        hidden = Planner(app_log=self.app_log, opened_folders=lambda _config: [])
+
+        self.assertEqual([key], shown.joining_targets(self.config))
+        self.assertEqual([], hidden.joining_targets(self.config))
+        # Asking writes nothing: the folder is still outside sync.
+        self.assertEqual([key], shown.joining_targets(self.config))
+
     def test_a_login_stays_recorded_after_claudes_log_rotates(self):
         new_account = "dddddddd-0000-4000-8000-000000000004"
         new_folder = self.folder(new_account, A_ORG)

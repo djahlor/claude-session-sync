@@ -66,11 +66,13 @@ class Planner:
         clock_ns: Callable[[], int] = time.time_ns,
         app_log: Optional[Path] = None,
         state: Optional[ChatState] = None,
+        opened_folders: Optional[Callable[[Config], Sequence[str]]] = None,
     ) -> None:
         self._store = store
         self._clock_ns = clock_ns
         self._app_log = app_log
         self._state = state
+        self._opened_folders = opened_folders
 
     def plan(
         self,
@@ -108,6 +110,26 @@ class Planner:
         found = (self._store or SessionStore()).discover_targets(config)
         return self._select(config, found, state)[0]
 
+    def joining_targets(self, config: Config) -> list[str]:
+        """The folders outside sync that the next sync would let join.
+
+        Reads the chat state, Claude's log and a copy of its sidebar records
+        without writing any of them.
+        """
+        state = self._state or load_state(state_path(config.state_dir))
+        found = (self._store or SessionStore()).discover_targets(config)
+        return self._select(config, found, state)[2]
+
+    def _opened(self, config: Config) -> Sequence[str]:
+        """The folders Claude shows right now. Only the logins policy asks."""
+        if config.target_policy != "logins":
+            return ()
+        if self._opened_folders is not None:
+            return self._opened_folders(config)
+        from .layout import opened_folders
+
+        return opened_folders(config)
+
     def _select(self, config, found: Discovery, state: ChatState):
         """Record logins and enroll new folders in ``state``, then select."""
         roots = {
@@ -130,6 +152,7 @@ class Planner:
             found.targets,
             {target_key(target) for target in selected},
             state.logins,
+            self._opened(config),
         )
         if newly:
             state.enrolled = sorted(set(state.enrolled) | set(newly))
