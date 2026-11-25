@@ -1,5 +1,6 @@
 """Smoke-test the actual macOS watcher with an isolated, non-writing child."""
 
+import hashlib
 import json
 import os
 import plistlib
@@ -435,6 +436,15 @@ class WatcherTests(unittest.TestCase):
         """`ps` on a busy Mac may use the CLI's whole process check budget."""
         self.live_scenario(request_restart=True, slow_restart_check=True)
 
+    def test_a_claude_that_moves_to_another_workspace_is_restarted_once_more(self):
+        self.live_scenario(change_account=True, workspace_moves=True)
+
+    def test_a_relaunched_helper_still_runs_the_workspace_check_it_owes(self):
+        self.live_scenario(request_restart=True, owed_workspace_check=True)
+
+    def test_a_relaunched_helper_never_repeats_a_workspace_check(self):
+        self.live_scenario(request_restart=True, owed_workspace_check=False)
+
     def test_groups_are_checked_only_when_they_are_the_last_restart_reason(self):
         self.live_scenario(
             sign_out=True,
@@ -499,6 +509,8 @@ class WatcherTests(unittest.TestCase):
         slow_restart_check=False,
         busy_restart_check=False,
         sign_out_while_busy=False,
+        workspace_moves=False,
+        owed_workspace_check=None,
     ):
         from claude_session_sync.processes import PROCESS_PROBE_TIMEOUT_SECONDS
 
@@ -508,6 +520,20 @@ class WatcherTests(unittest.TestCase):
             account = root / "config.json"
             first_account = str(uuid.uuid4())
             account.write_text(json.dumps({"lastKnownAccountUuid": first_account}))
+            receipt_file = root / "account-restart.json"
+            if owed_workspace_check is not None:
+                # What an earlier helper saved: after a switch, with or without
+                # its workspace check still owed.
+                receipt = {
+                    "account_hash": hashlib.sha256(
+                        first_account.upper().encode()
+                    ).hexdigest(),
+                    "phase": "finished",
+                }
+                if owed_workspace_check:
+                    receipt["workspace_check"] = True
+                receipt_file.write_text(json.dumps(receipt))
+                os.chmod(receipt_file, 0o600)
             folder = root / "claude-code-sessions" / "account" / "workspace"
             folder.mkdir(parents=True)
             calls = root / "calls.jsonl"
@@ -554,6 +580,12 @@ class WatcherTests(unittest.TestCase):
                 " time.sleep(2 if " + repr(quit_during_check) + " else 1)\n"
                 f" reason = 'claude-closed' if {quit_during_check!r} else 'same-groups' if same else 'different-groups'\n"
                 " print(json.dumps({'state': 'no-restart' if same else 'restart', 'reason': reason, 'restart': not same}))\n"
+                "elif sys.argv[1] == 'workspace-after-switch':\n"
+                " checks = sum(json.loads(line)[0] == 'workspace-after-switch' for line in calls.read_text().splitlines())\n"
+                # Claude moves to the account's other workspace once, after the first restart.
+                f" moved = {workspace_moves!r} and checks == 1\n"
+                " time.sleep(1)\n"
+                " print(json.dumps({'state': 'restart' if moved else 'no-restart', 'reason': 'workspace-changed' if moved else 'same-workspace', 'restart': moved}))\n"
                 "else:\n"
                 f" if {request_during_sync!r} and len(calls.read_text().splitlines()) == 1: time.sleep(3)\n"
                 f" if {claude_open_waits!r}: print(json.dumps({{'state': 'waiting', 'reason': 'claude-open', 'progress': 'waiting-for-Claude'}})); raise SystemExit(0)\n"
@@ -618,6 +650,9 @@ class WatcherTests(unittest.TestCase):
             def switches():
                 return [item for item in entries() if item[0] == "switch"]
 
+            def workspace_checks():
+                return [i for i in entries() if i[0] == "workspace-after-switch"]
+
             try:
                 self.assertTrue(
                     wait_for(
@@ -656,8 +691,23 @@ class WatcherTests(unittest.TestCase):
                         (root / "account-restart.json").read_text(),
                     )
                     self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
-                    time.sleep(4)
-                    self.assertEqual(1, len(switches()), "no restart loop")
+                    if workspace_moves:
+                        self.assertTrue(
+                            wait_for(lambda: len(switches()) == 2, 30),
+                            "a move to another workspace must restart once more",
+                        )
+                        self.assertIn("--after-account-switch", switches()[1])
+                        self.assertTrue(wait_for(app_running, 10), "Claude must reopen")
+                    time.sleep(6)
+                    self.assertEqual(
+                        2 if workspace_moves else 1, len(switches()), "no restart loop"
+                    )
+                    self.assertEqual(
+                        [["workspace-after-switch", "Work", "--json"]],
+                        workspace_checks(),
+                        "one check per switch",
+                    )
+                    self.assertNotIn("workspace_check", receipt_file.read_text())
                 if sign_out:
 
                     def claude_config(account_id, signed_in):
@@ -891,6 +941,13 @@ class WatcherTests(unittest.TestCase):
                             item for item in entries() if item[0] == "switch"
                         )
                         self.assertIn("--adopt-current-sidebar", switch_call)
+                    if owed_workspace_check is not None:
+                        self.assertEqual(
+                            1 if owed_workspace_check else 0,
+                            len(workspace_checks()),
+                            "a relaunched helper runs an owed check once, and none twice",
+                        )
+                        self.assertNotIn("workspace_check", receipt_file.read_text())
                     self.assertFalse((root / "restart-request").exists())
                     phase = json.loads(status.read_text())["restart_phase"]
                     self.assertEqual(

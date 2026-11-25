@@ -39,6 +39,16 @@ GROUPS_CHECK_INTERVAL = 1.0
 # once more a little later, so a copy taken between two writes cannot pass alone.
 GROUPS_CONFIRM_SECONDS = 6.0
 
+# After a switch Claude can move to another workspace of the new account: by
+# itself 8 seconds after it reopened on 25-11-2026, or by a click. The check
+# for that watches this long, and reads a copy of the sidebar this often.
+WORKSPACE_CHECK_SECONDS = 45.0
+WORKSPACE_CHECK_INTERVAL = 3.0
+# The check starts the moment the switch reopened Claude. `open` returns
+# before the process list shows Claude, so for this long a Claude that is not
+# running counts as not started yet.
+WORKSPACE_LAUNCH_SECONDS = 15.0
+
 # What the groups check found, the signed-in scope and the main scope.
 GroupsFound = tuple[str, Optional[str], Optional[str]]
 
@@ -176,3 +186,28 @@ def wait_for_groups(
         if clock() >= deadline:
             return None
         sleeper(GROUPS_CHECK_INTERVAL)
+
+
+def wait_for_workspace(
+    check: Callable[[], Optional[str]],
+    stopped: Callable[[], bool],
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> Optional[str]:
+    """Run check until it names a workspace twice. None when stopped or at the time limit.
+
+    Chromium writes Local Storage to disk in delayed batches, so a second copy
+    a little later must agree. A finding that does not hold, as after one
+    torn copy, goes back to watching: the switch has only this one check.
+    """
+
+    deadline = clock() + WORKSPACE_CHECK_SECONDS
+    while True:
+        found = check()
+        if found is not None:
+            sleeper(GROUPS_CONFIRM_SECONDS)
+            if check() == found:
+                return found
+        if stopped() or clock() >= deadline:
+            return None
+        sleeper(WORKSPACE_CHECK_INTERVAL)

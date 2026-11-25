@@ -329,6 +329,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     signed_in_groups.add_argument("profile")
     signed_in_groups.add_argument("--json", action="store_true", dest="as_json")
+    workspace_after_switch = commands.add_parser(
+        "workspace-after-switch",
+        help="after a switch, check whether Claude moved to a workspace without the groups",
+    )
+    workspace_after_switch.add_argument("profile")
+    workspace_after_switch.add_argument("--json", action="store_true", dest="as_json")
     switch.add_argument("--no-launch", action="store_true")
     switch_layout = switch.add_mutually_exclusive_group()
     switch_layout.add_argument(
@@ -1007,6 +1013,109 @@ def _run_signed_in_groups(
         return report(SAME_GROUPS, restart=False)
     finally:
         handoff.release()
+
+
+def _run_workspace_after_switch(
+    arguments: Any,
+    config: Config,
+    dependencies: CliDependencies,
+    output: TextIO,
+) -> int:
+    """Whether Claude moved to another workspace of the new account, without the groups.
+
+    An account can belong to several workspaces. The switch copies the groups
+    into the one Claude opened first. When Claude then moves to another one,
+    that one still shows its old groups. This watches for the move for a short
+    time after the switch and asks for one more restart only when it is
+    certain. Everything unclear keeps Claude open, because a restart ends
+    every open chat. When the workspace Claude moved to already shows the
+    same groups, nothing is copied and the main scope follows Claude there,
+    so groups changed in it travel at the next switch. Reads only disposable
+    copies of Claude's database, and writes nothing but that main scope.
+    """
+
+    from .layout import LayoutBusyError, main_account_blocker, read_pending_adoption
+    from .layout_records import LayoutError
+    from .live import (
+        GROUPS_CONFIRM_SECONDS,
+        WORKSPACE_LAUNCH_SECONDS,
+        wait_for_workspace,
+    )
+    from .logins import last_known_account, signed_in
+
+    profile = _find_profile(config, arguments.profile)
+    started = dependencies.clock()
+
+    def report(reason: str, *, restart: bool = False) -> int:
+        state = "restart" if restart else "no-restart"
+        payload = {"state": state, "reason": reason, "restart": restart}
+        _write(payload, as_json=arguments.as_json, stream=output)
+        return 0
+
+    if not config.sync_sidebar_layout:
+        return report("sidebar-sync-off")
+    blocker = main_account_blocker(config)
+    if blocker is not None:
+        return report(blocker)
+    account = last_known_account(profile.data_root)
+    if account is None or signed_in(profile.data_root) is False:
+        return report("not-signed-in")
+    try:
+        if read_pending_adoption(config.state_dir) is not None:
+            return report("main-account-choice-pending")
+    except LayoutError:
+        return report("main-account-choice-pending")
+    layout = dependencies.layout_factory(config)
+    stopped: list[str] = []
+    # The workspace with the same groups, its main scope, and when it was first seen.
+    same: list[tuple[tuple[str, str], float]] = []
+
+    def follow() -> None:
+        """Make a workspace that shows the same groups the main scope, once it held."""
+        found = layout.workspace_with_same_groups(account)
+        if found is None or (same and same[0][0] != found):
+            same.clear()
+        if found is None:
+            return
+        if not same:
+            same.append((found, dependencies.clock()))
+        # Chromium writes Local Storage to disk in delayed batches, so a
+        # later copy must still agree.
+        if dependencies.clock() - same[0][1] < GROUPS_CONFIRM_SECONDS:
+            return
+        try:
+            layout.follow_signed_in_account(*found)
+        except LayoutBusyError:
+            return
+        stopped.append("same-groups")
+
+    def check() -> str | None:
+        if not _running_processes(config, dependencies):
+            # Just reopened by the switch, Claude may not be listed yet.
+            if dependencies.clock() - started >= WORKSPACE_LAUNCH_SECONDS:
+                stopped.append("claude-closed")
+            return None
+        if (
+            last_known_account(profile.data_root) != account
+            or signed_in(profile.data_root) is False
+        ):
+            stopped.append("account-changed")
+            return None
+        try:
+            moved = layout.workspace_after_switch(account)
+            if moved is None:
+                follow()
+            return moved
+        except (LayoutError, OSError, subprocess.SubprocessError):
+            # A torn copy or a slow helper proves nothing. The next read may.
+            return None
+
+    scope = wait_for_workspace(
+        check, lambda: bool(stopped), dependencies.clock, dependencies.sleeper
+    )
+    if scope is not None:
+        return report("workspace-changed", restart=True)
+    return report(stopped[0] if stopped else "same-workspace")
 
 
 def _launch(profile: Any, dependencies: CliDependencies) -> bool:
@@ -1888,6 +1997,7 @@ _COMMANDS: dict[str, Callable[..., int]] = {
     "switch": _run_switch,
     "signed-out-sync": _run_signed_out,
     "signed-in-groups": _run_signed_in_groups,
+    "workspace-after-switch": _run_workspace_after_switch,
     "rollback": _cmd_rollback,
     "browser-logins": _cmd_browser_logins,
     "status": _cmd_status,

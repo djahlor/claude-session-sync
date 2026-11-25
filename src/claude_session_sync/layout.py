@@ -91,6 +91,8 @@ from .layout_records import (  # noqa: F401  the module's public names stay impo
     scope_sessions,
     sidebar_accounts,
     transform_layout_records,
+    workspace_after_switch,
+    workspace_with_same_groups,
 )
 from .locking import ExclusiveFileLock, LockUnavailableError
 from .processes import PROCESS_PROBE_TIMEOUT_SECONDS, managed_processes
@@ -473,6 +475,35 @@ class LayoutSynchronizer:
         main_scope = _decode_main_scope(_snapshot_bytes(self._main_scope_path()))
         verdict, scope = groups_after_sign_in(records, account, main_scope)
         return verdict, scope, main_scope
+
+    def workspace_after_switch(self, account: str) -> str | None:
+        """The other workspace of the main account Claude moved to, if its groups differ.
+
+        Reads a disposable copy of Claude's database and never the live files.
+        """
+        with self._database_copy(self.config.profiles[0].data_root) as database:
+            records = {
+                key: database.get_optional(key)
+                for key in (DFRAME_STORE_KEY, *SYNC_METADATA_KEYS, SYNC_ORG_KEY)
+            }
+        main_scope = _decode_main_scope(_snapshot_bytes(self._main_scope_path()))
+        return workspace_after_switch(records, account, main_scope)
+
+    def workspace_with_same_groups(self, account: str) -> tuple[str, str] | None:
+        """The other workspace Claude moved to that shows the main scope's groups, and that main scope.
+
+        Reads a disposable copy of Claude's database and never the live files.
+        """
+        with self._database_copy(self.config.profiles[0].data_root) as database:
+            records = {
+                key: database.get_optional(key)
+                for key in (DFRAME_STORE_KEY, *SYNC_METADATA_KEYS, SYNC_ORG_KEY)
+            }
+        main_scope = _decode_main_scope(_snapshot_bytes(self._main_scope_path()))
+        scope = workspace_with_same_groups(records, account, main_scope)
+        if scope is None or main_scope is None:
+            return None
+        return scope, main_scope
 
     def follow_signed_in_account(self, scope: str, main_scope: str) -> None:
         """Make the signed-in account the main one, as a switch's sync would.

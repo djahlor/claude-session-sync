@@ -15,6 +15,8 @@ private struct RestartReceipt: Codable {
   var candidateHash: String?
   var preflightAttempts: Int?
   var retryNotBefore: Double?
+  // True from an account switch until its one workspace check has started.
+  var workspaceCheck: Bool?
 
   private enum CodingKeys: String, CodingKey {
     case accountHash = "account_hash"
@@ -22,6 +24,7 @@ private struct RestartReceipt: Codable {
     case candidateHash = "candidate_hash"
     case preflightAttempts = "preflight_attempts"
     case retryNotBefore = "retry_not_before"
+    case workspaceCheck = "workspace_check"
   }
 }
 
@@ -224,6 +227,10 @@ private final class SessionSyncWatcher: NSObject {
   private var signedOutResult: SignedOutResult?
   // A switch waits for this check before it decides on the restart.
   private var groupsChecking = false
+  // A switch owes one check for a Claude that moves to another workspace of
+  // the new account. Saved with the receipt, so a relaunched helper neither
+  // loses the check nor runs it twice.
+  private var workspaceCheckPending = false
   private var statusItem: NSStatusItem?
   private let notice = StatusNotice()
   // Present when the status window is turned off in the Sync menu.
@@ -262,6 +269,7 @@ private final class SessionSyncWatcher: NSObject {
             ["ready", "finished", "checking", "quitting", "syncing", "needs-attention"].contains(phase)
           else { throw CocoaError(.fileReadCorruptFile) }
           accountHash = hash
+          workspaceCheckPending = saved.workspaceCheck == true
           if phase == "checking" {
             // Older helpers quit Claude after an account check. Validate the
             // receipt, then drop the pending check: switches never quit Claude.
@@ -332,7 +340,8 @@ private final class SessionSyncWatcher: NSObject {
     guard (try directory.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true
     else { throw CocoaError(.fileWriteNoPermission) }
     if FileManager.default.fileExists(atPath: restartURL.path) { _ = try privateData(restartURL) }
-    let receipt = RestartReceipt(accountHash: hash, phase: restartPhase)
+    var receipt = RestartReceipt(accountHash: hash, phase: restartPhase)
+    if workspaceCheckPending { receipt.workspaceCheck = true }
     let data = try JSONEncoder().encode(receipt)
     try data.write(to: restartURL, options: [.atomic])
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: restartURL.path)
@@ -543,6 +552,7 @@ private final class SessionSyncWatcher: NSObject {
     candidateHash = nil
     candidateSince = nil
     reopenRetries = 0
+    workspaceCheckPending = true
     if restartPhase != "needs-attention" { restartPhase = "ready" }
     let signedOut = signedOutResult
     signedOutResult = nil
@@ -583,6 +593,51 @@ private final class SessionSyncWatcher: NSObject {
       withJSONObject: ["progress": "finished", "restart_skipped": reason])) ?? Data()
     writeStatus(exitStatus: 0, output: data, launchFailed: false)
     notify(message)
+    startWorkspaceCheck()
+  }
+
+  // An account can belong to several workspaces. Claude opens one at the
+  // sign-in and can move to another seconds later, by itself or by a click,
+  // while the switch's copy went to the first. One check per switch watches
+  // for that move. Only a certain answer restarts Claude again, because a
+  // restart ends every open chat.
+  private func startWorkspaceCheck() {
+    guard workspaceCheckPending, let profile = profile else { return }
+    // Saved before the check starts, so a helper relaunched meanwhile never
+    // runs a second one for the same switch.
+    workspaceCheckPending = false
+    do { try saveRestartState() } catch { return }
+    let output = Pipe()
+    guard let task = cliProcess(["workspace-after-switch", profile, "--json"], output: output)
+    else { return }
+    let account = accountHash
+    let completion = ProcessCompletion { [weak self] exitStatus, data in
+      self?.queue.async {
+        self?.finishWorkspaceCheck(exitStatus: exitStatus, output: data, account: account)
+      }
+    }
+    task.terminationHandler = { process in
+      completion.record(exitStatus: process.terminationStatus)
+    }
+    do {
+      try task.run()
+      drain(output, into: completion)
+    } catch {
+      task.terminationHandler = nil
+      completion.cancel()
+    }
+  }
+
+  private func finishWorkspaceCheck(exitStatus: Int32, output: Data, account: String?) {
+    let result = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+    guard exitStatus == 0, result?["restart"] as? Bool == true,
+      result?["reason"] as? String == "workspace-changed",
+      let checked = account, checked == accountHash, readAccountHash() == checked,
+      !restartRequested, !groupsChecking
+    else { return }
+    showStatus("Claude opened another workspace. Restarting once more for your groups.",
+      banner: true)
+    requestRestart(mode: "after-account-switch")
   }
 
   // Claude loads the new account's groups from its servers at sign-in. When
@@ -959,6 +1014,7 @@ private final class SessionSyncWatcher: NSObject {
       lastFailureKey = nil
       if restarting {
         notify("Sync finished. Claude is reopening.")
+        startWorkspaceCheck()
       } else {
         showStatus("Sync finished")
       }

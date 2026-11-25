@@ -2408,6 +2408,52 @@ class PerAccountCopyTests(unittest.TestCase):
             )
             self.assertIn("RECOVERY_REQUIRED", stuck.read_text())
 
+    def test_a_switch_copy_follows_claude_to_another_workspace_of_the_account(self):
+        # The first copy went to b/first and still waits for its upload.
+        # Claude then moved to b/second, the account's other workspace.
+        slots = {"b/first": self.MAIN, "b/second": self.OLD}
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), active="b/second", flag=b"\x01b/first", slots=slots
+            )
+            main = self.main_file(config, "b/first")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+
+            state = decoded(data[DFRAME_STORE_KEY])["state"]
+            self.assertEqual(self.MAIN, state["codeSidebarByScope"]["b/second"])
+            self.assertEqual(b"\x01b/second", data[layout_module.GROUP_UPLOAD_KEY])
+            self.assertEqual("b/second", json.loads(main.read_text())["main_scope"])
+            self.assertEqual("claude-uploads-copy-on-next-start", receipt.reason)
+
+    def test_an_upload_waiting_in_another_workspace_blocks_a_copy_without_a_switch(
+        self,
+    ):
+        slots = {"b/first": self.MAIN, "b/second": self.OLD}
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), active="b/second", flag=b"\x01b/first", slots=slots
+            )
+            self.main_file(config, "b/first")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync()
+
+            self.assertEqual("another-upload-pending", receipt.reason)
+            self.assertEqual([], writes)
+
+    def test_another_accounts_waiting_upload_still_blocks_a_switch_copy(self):
+        slots = {"a/w": self.MAIN, "b/first": self.MAIN, "b/second": self.OLD}
+        with tempfile.TemporaryDirectory() as directory:
+            config, synchronizer, data, writes, fake = self.fixture(
+                Path(directory), active="b/second", flag=b"\x01a/w", slots=slots
+            )
+            self.main_file(config, "b/first")
+            with patch("claude_session_sync.layout.LevelDatabase", fake):
+                receipt = synchronizer.sync(after_account_switch=True)
+
+            self.assertEqual("another-upload-pending", receipt.reason)
+            self.assertEqual([], writes)
+
     def test_switch_copy_keeps_each_sections_group_sort_and_show_settings(self):
         # The section menu's Group by, Sort by and Show live in each section.
         views = {
