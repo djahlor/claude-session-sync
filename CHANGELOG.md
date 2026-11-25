@@ -8,6 +8,7 @@ To update, paste the install sentence from the [README](README.md#install) into 
 
 ### Fixed
 
+- A switch into an account with more than one workspace left the new account without groups. Claude opens one workspace at the sign-in and can move to another seconds later, by itself or by a click, and the switch had copied the groups into the first. The helper now checks once after every switch, for about 45 seconds, whether Claude moved to another workspace of that account that shows other groups. Only then it restarts Claude once more and copies the groups there. A check that cannot tell keeps Claude open, and no switch gets more than this one extra restart. A copy still waiting to upload for the first workspace no longer blocks the copy for the second. When the workspace Claude moved to already shows the same groups, Claude stays open and that workspace becomes the source for the next switch, so groups you change there travel with you.
 - New accounts whose empty session folder is created within five seconds of login now join sync and receive existing chats. Folder creation is compared with the login time; the five-second delay still applies to chat writes, and folders containing chats from before the login stay excluded.
 
 ## [0.9.1] - 2026-11-04

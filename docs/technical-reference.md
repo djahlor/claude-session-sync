@@ -659,6 +659,57 @@ own mode.
 With browser logins on, `browser-logins` stays a reason, so the check does
 not run and every switch still restarts once.
 
+### Workspace check after the switch
+
+An account can belong to more than one workspace, and each workspace has its
+own groups on Anthropic's servers. Claude opens one workspace at the sign-in
+and can move to another one seconds later, by itself or by a click. The
+switch's copy went into the workspace Claude showed when it quit, so the one
+it moved to still shows its old groups. On 25 November 2026 Claude reopened
+after a switch in one workspace and moved to the account's other one 8 seconds
+later.
+
+So after every switch, restarted or not, the watcher runs
+`workspace-after-switch <profile> --json` once:
+
+- It reads a disposable copy of Claude's `Local Storage/leveldb` every 3
+  seconds for up to 45 seconds, and never writes to Claude's files.
+- It reports `restart: true`, `reason: workspace-changed` only when all of
+  this holds: `ccd-sync-owner` and `ccd-sync-org` name another workspace of
+  the main scope's account, `lastSidebarScopeKey` is that workspace, both
+  slots exist, the sections differ, and a second read 6 seconds later still
+  says so. A finding the second read does not repeat, as after one torn
+  copy, goes back to watching until the time limit. The watcher then restarts Claude once more in the switch's mode,
+  and that sync copies the main scope into the new workspace.
+- Everything else keeps Claude open: `same-workspace` (no move in the time
+  limit), `claude-closed` (after 15 seconds, because a Claude the switch
+  just reopened is not listed as running at once),
+  `account-changed`, `not-signed-in`, `main-account-choice-pending`,
+  `sidebar-sync-off`, and a copy that cannot be read. Groups edited in the
+  new workspace that still wait for their upload also keep Claude open, so
+  they are never overwritten. A restart ends every open chat, so it never
+  runs on a guess.
+- When the workspace Claude moved to already shows the same sections,
+  nothing needs copying. Once two reads at least 6 seconds apart agree, the
+  check makes that workspace the main scope in `sidebar-main-0.json`, the
+  only file it ever writes, and reports `restart: false`, `reason:
+  same-groups`. The next switch copies from the main scope, so groups changed
+  in that workspace would otherwise stay behind.
+- The check is owed once per switch. The watcher saves that in its restart
+  receipt (`workspace_check`) and clears it before the check starts, so a
+  helper restarted meanwhile neither loses the check nor runs it twice, and a
+  switch gets at most one extra restart.
+
+At that second sync Claude's upload flag can still name the first workspace,
+when Claude moved before it uploaded the first copy. A flag that names the
+main scope, in another workspace of the signed-in account, is the switch's own
+copy and does not block the next one. Any other waiting upload still does
+(`another-upload-pending`).
+
+Limits: the groups also reach the workspace Claude opened first, as before. A
+move later than the time limit is not followed; the next switch into the
+account copies the groups again.
+
 A sync with nothing to do read 46,000 chat files in 9 to 14 seconds on a busy
 Mac, and the last five sign-ins on the development Mac came 14 to 37 seconds
 after the sign-out. A faster sign-in only costs the restart, as before.

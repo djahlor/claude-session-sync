@@ -131,6 +131,8 @@ A new account joins the next time Claude closes after you sign in and open the C
 
 Newer Claude versions keep groups per account on Anthropic's servers. When you switch, the restart copies the groups of the account you just left into the account you signed in to, and Claude saves them to that account itself. Sync never reads or sends your login. If something is not as sync expects, it changes nothing and `status` says why. Pins are not copied on these versions.
 
+An account with more than one workspace has groups per workspace. If Claude moves to another workspace right after the switch, Claude restarts once more and the groups follow it there.
+
 Older Claude versions keep pins and groups on your Mac. One main account is the source. When your accounts have different groups, the installer asks which one is the main account, and until you choose, sync leaves the groups alone.
 
 You can also copy groups by hand with the [sidebar-groups skill](skills/sidebar-groups/SKILL.md). The [technical reference](docs/technical-reference.md#pins-and-custom-groups) has the steps and the rules for each version.

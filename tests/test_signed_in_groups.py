@@ -27,11 +27,21 @@ from claude_session_sync.layout_records import (
     SYNC_QUARANTINE_KEY,
     LayoutError,
     groups_after_sign_in,
+    workspace_after_switch,
+    workspace_with_same_groups,
 )
-from claude_session_sync.live import GROUPS_CHECK_SECONDS, GROUPS_CONFIRM_SECONDS
+from claude_session_sync.live import (
+    GROUPS_CHECK_SECONDS,
+    GROUPS_CONFIRM_SECONDS,
+    WORKSPACE_CHECK_INTERVAL,
+    WORKSPACE_CHECK_SECONDS,
+    WORKSPACE_LAUNCH_SECONDS,
+)
 
 A_SCOPE = f"{A_ACCOUNT}/{A_ORG}"
 B_SCOPE = f"{B_ACCOUNT}/{B_ORG}"
+# B's other workspace: Claude opens it first, and the switch copies into it.
+B_FIRST = f"{B_ACCOUNT}/{A_ORG}"
 MAIN = seeded_slot(section("Popcorn", ["p1", "p2"]), section("Life", ["l1"]))
 OLD = seeded_slot(section("Customers", ["p1"]), section("Old", ["l1"]))
 
@@ -136,8 +146,105 @@ class GroupsAfterSignInTests(unittest.TestCase):
             groups_after_sign_in(broken, B_ACCOUNT, A_SCOPE)
 
 
-class SignedInGroupsCommandTests(ChatCliFixture):
-    """The command the menu-bar helper runs when groups are the last restart reason."""
+def moved(second_slot, **changes):
+    """Signed in to B: the switch copied into its first workspace, Claude shows its second."""
+
+    options = {
+        "owner": B_ACCOUNT,
+        "org": B_ORG,
+        "active": B_SCOPE,
+        "slots": {B_FIRST: MAIN, B_SCOPE: second_slot},
+    }
+    options.update(changes)
+    return sidebar(**options)
+
+
+class WorkspaceAfterSwitchTests(unittest.TestCase):
+    def test_another_workspace_with_other_groups_is_named(self):
+        self.assertEqual(
+            B_SCOPE, workspace_after_switch(moved(OLD), B_ACCOUNT, B_FIRST)
+        )
+
+    def test_the_first_copy_still_waiting_to_upload_does_not_hide_the_move(self):
+        records = moved(OLD)
+        records[GROUP_UPLOAD_KEY] = b"\x01" + B_FIRST.encode()
+
+        self.assertEqual(B_SCOPE, workspace_after_switch(records, B_ACCOUNT, B_FIRST))
+
+    def test_another_workspace_with_the_same_groups_is_named_to_follow(self):
+        self.assertEqual(
+            B_SCOPE, workspace_with_same_groups(moved(MAIN), B_ACCOUNT, B_FIRST)
+        )
+        self.assertIsNone(workspace_after_switch(moved(MAIN), B_ACCOUNT, B_FIRST))
+        self.assertIsNone(workspace_with_same_groups(moved(OLD), B_ACCOUNT, B_FIRST))
+
+    def test_nothing_unclear_is_followed(self):
+        edited = moved(MAIN)
+        edited[GROUP_UPLOAD_KEY] = b"\x01" + B_SCOPE.encode()
+        quarantined = moved(MAIN)
+        quarantined[SYNC_QUARANTINE_KEY] = b"\x011"
+        cases = {
+            "the workspace the copy went to": (
+                moved(MAIN, org=A_ORG, active=B_FIRST),
+                B_FIRST,
+            ),
+            "a main scope of another account": (moved(MAIN), A_SCOPE),
+            "a sign-in Claude has not settled": (moved(MAIN, org=None), B_FIRST),
+            "groups edited in the new workspace": (edited, B_FIRST),
+            "a quarantined settings sync": (quarantined, B_FIRST),
+            "no records": ({}, B_FIRST),
+        }
+        for name, (records, main_scope) in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(
+                    workspace_with_same_groups(records, B_ACCOUNT, main_scope)
+                )
+
+    def test_everything_else_names_nothing(self):
+        edited = moved(OLD)
+        edited[GROUP_UPLOAD_KEY] = b"\x01" + B_SCOPE.encode()
+        other_upload = moved(OLD)
+        other_upload[GROUP_UPLOAD_KEY] = b"\x01" + A_SCOPE.encode()
+        quarantined = moved(OLD)
+        quarantined[SYNC_QUARANTINE_KEY] = b"\x011"
+        empty_main = seeded_slot()
+        cases = {
+            "the workspace the copy went to": (
+                moved(OLD, org=A_ORG, active=B_FIRST),
+                B_FIRST,
+            ),
+            "the same groups": (moved(MAIN), B_FIRST),
+            "a main scope of another account": (moved(OLD), A_SCOPE),
+            "no main scope": (moved(OLD), None),
+            "a sign-in Claude has not settled": (moved(OLD, org=None), B_FIRST),
+            "a sidebar that still shows the first workspace": (
+                moved(OLD, active=B_FIRST),
+                B_FIRST,
+            ),
+            "no slot for the new workspace": (
+                moved(OLD, slots={B_FIRST: MAIN}),
+                B_FIRST,
+            ),
+            "no slot for the main scope": (moved(OLD, slots={B_SCOPE: OLD}), B_FIRST),
+            "groups edited in the new workspace": (edited, B_FIRST),
+            "another account's upload": (other_upload, B_FIRST),
+            "a quarantined settings sync": (quarantined, B_FIRST),
+            "a main scope without groups": (
+                moved(OLD, slots={B_FIRST: empty_main, B_SCOPE: OLD}),
+                B_FIRST,
+            ),
+            "another account signed in": (moved(OLD, owner=A_ACCOUNT), B_FIRST),
+            "no records": ({}, B_FIRST),
+        }
+        for name, (records, main_scope) in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(
+                    workspace_after_switch(records, B_ACCOUNT, main_scope)
+                )
+
+
+class SidebarCommandFixture(ChatCliFixture):
+    """Claude open and signed in to B, with a fake standing in for its sidebar database."""
 
     def setUp(self):
         super().setUp()
@@ -179,6 +286,13 @@ class SignedInGroupsCommandTests(ChatCliFixture):
 
         return FakeDatabase
 
+    def main_scope(self):
+        return json.loads(self.main.read_text())["main_scope"]
+
+
+class SignedInGroupsCommandTests(SidebarCommandFixture):
+    """The command the menu-bar helper runs when groups are the last restart reason."""
+
     def check(self, **dependencies):
         options = {
             "layout_factory": lambda config: LayoutSynchronizer(
@@ -193,9 +307,6 @@ class SignedInGroupsCommandTests(ChatCliFixture):
             )
         self.assertEqual(0, code, errors)
         return json.loads(out)
-
-    def main_scope(self):
-        return json.loads(self.main.read_text())["main_scope"]
 
     def test_the_same_groups_keep_claude_open_and_follow_the_new_account(self):
         payload = self.check()
@@ -433,4 +544,201 @@ class SignedInGroupsCommandTests(ChatCliFixture):
         payload = self.check()
 
         self.assertEqual("needs-one-default-profile", payload["reason"])
+        self.assertEqual(0, self.reads)
+
+
+class WorkspaceAfterSwitchCommandTests(SidebarCommandFixture):
+    """The command the helper runs once after every switch. Only a certain move restarts."""
+
+    def setUp(self):
+        super().setUp()
+        self.records = moved(OLD)
+        self.main.write_text(json.dumps({"version": 1, "main_scope": B_FIRST}))
+
+    def check(self, **dependencies):
+        options = {
+            "layout_factory": lambda config: LayoutSynchronizer(
+                config, helper=self.helper, process_probe=lambda: ()
+            ),
+            "sleeper": lambda _seconds: None,
+        }
+        options.update(dependencies)
+        with patch("claude_session_sync.layout.LevelDatabase", self.fake_database()):
+            code, out, errors = self.cli(
+                "workspace-after-switch", "Work", "--json", **options
+            )
+        self.assertEqual(0, code, errors)
+        return json.loads(out)
+
+    def timed(self, on_sleep=lambda _seconds: None):
+        now = [0.0]
+        waits = []
+
+        def sleeper(seconds):
+            now[0] += seconds
+            waits.append(seconds)
+            on_sleep(seconds)
+
+        return self.check(clock=lambda: now[0], sleeper=sleeper), waits
+
+    def test_a_move_to_a_workspace_with_other_groups_restarts(self):
+        payload, waits = self.timed()
+
+        self.assertEqual(
+            {"state": "restart", "reason": "workspace-changed", "restart": True},
+            payload,
+        )
+        self.assertEqual([GROUPS_CONFIRM_SECONDS], waits)
+        # The check writes nothing: the restart's own sync moves the main scope.
+        self.assertEqual(B_FIRST, self.main_scope())
+
+    def test_a_move_seconds_after_claude_reopened_is_still_seen(self):
+        self.records = moved(OLD, org=A_ORG, active=B_FIRST)
+
+        reads = []
+
+        def on_sleep(_seconds):
+            reads.append(1)
+            if len(reads) == 3:
+                self.records = moved(OLD)
+
+        payload, waits = self.timed(on_sleep)
+
+        self.assertTrue(payload["restart"])
+        self.assertEqual([WORKSPACE_CHECK_INTERVAL] * 3, waits[:3])
+
+    def test_a_claude_that_stays_in_the_first_workspace_stays_open(self):
+        self.records = moved(OLD, org=A_ORG, active=B_FIRST)
+
+        payload, waits = self.timed()
+
+        self.assertEqual(
+            {"state": "no-restart", "reason": "same-workspace", "restart": False},
+            payload,
+        )
+        self.assertGreaterEqual(sum(waits), WORKSPACE_CHECK_SECONDS)
+        self.assertLessEqual(
+            sum(waits), WORKSPACE_CHECK_SECONDS + WORKSPACE_CHECK_INTERVAL
+        )
+
+    def test_a_move_to_a_workspace_with_the_same_groups_moves_the_main_scope(self):
+        # Nothing to copy, so Claude stays open. Groups changed there later
+        # must travel at the next switch, which copies from the main scope.
+        self.records = moved(MAIN)
+
+        payload, waits = self.timed()
+
+        self.assertEqual(
+            {"state": "no-restart", "reason": "same-groups", "restart": False},
+            payload,
+        )
+        self.assertEqual(B_SCOPE, self.main_scope())
+        # Seen, then seen again after Chromium's next save, then followed.
+        self.assertGreaterEqual(sum(waits), GROUPS_CONFIRM_SECONDS)
+        self.assertLess(sum(waits), WORKSPACE_CHECK_SECONDS)
+
+    def test_the_same_groups_seen_once_do_not_move_the_main_scope(self):
+        self.records = moved(MAIN)
+
+        def on_sleep(_seconds):
+            self.records = moved(MAIN, org=A_ORG, active=B_FIRST)
+
+        payload, _waits = self.timed(on_sleep)
+
+        self.assertEqual("same-workspace", payload["reason"])
+        self.assertEqual(B_FIRST, self.main_scope())
+
+    def test_a_move_that_does_not_hold_goes_back_to_watching(self):
+        def on_sleep(seconds):
+            if seconds == GROUPS_CONFIRM_SECONDS:
+                # Back in the workspace the copy went to.
+                self.records = moved(OLD, org=A_ORG, active=B_FIRST)
+
+        payload, waits = self.timed(on_sleep)
+
+        self.assertEqual(
+            {"state": "no-restart", "reason": "same-workspace", "restart": False},
+            payload,
+        )
+        self.assertGreaterEqual(sum(waits), WORKSPACE_CHECK_SECONDS)
+        self.assertEqual(B_FIRST, self.main_scope())
+
+    def test_one_torn_copy_at_the_second_read_does_not_waste_the_check(self):
+        class Unreadable:
+            def get(self, _key):
+                raise LayoutError("Claude sidebar record could not be read safely")
+
+        confirms = []
+
+        def on_sleep(seconds):
+            if seconds == GROUPS_CONFIRM_SECONDS:
+                confirms.append(1)
+                self.records = Unreadable() if len(confirms) == 1 else moved(OLD)
+            else:
+                self.records = moved(OLD)
+
+        payload, _waits = self.timed(on_sleep)
+
+        self.assertEqual("workspace-changed", payload["reason"])
+        self.assertTrue(payload["restart"])
+        self.assertEqual(2, len(confirms))
+
+    def test_nothing_unclear_restarts(self):
+        class Unreadable:
+            def get(self, _key):
+                raise LayoutError("Claude sidebar record could not be read safely")
+
+        self.records = Unreadable()
+        self.assertFalse(self.timed()[0]["restart"])
+
+        self.records = moved(OLD)
+        self.helper.unlink()
+        self.assertFalse(self.timed()[0]["restart"])
+
+    def test_a_closed_claude_stays_closed(self):
+        self.running = False
+
+        payload, waits = self.timed()
+
+        self.assertEqual(
+            {"state": "no-restart", "reason": "claude-closed", "restart": False},
+            payload,
+        )
+        self.assertEqual(0, self.reads)
+        # Not listed yet is not closed: it is asked again for the first seconds.
+        self.assertGreaterEqual(sum(waits), WORKSPACE_LAUNCH_SECONDS)
+        self.assertLess(sum(waits), WORKSPACE_CHECK_SECONDS)
+
+    def test_a_claude_that_is_listed_a_little_after_its_launch_is_still_checked(self):
+        self.running = False
+        slept = []
+
+        def on_sleep(_seconds):
+            slept.append(1)
+            if len(slept) == 2:
+                self.running = True
+
+        payload, _waits = self.timed(on_sleep)
+
+        self.assertEqual("workspace-changed", payload["reason"])
+        self.assertTrue(payload["restart"])
+
+    def test_another_switch_during_the_wait_ends_the_check(self):
+        self.records = moved(OLD, org=A_ORG, active=B_FIRST)
+
+        payload, waits = self.timed(lambda _seconds: self.sign_in(A_ACCOUNT))
+
+        self.assertEqual("account-changed", payload["reason"])
+        self.assertFalse(payload["restart"])
+        self.assertEqual(1, len(waits))
+
+    def test_groups_that_do_not_sync_are_never_checked(self):
+        self.config = replace(self.config, sync_sidebar_layout=False)
+
+        payload = self.check()
+
+        self.assertEqual(
+            {"state": "no-restart", "reason": "sidebar-sync-off", "restart": False},
+            payload,
+        )
         self.assertEqual(0, self.reads)

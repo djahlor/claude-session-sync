@@ -396,7 +396,15 @@ def plan_account_copy(
         if upload_flag in (scoped, scoped + b"|migrate"):
             # The newest edits are this account's and not uploaded yet.
             return AccountCopyPlan(active, reason="signed-in-edit-pending")
-        return AccountCopyPlan(main_scope, reason="another-upload-pending")
+        if not (
+            after_account_switch
+            and _same_account_other_workspace(main_scope, active)
+            and upload_flag == b"\x01" + str(main_scope).encode("utf-8")
+        ):
+            return AccountCopyPlan(main_scope, reason="another-upload-pending")
+        # The flag is the switch's own copy, made for the workspace Claude
+        # opened first. Claude moved to another workspace of the account
+        # before it uploaded, so the copy goes on to that one.
     if requested_source is not None:
         source = requested_source
     elif main_scope is None:
@@ -420,6 +428,87 @@ def plan_account_copy(
     if slots[source].get("sections") == slots[active].get("sections"):
         return AccountCopyPlan(active)
     return AccountCopyPlan(active, source=source, target=active)
+
+
+def _same_account_other_workspace(main_scope: object, active: str) -> bool:
+    if not _valid_scope(main_scope) or main_scope == active:
+        return False
+    assert isinstance(main_scope, str)  # _valid_scope accepted it
+    return main_scope.partition("/")[0].lower() == active.partition("/")[0].lower()
+
+
+def _other_workspace(
+    records: Mapping[bytes, bytes | None], account: str, main_scope: str | None
+) -> tuple[str, bool] | None:
+    """The other workspace of the main account Claude settled on, and whether its groups match.
+
+    None unless that is certain: anything unclear, an upload that waits for
+    another scope, and a main scope without groups all return None.
+    """
+
+    owner = _owner_account(records.get(SYNC_OWNER_KEY))
+    org = _owner_account(records.get(SYNC_ORG_KEY))
+    if owner is None or org is None or owner.lower() != account:
+        return None
+    scope = f"{owner}/{org}"
+    if not _same_account_other_workspace(main_scope, scope):
+        return None
+    assert main_scope is not None  # _same_account_other_workspace checked it
+    record = records.get(DFRAME_STORE_KEY)
+    if not keeps_sidebar_on_server(record):
+        return None
+    assert record is not None  # keeps_sidebar_on_server read it
+    state = _decode_record(record, "dframe store record")["state"]
+    slots = state["codeSidebarByScope"]
+    if (
+        state.get("lastSidebarScopeKey") != scope
+        or scope not in slots
+        or main_scope not in slots
+    ):
+        return None
+    if records.get(SYNC_QUARANTINE_KEY) is not None:
+        return None
+    upload = records.get(GROUP_UPLOAD_KEY)
+    if upload is not None and upload != b"\x01" + main_scope.encode("utf-8"):
+        # Groups edited in the new workspace wait for their upload, or
+        # another account's do. Neither is overwritten.
+        return None
+    if not _manual_sections(slots[main_scope], "main account sidebar"):
+        return None
+    _manual_sections(slots[scope], "signed-in account sidebar")
+    return scope, slots[main_scope].get("sections") == slots[scope].get("sections")
+
+
+def workspace_after_switch(
+    records: Mapping[bytes, bytes | None], account: str, main_scope: str | None
+) -> str | None:
+    """The workspace Claude moved to after a switch, when it shows other groups.
+
+    An account can belong to several workspaces. Claude opens one at the
+    sign-in and can move to another seconds later, by itself or by a click,
+    while the switch's copy went to the first. Returns the signed-in scope
+    only when that is certain: Claude settled on another workspace of the
+    main scope's account, and its sections differ from the copied ones.
+    Anything unclear returns None, because a second restart ends every open
+    chat and must never run on a guess.
+    """
+
+    found = _other_workspace(records, account, main_scope)
+    return found[0] if found is not None and not found[1] else None
+
+
+def workspace_with_same_groups(
+    records: Mapping[bytes, bytes | None], account: str, main_scope: str | None
+) -> str | None:
+    """The workspace Claude moved to after a switch, when it already shows the same groups.
+
+    Nothing needs copying then, but the main scope must follow Claude there.
+    Groups changed in that workspace would otherwise stay behind at the next
+    switch, which copies from the main scope.
+    """
+
+    found = _other_workspace(records, account, main_scope)
+    return found[0] if found is not None and found[1] else None
 
 
 # What a check right after an in-app sign-in found. Only SAME_GROUPS lets the
